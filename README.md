@@ -19,6 +19,17 @@ the worked example throughout the documentation.
   work. Rev 3, 2026-09-20.
 - `docs/figures/`: the org chart, the loop graph, the coding loop, and the deployment view.
 
+- `docs/setup.md`: what a repository and a machine need before loops run (repo configuration, the machine layout the
+  launcher expects, the spec reviewer, Slack channels).
+- `scripts/`: `launch-loop.sh` (the coding-loop launcher: worktree, attempts, exit script, PR with auto-merge),
+  `account.sh` (per-account Claude Code config dirs), `spec-watch.sh` (starts the spec reviewer), `setup-github.sh`
+  (labels, auto-merge, branch protection, secrets).
+- `tools/factory/`: the spec reviewer (`spec_review.py`, its brief `spec_review_prompt.md`) and the watcher
+  (`spec_watch.py`).
+- `docs/factory/`: the standing rules the reviewer and the watchers enforce.
+- `ci/`: the three GitHub Actions workflows (exit-criteria check, review bot, Slack notify); copy into
+  `.github/workflows/`.
+
 ## Status
 
 Design stage. The framework is being extracted from a running deployment; the reusable pieces (the supervisor, the
