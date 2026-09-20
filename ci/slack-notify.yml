@@ -1,0 +1,21 @@
+name: slack-notify
+on:
+  pull_request:
+    types: [opened, closed]
+    branches: [main]
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Slack
+        env:
+          WEBHOOK: ${{ secrets.SLACK_PR_WEBHOOK }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "No webhook set, skipping"; exit 0; fi
+          ACTION="${{ github.event.action }}"
+          MERGED="${{ github.event.pull_request.merged }}"
+          TITLE="${{ github.event.pull_request.title }}"
+          URL="${{ github.event.pull_request.html_url }}"
+          if [ "$ACTION" = "closed" ] && [ "$MERGED" = "true" ]; then STATUS="MERGED"; elif [ "$ACTION" = "closed" ]; then STATUS="closed (not merged)"; else STATUS="opened"; fi
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"PR $STATUS: $TITLE — $URL\"}" "$WEBHOOK"

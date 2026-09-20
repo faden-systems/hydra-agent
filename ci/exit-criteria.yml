@@ -1,0 +1,40 @@
+name: exit-criteria
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  run-exit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies (repo-wide)
+        run: |
+          python3 -m pip install -q pytest
+          if [ -f fitflow-backend/requirements.txt ]; then python3 -m pip install -q -r fitflow-backend/requirements.txt; fi
+      - name: Find loop id from branch name
+        id: loop
+        run: |
+          BRANCH="${GITHUB_HEAD_REF}"
+          LOOP_ID=$(echo "$BRANCH" | sed -n 's|^loop/\([a-z0-9]*\).*|\1|p')
+          if [ -z "$LOOP_ID" ]; then
+            echo "No loop id in branch name ($BRANCH). Skipping exit check."
+            echo "loop_id=" >> "$GITHUB_OUTPUT"
+          else
+            echo "loop_id=$LOOP_ID" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run exit script
+        if: steps.loop.outputs.loop_id != ''
+        env:
+          BASE_REF: origin/main
+        run: |
+          SCRIPT="loops/${{ steps.loop.outputs.loop_id }}.exit.sh"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "FAIL: $SCRIPT not found"; exit 1
+          fi
+          chmod +x "$SCRIPT"
+          "$SCRIPT"

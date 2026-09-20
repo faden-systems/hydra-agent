@@ -1,0 +1,42 @@
+name: codex-review
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Get diff
+        run: |
+          git diff origin/main...HEAD > pr.diff
+          head -c 60000 pr.diff > pr.trunc.diff
+      - name: Ask OpenAI for review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ vars.CODEX_MODEL != '' && vars.CODEX_MODEL || 'gpt-5.5' }}
+        run: |
+          DIFF=$(cat pr.trunc.diff | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+          BODY=$(cat << JSON
+          {"model": "$MODEL",
+           "messages": [
+             {"role": "system", "content": "You are a strict code reviewer from a different vendor than the author. Look for: real bugs, security issues, scope-fence violations (files changed that the diff should not touch), and missing error handling. Be brief. If it looks fine, say APPROVE and one sentence why. If not, list concrete problems."},
+             {"role": "user", "content": $DIFF}
+           ]}
+          JSON
+          )
+          curl -s https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["choices"][0]["message"]["content"] if "choices" in r else json.dumps(r))' > review.txt
+          cat review.txt
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body-file review.txt
