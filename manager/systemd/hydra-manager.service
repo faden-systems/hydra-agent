@@ -16,6 +16,8 @@ Environment=CLAUDE_CONFIG_DIR=/srv/hydra/manager/.claude
 Environment=GH_CONFIG_DIR=/home/hydra/.config/gh
 Environment=GIT_TERMINAL_PROMPT=0
 Environment=PATH=/opt/hydra-tools/bin:/opt/hydra-node/bin:/usr/local/bin:/usr/bin:/bin
+# repo comes from $HYDRA_HOME/config.json (bootstrap defaults to /srv/hydra/repos/faden).
+# Keep --repo unset so an operator's configured clone remains authoritative.
 ExecStart=/srv/hydra/manager/venv/bin/python /srv/hydra/manager/app/manager/supervisor.py
 Restart=always
 RestartSec=10

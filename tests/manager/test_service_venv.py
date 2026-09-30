@@ -31,6 +31,8 @@ def test_bootstrap_installs_both_packages_into_runtime_venv(tmp_path):
 set -euo pipefail
 source "$1/setup/manager-vm.sh"
 MANAGER=$2/manager
+REPOS=$2/repos
+as_hydra() { command "$@"; }
 STATE=$2/state
 UNIT_DIR=$2/units
 HYDRA_MANAGER_SRC=$1/manager
