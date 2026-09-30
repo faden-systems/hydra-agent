@@ -449,6 +449,18 @@ web SSH or a hidden prompt, never through Slack or a chat transcript.
    stops turns at any time; `hydra pause` does the same from the console.
 
 The first Claude turn creates `session-id` (a fresh session; `--resume` afterwards).
-Rotation to the L account or Codex happens on quota and is visible as `engine: ...`
-in the thread and in `hydra status`; `hydra engine claude-r2d2` moves back.
+Rotation to the L account or Codex happens on quota and is visible as `engine: <acc> (<model>)`
+in the thread and in `hydra status`; `hydra engine acc=claude-r2d2 model=fable5.1` (or the
+short form `hydra engine claude-r2d2`) moves back. `engine` is JSON `{"acc", "model"}`; a
+legacy one-word file is upgraded on the next turn.
+
+After every merge to `manager/` on `main`, as root: `hydra update`. It fast-forwards the
+hydra-agent clone, re-copies `manager/` into `app/manager/`, refreshes `CLAUDE.md` and the
+`AGENTS.md` link, restarts both services and prints `updated to <commit>`. Without it the
+deployed rules and code stay at whatever the bootstrap copied.
+
+Shared memory lives in the faden clone at `factory/manager-memory/` (`MEMORY.md`, `claude/`,
+`codex/NOTES.md`, `MANAGER-HANDOFF.md`, `LEDGER.jsonl`); the supervisor commits it after every
+turn together with `state.json` and the logs. `$HYDRA_HOME/MANAGER-HANDOFF.md` becomes a
+symlink into that folder on the first turn after the update.
 

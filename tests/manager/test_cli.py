@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-from conftest import MANAGER, S, fake_engine, queue_event
+from conftest import MANAGER, S, engine_acc, fake_engine, queue_event
 
 HYDRA = os.path.join(MANAGER, "hydra")
 
@@ -51,8 +51,9 @@ def test_status_renders_from_fixtures(home):
 
 
 def test_engine_pause_resume_logs_tail(home):
-    assert run(home, "engine").stdout.strip() == "claude-r2d2"
-    assert run(home, "engine", "codex").returncode == 0 and open(os.path.join(home, "engine")).read().strip() == "codex"
+    assert run(home, "engine").stdout.strip() == "engine: claude-r2d2 (claude-fable-5-1)", "a legacy file shows the default model"
+    assert run(home, "engine", "codex").returncode == 0 and engine_acc(home) == "codex"
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "codex", "model": "gpt-6-astra"}
     assert run(home, "engine", "bogus").returncode == 2
     assert run(home, "pause", "maintenance").returncode == 0 and open(os.path.join(home, "PAUSE")).read().strip() == "maintenance"
     assert "resumed" in run(home, "resume").stdout and not os.path.exists(os.path.join(home, "PAUSE"))
@@ -64,6 +65,34 @@ def test_engine_pause_resume_logs_tail(home):
     assert "U1: hello there" in run(home, "tail", "C_DEV").stdout
     assert run(home, "tail", "C_NOPE").returncode == 1
     assert run(home).returncode == 2 and run(home, "--help").returncode == 0
+
+
+def test_engine_acc_model_round_trip_and_rejection(home):
+    r = run(home, "engine", "acc=claude-l", "model=sonnet5")
+    assert r.returncode == 0 and r.stdout.strip() == "engine: claude-l (claude-sonnet-5)", r.stdout + r.stderr
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-sonnet-5"}
+    assert run(home, "engine").stdout.strip() == "engine: claude-l (claude-sonnet-5)"
+    r = run(home, "engine", "acc=codex", "model=fable5.1")
+    assert r.returncode == 2 and "claude family" in r.stderr and "gpt6" in r.stderr
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-sonnet-5"}, "rejected: nothing changes"
+    r = run(home, "engine", "model=zzz")
+    assert r.returncode == 2 and "unknown model" in r.stderr
+    assert run(home, "engine", "model=haiku4.5").returncode == 0
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-haiku-4-5-20251001"}
+    assert run(home, "engine", "acc=codex", "model=sol").stdout.strip() == "engine: codex (gpt-5.6-sol)"
+    assert "engine: codex (gpt-5.6-sol)" in run(home, "status").stdout
+
+
+def test_attach_uses_the_configured_model(home, tmp_path):
+    d = tmp_path / "att2"; d.mkdir()
+    script = str(d / "claude")
+    open(script, "w").write("#!/usr/bin/env python3\nimport sys, json\n"
+                            f"open({str(d / 'calls.jsonl')!r}, 'a').write(json.dumps({{'argv': sys.argv[1:]}}) + '\\n')\n")
+    os.chmod(script, 0o755)
+    open(os.path.join(home, "config.json"), "w").write(json.dumps({"engines": {"claude-r2d2": {"bin": script}, "claude-l": {"bin": script}}}))
+    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-l", "model": "claude-opus-5"}))
+    assert run(home, "attach").returncode == 0
+    assert json.loads(open(d / "calls.jsonl").read().strip())["argv"] == ["--resume", "sess-test", "--model", "claude-opus-5"]
 
 
 def test_attach_takes_and_releases_the_lock(home, tmp_path):

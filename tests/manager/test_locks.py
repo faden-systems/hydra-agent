@@ -141,11 +141,14 @@ def test_persistence_commits_mirror_and_state_and_pushes(home, ok_engine, poster
     files = subprocess.run(["git", "--git-dir", bare, "ls-tree", "-r", "--name-only", "HEAD"], capture_output=True, text=True).stdout.split()
     assert "factory/log/C_DEV.jsonl" in files and "factory/state.json" in files
     assert "building" in subprocess.run(["git", "--git-dir", bare, "show", "HEAD:factory/state.json"], capture_output=True, text=True).stdout
-    # nothing changed: no empty commit
+    assert "factory/manager-memory/LEDGER.jsonl" in files and "factory/manager-memory/MANAGER-HANDOFF.md" in files
+    # every turn appends a ledger line and mirrors the manager's reply, so every turn commits (b2)
     queue_event(home, "again")
     assert sup.run_once() is True
     log2 = subprocess.run(["git", "--git-dir", bare, "log", "--format=%s"], capture_output=True, text=True).stdout.split("\n")
-    assert log2[0] == "manager: turn 1"
+    assert log2[:2] == ["manager: turn 2", "manager: turn 1"]
+    ledger = subprocess.run(["git", "--git-dir", bare, "show", "HEAD:factory/manager-memory/LEDGER.jsonl"], capture_output=True, text=True).stdout
+    assert [json.loads(l)["turn"] for l in ledger.splitlines() if l.strip()] == [1, 2]
 
 
 def test_state_is_seeded_from_the_repo_when_home_has_none(home, ok_engine, poster, clone):

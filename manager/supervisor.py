@@ -4,7 +4,14 @@
 Runs as `hydra` on hydra-manager. The queue is `$HYDRA_HOME/inbox/events.jsonl`; a turn batches everything queued
 since the last turn into one message, runs it through the current engine (claude-r2d2 -> claude-l -> codex, rotating
 on quota), delivers the reply to the originating Slack thread (or the console), rewrites `MANAGER-HANDOFF.md` from
-the `---HANDOFF---` block, logs the turn, and commits `factory/state.json` and `factory/log/` in the faden clone.
+the `---HANDOFF---` block, logs the turn, and commits `factory/state.json`, `factory/log/` and the shared memory
+folder `factory/manager-memory/` in the faden clone.
+
+Shared memory (loops/b2.md): every engine gets `HYDRA_HOME` and `HYDRA_MEMORY_DIR` in its environment and a three-line
+`[memory]` preamble computed from `LEDGER.jsonl`; after the turn the supervisor snapshots Claude's memory files, stamps
+the handoff header, appends the ledger line (files written = hash diff of the folder) and mirrors its own reply.
+The engine file `$HYDRA_HOME/engine` is JSON `{"acc", "model"}`; `parse_engine_command` handles
+`engine acc=<account> [model=<alias>]` for the CLI and the bridge; model aliases live in `models.json`.
 
 Entry points: `supervisor.py --once` runs one `run_once()`; no argument runs the service loop (systemd).
 The `Supervisor` class, `acquire_writer` and the queue helpers are importable without a network or a Slack token.
@@ -25,7 +32,10 @@ import urllib.request
 import uuid
 
 ENGINE_ORDER = ("claude-r2d2", "claude-l", "codex")
-MODEL = "claude-fable-5-1"
+MODEL = "claude-fable-5-1"  # the Claude family default; kept for callers that predate models.json
+FAMILIES = ("claude", "codex")
+MEMORY_DIRNAME = os.path.join("factory", "manager-memory")
+MEMORY_SKELETON = "# Manager memory (shared by every engine)\n\n## Facts\n\n## Decisions\n\n## Conflicts\n"
 HANDOFF_MARK = "---HANDOFF---"
 QUOTA_RE = re.compile(r"quota|usage limit|rate|\b40[13]\b", re.IGNORECASE)
 NO_SESSION_RE = re.compile(r"no conversation found|session.*not found|could not find session", re.IGNORECASE)
@@ -340,13 +350,156 @@ def tracks_summary(state):
     return lines
 
 
+# ----------------------------------------------------------------------------------------------- engines and models
+
+class BadEngine(Exception):
+    """An `engine ...` command that names an unknown account, an unknown alias or a model of the wrong family."""
+
+
+def load_models(home=None):
+    """`manager/models.json`, extended by an optional `$HYDRA_HOME/models.json` (same shape, merged per family)."""
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json")
+    try:
+        models = json.loads(read_text(base, "{}") or "{}")
+    except json.JSONDecodeError:
+        models = {}
+    extra_path = os.path.join(home or home_dir(), "models.json")
+    if os.path.exists(extra_path):
+        try:
+            extra = json.loads(read_text(extra_path, "{}") or "{}")
+        except json.JSONDecodeError:
+            extra = {}
+        for fam, spec in (extra.items() if isinstance(extra, dict) else []):
+            if isinstance(spec, dict):
+                target = models.setdefault(fam, {"aliases": {}})
+                target.setdefault("aliases", {}).update(spec.get("aliases") or {})
+                for k in ("default", "id_prefix"):
+                    if spec.get(k):
+                        target[k] = spec[k]
+    for fam in FAMILIES:
+        models.setdefault(fam, {"aliases": {}})
+    return models
+
+
+def family_of(name, engines=None):
+    """`claude-r2d2` and `claude-l` are one family for memory and models; `codex` (or kind: codex) is the other."""
+    if name == "codex" or ((engines or {}).get(name) or {}).get("kind") == "codex":
+        return "codex"
+    return "claude"
+
+
+def family_default_model(family, models=None):
+    models = models or load_models()
+    spec = models.get(family) or {}
+    alias = spec.get("default")
+    return (spec.get("aliases") or {}).get(alias) or alias or (MODEL if family == "claude" else "")
+
+
+def resolve_model(family, text, models=None):
+    """Alias or full id -> full model id for `family`; raises BadEngine with the list of valid aliases."""
+    models = models or load_models()
+    spec = models.get(family) or {}
+    aliases = spec.get("aliases") or {}
+    text = (text or "").strip()
+    if not text:
+        return family_default_model(family, models)
+    if text in aliases:
+        return aliases[text]
+    if text in aliases.values():
+        return text
+    prefix = spec.get("id_prefix")
+    if prefix and text.startswith(prefix) and "=" not in text:
+        return text  # a full id of this family, accepted as-is
+    valid = ", ".join(f"{k} -> {v}" for k, v in aliases.items())
+    for other, other_spec in models.items():
+        other_aliases = other_spec.get("aliases") or {}
+        if other != family and (text in other_aliases or text in other_aliases.values()):
+            raise BadEngine(f"model {text!r} belongs to the {other} family, not to {family}; valid for {family}: {valid}")
+    raise BadEngine(f"unknown model {text!r} for {family}; valid: {valid}" + (f" (or a full id starting with {prefix!r})" if prefix else ""))
+
+
+def carry_model(model, from_family, to_family, models=None):
+    """The model to use after an automatic switch: the same alias when the new family has it, else its default."""
+    models = models or load_models()
+    if from_family == to_family:
+        return model or family_default_model(to_family, models)
+    src = (models.get(from_family) or {}).get("aliases") or {}
+    dst = (models.get(to_family) or {}).get("aliases") or {}
+    for alias, mid in src.items():
+        if mid == model and alias in dst:
+            return dst[alias]
+    return family_default_model(to_family, models)
+
+
+def parse_engine_command(text, current=None, known=ENGINE_ORDER, engines=None, models=None):
+    """`acc=<account> [model=<alias|id>]`, or the legacy `<account>`, or `model=<alias>` alone when `current` gives the
+    account. Returns {"acc", "model"} with the full model id; raises BadEngine (nothing is changed by parsing)."""
+    models = models or load_models()
+    acc = model = None
+    words = (text or "").split()
+    for w in words:
+        if "=" in w:
+            k, v = w.split("=", 1)
+            k = k.strip().lower()
+            if k in ("acc", "account", "engine"):
+                acc = v.strip()
+            elif k == "model":
+                model = v.strip()
+            else:
+                raise BadEngine(f"unknown parameter {k!r}; use acc=<{'|'.join(known)}> [model=<alias>]")
+        elif acc is None:
+            acc = w.strip()
+        else:
+            raise BadEngine(f"unexpected word {w!r}; use acc=<{'|'.join(known)}> [model=<alias>]")
+    if acc is None:
+        if current and current.get("acc"):
+            acc = current["acc"]
+        else:
+            raise BadEngine(f"missing account; use acc=<{'|'.join(known)}> [model=<alias>]")
+    acc = acc.lower()
+    if acc not in known:
+        raise BadEngine(f"unknown engine {acc!r}; one of {', '.join(known)}")
+    family = family_of(acc, engines)
+    return {"acc": acc, "model": resolve_model(family, model, models)}
+
+
+def read_engine(home, engines=None):
+    """The engine file as {"acc", "model"}; a legacy one-word file (or none) gets the family default model."""
+    raw = read_text(os.path.join(home, "engine")).strip()
+    acc, model = "", ""
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict):
+            acc = str(data.get("acc") or "").strip()
+            model = str(data.get("model") or "").strip()
+    else:
+        acc = raw.split()[0] if raw else ""
+    acc = acc or ENGINE_ORDER[0]
+    return {"acc": acc, "model": model or family_default_model(family_of(acc, engines))}
+
+
+def engine_file_is_legacy(home):
+    raw = read_text(os.path.join(home, "engine")).strip()
+    return bool(raw) and not raw.startswith("{")
+
+
 def current_engine(home):
-    name = read_text(os.path.join(home, "engine")).strip()
-    return name or ENGINE_ORDER[0]
+    """The current account name (the old one-word view of the engine file)."""
+    return read_engine(home)["acc"]
 
 
-def set_engine(home, name):
-    write_text(os.path.join(home, "engine"), name + "\n")
+def set_engine(home, name, model=None, engines=None):
+    """Write the JSON engine file; `model` defaults to the family default. Returns the pair written."""
+    pair = {"acc": name, "model": model or family_default_model(family_of(name, engines))}
+    write_text(os.path.join(home, "engine"), json.dumps(pair) + "\n")
+    return pair
+
+
+def engine_label(pair):
+    return f"{pair['acc']} ({pair['model']})"
 
 
 def last_turn(home):
@@ -364,7 +517,7 @@ def status_text(home, repo=None):
     ws = writer_status(home)
     if ws and ws[0] != "stale" and ws[1] and not ws[1].startswith("supervisor"):
         lines.append(f"manager in console session ({ws[1]})")
-    lines.append(f"engine: {current_engine(home)}")
+    lines.append(f"engine: {engine_label(read_engine(home))}")
     lt = last_turn(home)
     if lt:
         when = now_iso(lt.get("at")) if isinstance(lt.get("at"), (int, float)) else str(lt.get("at"))
@@ -380,6 +533,147 @@ def status_text(home, repo=None):
     tracks = tracks_summary(read_state(home, repo))
     lines.append("tracks: " + ("; ".join(tracks) if tracks else "none in state.json"))
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------------------------- shared memory
+
+def memory_dir_for(home, repo=None):
+    """`<repo>/factory/manager-memory` when the faden clone is configured, else `$HYDRA_HOME/manager-memory`."""
+    return os.path.abspath(os.path.join(repo, MEMORY_DIRNAME) if repo else os.path.join(home, "manager-memory"))
+
+
+def read_ledger(memory_dir):
+    return [r for r in read_jsonl(os.path.join(memory_dir, "LEDGER.jsonl")) if isinstance(r, dict)]
+
+
+def dir_hashes(root, skip=("LEDGER.jsonl",)):
+    """{relative path: sha256} of every regular file under `root` (the ledger itself excluded)."""
+    out = {}
+    if not os.path.isdir(root):
+        return out
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d != ".git")
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root)
+            if rel in skip or not os.path.isfile(full):
+                continue
+            try:
+                out[rel] = _digest(full)
+            except OSError:
+                continue
+    return out
+
+
+def files_changed(before, after):
+    """Paths whose hash is new, different or gone between two dir_hashes() snapshots."""
+    return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+
+
+def stamp_handoff(text, engine, at=None):
+    """The handoff body with the two-line header the supervisor keeps on every rewrite."""
+    body = text.rstrip()
+    if body.startswith("updated_at:"):
+        body = strip_handoff_header(body)
+    return f"updated_at: {at or now_iso()}\nengine: {engine}\n\n{body}\n"
+
+
+def strip_handoff_header(text):
+    lines = text.splitlines()
+    if lines and lines[0].startswith("updated_at:"):
+        lines = lines[1:]
+        if lines and lines[0].startswith("engine:"):
+            lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    return "\n".join(lines)
+
+
+def handoff_header(text):
+    """{"updated_at", "engine"} from a stamped handoff; empty values when the header is missing."""
+    out = {"updated_at": "", "engine": ""}
+    for line in text.splitlines()[:2]:
+        if line.startswith("updated_at:"):
+            out["updated_at"] = line.split(":", 1)[1].strip()
+        elif line.startswith("engine:"):
+            out["engine"] = line.split(":", 1)[1].strip()
+    return out
+
+
+def claude_project_dirs(config_dir, cwd):
+    """Candidate `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>` directories for the engine's working directory."""
+    cwd = os.path.abspath(cwd)
+    encodings = [cwd.replace("/", "-"), re.sub(r"[^A-Za-z0-9]", "-", cwd)]
+    seen, out = set(), []
+    for enc in encodings:
+        if enc not in seen:
+            seen.add(enc)
+            out.append(os.path.join(config_dir, "projects", enc))
+    return out
+
+
+def snapshot_claude_memory(config_dir, cwd, dest):
+    """Copy Claude Code's memory notes for `cwd` into `dest` (a mirror: stale .md files in dest are removed).
+    Returns the copied file names; nothing happens when Claude has no memory folder yet."""
+    src = None
+    for d in claude_project_dirs(config_dir, cwd):
+        if os.path.isdir(os.path.join(d, "memory")):
+            src = os.path.join(d, "memory")
+            break
+    if src is None:
+        return []
+    os.makedirs(dest, exist_ok=True)
+    names = sorted(n for n in os.listdir(src) if n.endswith(".md") and os.path.isfile(os.path.join(src, n)))
+    for n in names:
+        s_path, d_path = os.path.join(src, n), os.path.join(dest, n)
+        if not os.path.exists(d_path) or _digest(s_path) != _digest(d_path):
+            shutil.copyfile(s_path, d_path)
+    for n in os.listdir(dest):
+        if n.endswith(".md") and n not in names and os.path.isfile(os.path.join(dest, n)):
+            os.remove(os.path.join(dest, n))
+    return names
+
+
+def memory_preamble(memory_dir, family, engines=None):
+    """The three `[memory]` lines for a turn about to run on `family`, computed from the ledger and the handoff
+    header. Paths are relative to the memory folder; the engine never compares file dates itself."""
+    ledger = read_ledger(memory_dir)
+    fam = lambda e: family_of(str(e.get("engine") or ""), engines)  # noqa: E731
+    last = ledger[-1] if ledger else None
+    mine = [e for e in ledger if fam(e) == family]
+    my_last = mine[-1] if mine else None
+    if last:
+        line1 = f"[memory] last turn: {last.get('at')} on {last.get('engine')} (turn {last.get('turn')})."
+    else:
+        line1 = "[memory] last turn: none."
+    line1 += f" your last turn on {family}: " + (f"turn {my_last.get('turn')} at {my_last.get('at')}." if my_last else "none.")
+    changed = {}
+    cutoff = my_last.get("turn") if my_last else None
+    for e in ledger:
+        try:
+            after_cutoff = cutoff is None or int(e.get("turn") or 0) > int(cutoff)
+        except (TypeError, ValueError):
+            after_cutoff = True
+        if not after_cutoff or fam(e) == family:
+            continue
+        for path in e.get("files_written") or []:
+            changed[path] = e.get("at")
+    handoff_text = read_text(os.path.join(memory_dir, "MANAGER-HANDOFF.md"))
+    header = handoff_header(handoff_text)
+    if header["engine"] and family_of(header["engine"], engines) != family and "MANAGER-HANDOFF.md" not in changed:
+        changed["MANAGER-HANDOFF.md"] = header["updated_at"] or "unknown"
+    if changed:
+        line2 = "[memory] changed by other engines since then: " + ", ".join(f"{p} ({at})" for p, at in changed.items()) + "."
+    else:
+        line2 = "[memory] changed by other engines since then: none (same engine since your last turn)."
+    writers = [e for e in ledger if "MEMORY.md" in (e.get("files_written") or [])]
+    if writers:
+        w = writers[-1]
+        line3 = f"[memory] MEMORY.md last written {w.get('at')} by {w.get('engine')}."
+    else:
+        line3 = "[memory] MEMORY.md last written never."
+    line3 += " Read the changed files before acting."
+    return "\n".join((line1, line2, line3))
 
 
 # ----------------------------------------------------------------------------------------------- the message
@@ -455,6 +749,8 @@ class Supervisor:
         self.repo = repo if repo is not None else self.config.get("repo")
         self.dev_channel = self.config.get("dev_channel") or DEFAULT_DEV_CHANNEL
         self.engine_timeout = engine_timeout
+        self.models = load_models(self.home)
+        self.memory_dir = memory_dir_for(self.home, self.repo)
         for d in ("inbox", "inbox/files", "inbox/replies", "logs", "mirror", "credentials", ".claude"):
             os.makedirs(os.path.join(self.home, d), exist_ok=True)
 
@@ -513,14 +809,18 @@ class Supervisor:
         started = time.time()
         n = len(self.turns()) + 1
         self.sync_repo_before()
+        self.ensure_memory_layout()
+        before = dir_hashes(self.memory_dir)
         message = build_message(events)
         notes = []
         try:
-            engine, stdout, tokens = self.run_engines(message, notes)
+            engine, model, stdout, tokens = self.run_engines(message, notes)
         except AllEnginesFailed as e:
             log(f"turn {n}: every engine failed: {e}")
+            pair = read_engine(self.home, self.engines)
             append_jsonl(self.path("logs", "turns.jsonl"),
-                         {"n": n, "at": started, "engine": current_engine(self.home), "events": [ev["id"] for ev in events],
+                         {"n": n, "at": started, "engine": pair["acc"], "model": pair["model"],
+                          "events": [ev["id"] for ev in events],
                           "duration_s": round(time.time() - started, 3), "error": str(e)[:2000]})
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
             self.post_unavailable(events)
@@ -530,10 +830,13 @@ class Supervisor:
         reply, handoff = split_handoff(stdout)
         reply = sanitize_reply(reply)
         if handoff:
-            write_text(self.path("MANAGER-HANDOFF.md"), handoff.rstrip() + "\n")
+            self.write_handoff(handoff, engine)
+        if family_of(engine, self.engines) == "claude":
+            self.snapshot_claude_memory()
+        self.append_ledger(n, engine, model, before)
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
-        record = {"n": n, "at": started, "engine": engine, "events": [ev["id"] for ev in events],
+        record = {"n": n, "at": started, "engine": engine, "model": model, "events": [ev["id"] for ev in events],
                   "duration_s": round(time.time() - started, 3)}
         if tokens is not None:
             record["tokens"] = tokens
@@ -542,6 +845,51 @@ class Supervisor:
         self.deliver(deliveries, [ev["id"] for ev in events], n)
         self.persist(n)
         return True
+
+    # ---- shared memory (factory/manager-memory in the clone)
+    def handoff_path(self):
+        return os.path.join(self.memory_dir, "MANAGER-HANDOFF.md")
+
+    def ensure_memory_layout(self):
+        """The memory folder with its skeleton; the handoff moved there with a symlink left at the old path."""
+        os.makedirs(os.path.join(self.memory_dir, "claude"), exist_ok=True)
+        os.makedirs(os.path.join(self.memory_dir, "codex"), exist_ok=True)
+        shared = os.path.join(self.memory_dir, "MEMORY.md")
+        if not os.path.exists(shared):
+            write_text(shared, MEMORY_SKELETON)
+        old = self.path("MANAGER-HANDOFF.md")
+        new = self.handoff_path()
+        if os.path.islink(old):
+            if os.path.realpath(old) != os.path.realpath(new):
+                os.remove(old)
+        elif os.path.exists(old):
+            if not os.path.exists(new):
+                shutil.move(old, new)
+            else:
+                os.remove(old)  # the memory copy is the stamped, committed one
+        if not os.path.lexists(old):
+            os.symlink(new, old)
+
+    def write_handoff(self, handoff, engine):
+        write_text(self.handoff_path(), stamp_handoff(handoff, engine))
+
+    def read_handoff(self):
+        return read_text(self.handoff_path()) or read_text(self.path("MANAGER-HANDOFF.md"))
+
+    def snapshot_claude_memory(self):
+        return snapshot_claude_memory(self.path(".claude"), self.home, os.path.join(self.memory_dir, "claude"))
+
+    def append_ledger(self, n, engine, model, before):
+        after = dir_hashes(self.memory_dir)
+        handoff_text = read_text(self.handoff_path())
+        record = {"turn": n, "at": now_iso(), "engine": engine, "model": model,
+                  "files_written": files_changed(before, after),
+                  "handoff_sha": hashlib.sha256(handoff_text.encode("utf-8")).hexdigest() if handoff_text else None}
+        append_jsonl(os.path.join(self.memory_dir, "LEDGER.jsonl"), record)
+        return record
+
+    def preamble_for(self, name):
+        return memory_preamble(self.memory_dir, family_of(name, self.engines), self.engines)
 
     # ---- engines
     def engine_order(self):
@@ -574,7 +922,13 @@ class Supervisor:
         return False
 
     def run_engines(self, message, notes):
-        current = current_engine(self.home)
+        """Try the engines from the current one. Returns (engine, model, stdout, tokens). Each attempt gets its own
+        memory preamble (the family may differ) and the model carried over from the current pair."""
+        if engine_file_is_legacy(self.home):
+            pair = read_engine(self.home, self.engines)
+            set_engine(self.home, pair["acc"], pair["model"], self.engines)  # upgrade the one-word file to JSON
+        pair = read_engine(self.home, self.engines)
+        current = pair["acc"]
         errors = []
         persist_switch = False  # a quota or budget move is persisted; a plain failure is not
         for name in self.engine_order():
@@ -586,13 +940,15 @@ class Supervisor:
                 errors.append((name, "over budget"))
                 persist_switch = True
                 continue
-            rc, out, err, tokens = self.invoke(name, spec, message)
+            model = carry_model(pair["model"], family_of(current, self.engines), family_of(name, self.engines), self.models)
+            full = self.preamble_for(name) + "\n\n" + message
+            rc, out, err, tokens = self.invoke(name, spec, full, model)
             if rc == 0:
                 if name != current:
                     if persist_switch:
-                        set_engine(self.home, name)
-                    notes.append(f"engine: {name}")
-                return name, out, tokens
+                        set_engine(self.home, name, model, self.engines)
+                    notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
+                return name, model, out, tokens
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
             log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
             if QUOTA_RE.search(err or ""):
@@ -603,6 +959,8 @@ class Supervisor:
         env = {k: v for k, v in os.environ.items()
                if not (k.startswith("CLAUDE") or k.startswith("ANTHROPIC"))}
         env["CLAUDE_CONFIG_DIR"] = self.path(".claude")
+        env["HYDRA_HOME"] = self.home
+        env["HYDRA_MEMORY_DIR"] = self.memory_dir
         cred = spec.get("cred")
         if cred:
             cred_path = cred if os.path.isabs(cred) else self.path("credentials", cred)
@@ -614,20 +972,21 @@ class Supervisor:
     def session_id(self):
         return read_text(self.path("session-id")).strip()
 
-    def invoke(self, name, spec, message):
+    def invoke(self, name, spec, message, model=None):
         """Run one engine on the batched message. Returns (rc, stdout, stderr, tokens)."""
+        model = model or family_default_model(family_of(name, self.engines), self.models)
         if name == "codex" or spec.get("kind") == "codex":
-            return self.invoke_codex(spec, message)
+            return self.invoke_codex(spec, message, model)
         sid = self.session_id()
         resume = bool(sid)
         if not sid:
             sid = str(uuid.uuid4())
         argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
-               ["--model", MODEL, "--dangerously-skip-permissions", "--output-format", "json"]
+               ["--model", model, "--dangerously-skip-permissions", "--output-format", "json"]
         rc, out, err = self._run(argv, message, self.engine_env(spec))
         if rc != 0 and resume and NO_SESSION_RE.search(err or ""):
             sid = str(uuid.uuid4())
-            argv = [spec["bin"], "-p", "--session-id", sid, "--model", MODEL, "--dangerously-skip-permissions",
+            argv = [spec["bin"], "-p", "--session-id", sid, "--model", model, "--dangerously-skip-permissions",
                     "--output-format", "json"]
             rc, out, err = self._run(argv, message, self.engine_env(spec))
         tokens = None
@@ -655,18 +1014,20 @@ class Supervisor:
                 return str(data.get("result") or ""), tokens, bool(data.get("is_error")), data.get("session_id")
         return stdout, None, False, None
 
-    def invoke_codex(self, spec, message):
-        prefix = ["# MANAGER-HANDOFF.md", read_text(self.path("MANAGER-HANDOFF.md"), "(none)").rstrip(),
+    def invoke_codex(self, spec, message, model=None):
+        model = model or family_default_model("codex", self.models)
+        preamble, sep, body = message.partition("\n\n") if message.startswith("[memory]") else ("", "", message)
+        prefix = ["# MANAGER-HANDOFF.md", (self.read_handoff() or "(none)").rstrip(),
                   "", "# factory/state.json", read_text(state_path(self.home, self.repo), "{}").rstrip(), ""]
-        full = "\n".join(prefix) + "\n" + message
+        full = (preamble + "\n\n" if preamble else "") + "\n".join(prefix) + "\n" + body
         last = self.path("logs", "codex-last-message.txt")
         with contextlib.suppress(FileNotFoundError):
             os.remove(last)
         resumable = os.path.exists(self.path("codex-session"))
         if resumable:
-            argv = [spec["bin"], "exec", "resume", "--last", "--skip-git-repo-check", "-o", last, "-"]
+            argv = [spec["bin"], "exec", "resume", "--last", "--skip-git-repo-check", "-m", model, "-o", last, "-"]
         else:
-            argv = [spec["bin"], "exec", "--skip-git-repo-check", "-o", last, "-"]
+            argv = [spec["bin"], "exec", "--skip-git-repo-check", "-m", model, "-o", last, "-"]
         env = self.engine_env({"cred": None})
         rc, out, err = self._run(argv, full, env)
         if rc == 0:
@@ -740,6 +1101,7 @@ class Supervisor:
             while pending["slack"]:
                 item = pending["slack"][0]
                 self.poster(item["channel"], item["thread_ts"], item["text"])
+                self.mirror_own_reply(item["channel"], item["thread_ts"], item["text"], n)
                 pending["slack"].pop(0)
             while pending["cli"]:
                 item = pending["cli"][0]
@@ -748,6 +1110,7 @@ class Supervisor:
                     mirror = "\n".join(mirror.splitlines()[:LONG_REPLY_HEAD]) + \
                              f"\n… full reply in inbox/replies/{item['id']}.txt"
                 self.poster(item["channel"], None, mirror)
+                self.mirror_own_reply(item["channel"], None, mirror, n)
                 pending["cli"].pop(0)
         except Exception as e:  # delivery failed: keep the reply, do not handle the events
             log(f"delivery failed, reply kept pending: {e}")
@@ -755,6 +1118,14 @@ class Supervisor:
             return False
         mark_handled(self.home, event_ids, turn=n)
         return True
+
+    def mirror_own_reply(self, channel, thread_ts, text, n):
+        """The bridge mirrors everyone but the manager; the supervisor mirrors its own posts into the channel log."""
+        if not channel:
+            return
+        append_jsonl(self.path("mirror", f"{channel}.jsonl"),
+                     {"mirrored_at": time.time(), "type": "message", "ts": None, "thread_ts": thread_ts,
+                      "user": "manager", "bot_id": None, "subtype": "manager_reply", "turn": n, "text": text})
 
     def deliver_pending(self):
         path = self.path("inbox", "pending-replies.jsonl")
@@ -806,7 +1177,8 @@ class Supervisor:
             shutil.copyfile(repo_state, self.path("state.json"))
 
     def persist(self, n):
-        """Copy mirror/ into factory/log/ and state.json into factory/, commit `manager: turn <n>`, push."""
+        """Copy mirror/ into factory/log/ and state.json into factory/, add the memory folder, commit
+        `manager: turn <n>`, push."""
         if not self.repo:
             return False
         if not os.path.isdir(os.path.join(self.repo, ".git")):
@@ -825,8 +1197,10 @@ class Supervisor:
         if os.path.exists(home_state) and (not os.path.exists(repo_state) or _digest(home_state) != _digest(repo_state)):
             os.makedirs(os.path.dirname(repo_state), exist_ok=True)
             shutil.copyfile(home_state, repo_state)
+        paths = ["factory/log"] + (["factory/state.json"] if os.path.exists(repo_state) else []) + \
+                ([MEMORY_DIRNAME] if os.path.isdir(os.path.join(self.repo, MEMORY_DIRNAME)) else [])
         try:
-            self._git("add", "-A", "--", "factory/log", *(["factory/state.json"] if os.path.exists(repo_state) else []))
+            self._git("add", "-A", "--", *paths)
             if self._git("diff", "--cached", "--quiet").returncode == 0:
                 return False
             self._git("commit", "-q", "-m", f"manager: turn {n}", check=True)

@@ -4,7 +4,7 @@
 `Bridge(home, allowlist, poster, token_env)` is testable without a client: `handle_message(event)`,
 `handle_file(event)`, `handle_reaction(event)`. Every message in a channel the bot is in is mirrored to
 `$HYDRA_HOME/mirror/<channel>.jsonl`; messages from allowlisted senders are queued for the supervisor; five commands
-(`status`, `pause`, `resume`, `engine <name>`, `digest now`) are answered without a turn.
+(`status`, `pause`, `resume`, `engine [acc=<account>] [model=<alias>]`, `digest now`) are answered without a turn.
 
 Entry points: `bridge.py --check` validates `allowlist.json` and the presence of `credentials/slack.env` without
 connecting; no argument runs the Socket Mode service (systemd).
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import supervisor as S  # noqa: E402
 
 MENTION_RE = re.compile(r"<@([A-Za-z0-9_]+)(?:\|[^>]*)?>")
-COMMAND_RE = re.compile(r"^(status|pause|resume|digest now|engine(?:\s+(\S+))?)$", re.IGNORECASE)
+COMMAND_RE = re.compile(r"^(status|pause|resume|digest now|engine(?:\s+(.+?))?)\s*$", re.IGNORECASE)
 INSTRUCT_COMMANDS = ("pause", "resume", "engine", "digest")
 SKIPPED_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave", "channel_topic",
                     "channel_purpose", "channel_name", "group_join", "group_leave"}
@@ -233,15 +233,18 @@ class Bridge:
                 os.remove(self.path("PAUSE"))
                 self.reply(channel, thread_ts, f"resumed; {S.queue_depth(self.home)} event(s) queued")
         elif name == "engine":
-            target = (m.group(2) or "").lower()
+            target = (m.group(2) or "").strip()
+            current = S.read_engine(self.home)
             if not target:
-                self.reply(channel, thread_ts, f"engine: {S.current_engine(self.home)}")
-            elif target not in S.ENGINE_ORDER:
-                self.reply(channel, thread_ts, f"unknown engine `{target}`; one of {', '.join(S.ENGINE_ORDER)}")
-                return {"command": word, "ok": False}
+                self.reply(channel, thread_ts, f"engine: {S.engine_label(current)}")
             else:
-                S.set_engine(self.home, target)
-                self.reply(channel, thread_ts, f"engine: {target}")
+                try:
+                    pair = S.parse_engine_command(target, current=current)
+                except S.BadEngine as e:
+                    self.reply(channel, thread_ts, f"{e}; nothing changed (engine: {S.engine_label(current)})")
+                    return {"command": word, "ok": False}
+                S.set_engine(self.home, pair["acc"], pair["model"])
+                self.reply(channel, thread_ts, f"engine: {S.engine_label(pair)}")
         elif name == "digest":
             S.append_event(self.home, S.new_event(
                 "timer", {"text": "digest now: write the digest (what ran, what it found, what it cost, what needs a "

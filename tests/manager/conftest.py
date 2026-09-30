@@ -79,6 +79,11 @@ class FakePoster:
         return " ".join(t for _, _, t in self.posted)
 
 
+def engine_acc(h):
+    """The account named by the JSON engine file (or a legacy one-word file)."""
+    return S.read_engine(h)["acc"]
+
+
 def queue_event(h, text, source="slack", sender="U_FOUNDER", ts=None, instructs=True, channel="C_DEV", thread="1.0"):
     ev = {"id": ts or str(uuid.uuid4()), "source": source, "at": time.time(),
           "payload": {"channel": channel, "thread_ts": thread, "user": sender, "text": text, "instructs": instructs}}
