@@ -27,7 +27,7 @@ inbox/pending-replies.jsonl replies whose delivery failed; delivered first on th
 inbox/replies/<id>.txt      replies to console (`hydra say`) events
 inbox/files/<ts>-<name>     attachments downloaded by the bridge
 mirror/<channel>.jsonl      every message in a channel the bot is in (copied to factory/log/ and committed)
-logs/turns.jsonl            {n, at, engine, events, duration_s, tokens?, error?} per turn
+logs/turns.jsonl            {n, at, engine, model, account, events, duration_s, tokens?, error?} per turn
 logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/posts.jsonl (dry mode)
 engine                      current engine: claude-r2d2 | claude-l | codex
 session-id                  the manager's Claude session id (created on the first turn)
@@ -62,8 +62,26 @@ are resolved with `shutil.which()` using the supervisor process's `PATH` (not th
 ```
 
 Claude credential paths are relative to `$HYDRA_HOME/credentials`. Codex uses its own login as `hydra`,
-not a Claude credential (`cred: null`). The table is loaded at supervisor startup; configuration-table
-changes require a supervisor restart, while the current `engine` file is read each turn.
+not a Claude credential (`cred: null`). The engine table and current `engine` file are read each turn.
+
+`hydra status` and `@manager status` include exactly one model/account line, for example:
+
+```text
+model: claude-r2d2 = claude-fable-5-1 via Claude account R2D2
+```
+
+`default_engines()` is the shared source for selection, status and turn logging. Both Claude engines
+use `claude-fable-5-1`, via `Claude account R2D2` or `Claude account L`; Codex uses `ChatGPT Pro`.
+Optional `config.json.engines.<name>.model` and `.account` override these values (account is a display
+label, not an authentication switch). Codex otherwise reads the selected profile's model or top-level
+model in `$CODEX_HOME/config.toml` (default `~/.codex`). Without either, it selects the lowest-priority
+visible model in that installation's `models_cache.json`; no vendor model ID is hardcoded. The resolved
+model is passed explicitly as `--model` on both fresh and resumed turns, preventing an old session's
+model from disagreeing with status. Hydra's explicit model selection takes precedence over Codex's
+project-local selection. Missing/unreadable metadata displays `unknown` and leaves selection to Codex.
+
+`hydra logs` prints the same line per turn using **captured** model/account fields, never today's
+configuration. Legacy records without those fields display `unknown`, rather than invented history.
 
 ### Switching and forcing an engine
 
@@ -98,7 +116,8 @@ Both engines launch in `$HYDRA_HOME` (normally `/srv/hydra/manager`). Claude rea
 /srv/hydra/manager/AGENTS.md -> app/manager/CLAUDE.md
 ```
 
-This is a symlink, not a second editable rules file; reinstalling manager code refreshes its target.
+This is a symlink, not a second editable rules file; `install_manager()` refreshes both its target and
+the installed `$HYDRA_HOME/CLAUDE.md` on every install, including reruns with existing rules.
 The working directory is not a Git checkout, so a direct rules probe as `hydra` needs the same flag used
 by the supervisor: `codex exec --skip-git-repo-check "summarize the rules you were given in three lines"`.
 

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import urllib.request
 import uuid
 
@@ -118,12 +119,42 @@ def load_config(home):
     return cfg if isinstance(cfg, dict) else {}
 
 
+def codex_model():
+    """Read only model-selection metadata, never auth. No guessed vendor default.
+
+    Pin the resolved selection with --model on fresh AND resumed turns, so the
+    status cannot disagree with a resumed session's previous model.
+    """
+    root = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    try:
+        cfg = tomllib.loads(read_text(os.path.join(root, "config.toml")))
+        profile = (cfg.get("profiles") or {}).get(cfg.get("profile"), {})
+        model = profile.get("model") or cfg.get("model")
+        if isinstance(model, str) and model:
+            return model
+    except (ValueError, TypeError, AttributeError):
+        return None
+    try:
+        cache = json.loads(read_text(os.path.join(root, "models_cache.json"), "{}"))
+        models = [m for m in cache.get("models", []) if m.get("visibility") == "list" and m.get("slug")]
+        return min(models, key=lambda m: m.get("priority", float("inf")))["slug"] if models else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def model_line(name, spec):
+    return f"model: {name} = {spec.get('model') or 'unknown'} via {spec.get('account') or 'unknown'}"
+
+
 def default_engines(home=None, config=None):
     cfg = config if config is not None else load_config(home or home_dir())
     engines = {
-        "claude-r2d2": {"bin": shutil.which("claude") or "claude", "cred": "claude-r2d2.env"},
-        "claude-l": {"bin": shutil.which("claude") or "claude", "cred": "claude-l.env"},
-        "codex": {"bin": shutil.which("codex") or "codex", "cred": None},
+        "claude-r2d2": {"bin": shutil.which("claude") or "claude", "cred": "claude-r2d2.env",
+                        "model": MODEL, "account": "Claude account R2D2"},
+        "claude-l": {"bin": shutil.which("claude") or "claude", "cred": "claude-l.env",
+                     "model": MODEL, "account": "Claude account L"},
+        "codex": {"bin": shutil.which("codex") or "codex", "cred": None,
+                  "model": codex_model(), "account": "ChatGPT Pro"},
     }
     for name, spec in (cfg.get("engines") or {}).items():
         if isinstance(spec, dict):
@@ -364,7 +395,9 @@ def status_text(home, repo=None):
     ws = writer_status(home)
     if ws and ws[0] != "stale" and ws[1] and not ws[1].startswith("supervisor"):
         lines.append(f"manager in console session ({ws[1]})")
-    lines.append(f"engine: {current_engine(home)}")
+    name = current_engine(home)
+    lines.append(f"engine: {name}")
+    lines.append(model_line(name, default_engines(home, cfg).get(name, {})))
     lt = last_turn(home)
     if lt:
         when = now_iso(lt.get("at")) if isinstance(lt.get("at"), (int, float)) else str(lt.get("at"))
@@ -450,7 +483,11 @@ class Supervisor:
         self.config = dict(load_config(self.home))
         if config:
             self.config.update(config)
-        self.engines = engines if engines is not None else default_engines(self.home, self.config)
+        defaults = default_engines(self.home, self.config)
+        self.engines = ({name: {**defaults.get(name, {}), **spec} for name, spec in engines.items()}
+                        if engines is not None else defaults)
+        self._refresh_engines = engines is None
+        self._config_overrides = config or {}
         self.poster = poster if poster is not None else default_poster(self.home)
         self.repo = repo if repo is not None else self.config.get("repo")
         self.dev_channel = self.config.get("dev_channel") or DEFAULT_DEV_CHANNEL
@@ -511,6 +548,9 @@ class Supervisor:
     # ---- one turn
     def turn(self, events):
         started = time.time()
+        if self._refresh_engines:
+            cfg = {**load_config(self.home), **self._config_overrides}
+            self.engines = default_engines(self.home, cfg)
         n = len(self.turns()) + 1
         self.sync_repo_before()
         message = build_message(events)
@@ -520,7 +560,8 @@ class Supervisor:
         except AllEnginesFailed as e:
             log(f"turn {n}: every engine failed: {e}")
             append_jsonl(self.path("logs", "turns.jsonl"),
-                         {"n": n, "at": started, "engine": current_engine(self.home), "events": [ev["id"] for ev in events],
+                         {"n": n, "at": started, "engine": current_engine(self.home),
+                          **self.engine_identity(current_engine(self.home)), "events": [ev["id"] for ev in events],
                           "duration_s": round(time.time() - started, 3), "error": str(e)[:2000]})
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
             self.post_unavailable(events)
@@ -533,7 +574,8 @@ class Supervisor:
             write_text(self.path("MANAGER-HANDOFF.md"), handoff.rstrip() + "\n")
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
-        record = {"n": n, "at": started, "engine": engine, "events": [ev["id"] for ev in events],
+        record = {"n": n, "at": started, "engine": engine, **self.engine_identity(engine),
+                  "events": [ev["id"] for ev in events],
                   "duration_s": round(time.time() - started, 3)}
         if tokens is not None:
             record["tokens"] = tokens
@@ -544,6 +586,10 @@ class Supervisor:
         return True
 
     # ---- engines
+    def engine_identity(self, name):
+        spec = self.engines.get(name, {})
+        return {key: spec.get(key) or "unknown" for key in ("model", "account")}
+
     def engine_order(self):
         current = current_engine(self.home)
         names = [x for x in ENGINE_ORDER if x in self.engines] + [x for x in self.engines if x not in ENGINE_ORDER]
@@ -623,11 +669,11 @@ class Supervisor:
         if not sid:
             sid = str(uuid.uuid4())
         argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
-               ["--model", MODEL, "--dangerously-skip-permissions", "--output-format", "json"]
+               ["--model", spec["model"], "--dangerously-skip-permissions", "--output-format", "json"]
         rc, out, err = self._run(argv, message, self.engine_env(spec))
         if rc != 0 and resume and NO_SESSION_RE.search(err or ""):
             sid = str(uuid.uuid4())
-            argv = [spec["bin"], "-p", "--session-id", sid, "--model", MODEL, "--dangerously-skip-permissions",
+            argv = [spec["bin"], "-p", "--session-id", sid, "--model", spec["model"], "--dangerously-skip-permissions",
                     "--output-format", "json"]
             rc, out, err = self._run(argv, message, self.engine_env(spec))
         tokens = None
@@ -667,6 +713,8 @@ class Supervisor:
             argv = [spec["bin"], "exec", "resume", "--last", "--skip-git-repo-check", "-o", last, "-"]
         else:
             argv = [spec["bin"], "exec", "--skip-git-repo-check", "-o", last, "-"]
+        if spec.get("model"):
+            argv[-1:-1] = ["--model", spec["model"]]
         env = self.engine_env({"cred": None})
         rc, out, err = self._run(argv, full, env)
         if rc == 0:
