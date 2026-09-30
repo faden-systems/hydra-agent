@@ -30,6 +30,15 @@ class FakePoster:
     def __call__(self, channel, thread_ts, text): self.posted.append((channel, thread_ts, text))
 
 
+def engine_acc(h):
+    """The engine file is plain text in b1 and JSON {"acc","model"} from b2 on; accept both."""
+    raw = open(os.path.join(h, "engine")).read().strip()
+    try:
+        return json.loads(raw)["acc"]
+    except (ValueError, KeyError, TypeError):
+        return raw
+
+
 def home():
     h = tempfile.mkdtemp()
     for d in ("inbox", "inbox/files", "logs", "credentials", ".claude", "mirror"): os.makedirs(os.path.join(h, d))
@@ -78,7 +87,7 @@ def main():
     event(h2, "hello"); assert sup2.run_once() is True
     texts = " ".join(t for _, _, t in post2.posted)
     assert "handled 1 events" in texts and "engine: claude-l" in texts, post2.posted
-    assert open(os.path.join(h2, "engine")).read().strip() == "claude-l", "the switch must persist"
+    assert engine_acc(h2) == "claude-l", "the switch must persist"
     assert calls(os.path.dirname(good))[-1]["env"].get("CLAUDE_CODE_OAUTH_TOKEN") == "fake-claude-l", "the second engine must run with its own token"
     # both Claude engines out: Codex takes the turn with the handoff and state on stdin
     h3 = home(); bad1 = fake_engine(tempfile.mkdtemp(), "quota"); bad2 = fake_engine(tempfile.mkdtemp(), "quota"); cdx_dir = tempfile.mkdtemp(); cdx = fake_engine(cdx_dir, "ok", name="codex")
@@ -86,7 +95,7 @@ def main():
     post3 = FakePoster(); sup3 = S.Supervisor(home=h3, engines=engines(bad1, bad2, cdx), poster=post3)
     event(h3, "still there?"); assert sup3.run_once() is True
     c3 = calls(cdx_dir)[-1]; assert "tracks: t9" in c3["stdin"] and '"t9"' in c3["stdin"], ("codex must receive the handoff and the state", c3["stdin"][:200])
-    assert "engine: codex" in " ".join(t for _, _, t in post3.posted) and open(os.path.join(h3, "engine")).read().strip() == "codex"
+    assert "engine: codex" in " ".join(t for _, _, t in post3.posted) and engine_acc(h3) == "codex"
     print("3 ok: engine rotation on quota, codex fallback with handoff + state")
     # 4. PAUSE blocks; the bridge answers paused to a command
     open(os.path.join(h, "PAUSE"), "w").write("L\n"); event(h, "anything")

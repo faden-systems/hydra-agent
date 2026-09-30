@@ -9,7 +9,7 @@ fence() {
 echo "[b2] fence..."; fence
 for f in manager/models.json manager/CLAUDE.md; do test -f "$f" || { echo "[b2] FAIL: $f missing"; exit 1; }; done
 grep -q 'Newer wins' manager/CLAUDE.md || { echo "[b2] FAIL: the memory rule is not in CLAUDE.md"; exit 1; }
-grep -q 'update' manager/hydra || { echo "[b2] FAIL: hydra has no update command"; exit 1; }
+# hydra update is exercised by the acceptance harness (case 7), not by grep
 grep -rEq 'xoxb-[0-9]|xapp-[0-9]|sk-ant-oat' manager/ tests/ setup/ 2>/dev/null && { echo "[b2] FAIL: token-shaped string"; exit 1; } || true
 echo "[b2] venv + tests..."
 [ -d .venv ] || python3 -m venv .venv
