@@ -1,4 +1,6 @@
 [Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=3
 Description=Hydra manager: the Slack bridge (@manager, Socket Mode)
 After=network-online.target
 Wants=network-online.target
@@ -11,7 +13,7 @@ WorkingDirectory=/srv/hydra/manager
 Environment=HOME=/home/hydra
 Environment=HYDRA_HOME=/srv/hydra/manager
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 /srv/hydra/manager/app/manager/bridge.py
+ExecStart=/srv/hydra/manager/venv/bin/python /srv/hydra/manager/app/manager/bridge.py
 Restart=always
 RestartSec=10
 UMask=0077

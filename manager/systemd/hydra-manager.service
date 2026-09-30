@@ -1,4 +1,6 @@
 [Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=3
 Description=Hydra manager: the supervisor (one persistent Claude Code session behind @manager)
 After=network-online.target
 Wants=network-online.target
@@ -14,7 +16,7 @@ Environment=CLAUDE_CONFIG_DIR=/srv/hydra/manager/.claude
 Environment=GH_CONFIG_DIR=/home/hydra/.config/gh
 Environment=GIT_TERMINAL_PROMPT=0
 Environment=PATH=/opt/hydra-tools/bin:/opt/hydra-node/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 /srv/hydra/manager/app/manager/supervisor.py
+ExecStart=/srv/hydra/manager/venv/bin/python /srv/hydra/manager/app/manager/supervisor.py
 Restart=always
 RestartSec=10
 UMask=0077
