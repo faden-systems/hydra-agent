@@ -48,6 +48,32 @@ venv/                       the project venv (slack_bolt); the entry points re-e
 app/manager/                this directory, installed by setup/manager-vm.sh
 ```
 
+## Repository configuration
+
+The service reads `/srv/hydra/manager/config.json` (`$HYDRA_HOME/config.json`), not a
+config in the deployed `app/manager/` directory. `setup/manager-vm.sh` seeds:
+
+```json
+{"repo": "/srv/hydra/repos/faden"}
+```
+
+The bootstrap uses `$REPOS/faden` and adds `repo` **only when the key is missing**,
+creating the config if absent. Other keys and an existing custom `repo` are preserved;
+an existing key, including an explicit empty or null value, is not overwritten. Writes
+are atomic, mode `0600`, and owned by `hydra`; reruns with a repo key leave the file
+untouched. Invalid JSON, non-object configs and symlinks fail without overwriting them.
+The unit intentionally has no `--repo` override, so this config remains authoritative.
+
+With the default, shared memory lives at `/srv/hydra/repos/faden/factory/manager-memory/`,
+and the supervisor commits memory, state and logs to that clone. Without a configured
+repo it falls back to `$HYDRA_HOME/manager-memory/` and does not persist to Git.
+Bootstrap only sets the path: it neither migrates existing local memory nor validates
+that a private clone is ready. Before an operator starts/restarts the service, ensure
+the configured clone exists and migrate any existing local memory separately.
+`hydra update` refreshes code but does not seed or migrate this config; existing
+installations need a separately approved config change. Repo changes take effect
+when the supervisor restarts.
+
 ## Engines
 
 The supervisor loads `default_engines()` in `app/manager/supervisor.py`, then applies optional
@@ -222,5 +248,7 @@ and the presence of `credentials/slack.env`.
 `setup/manager-vm.sh` copies this directory to `/srv/hydra/manager/app/manager/`, installs `CLAUDE.md` at
 `/srv/hydra/manager/CLAUDE.md`, creates `AGENTS.md -> app/manager/CLAUDE.md` in the same working directory,
 creates `/srv/hydra/manager/venv` with `slack_bolt` and `slack_sdk`, installs both units and
-`/usr/local/bin/hydra`. Then (a human, over SSH, never through Slack): `credentials/slack.env`, `allowlist.json`,
-`config.json` with the faden clone and the `#dev` channel id, `systemctl restart hydra-manager hydra-bridge`.
+`/usr/local/bin/hydra`, and defaults a missing `config.json.repo` to `/srv/hydra/repos/faden`
+without replacing other settings. Then (a human, over SSH, never through Slack):
+`credentials/slack.env`, `allowlist.json`, add the `#dev` channel id to the existing
+`config.json`, verify the configured clone/memory, and `systemctl restart hydra-manager hydra-bridge`.

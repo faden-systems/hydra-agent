@@ -274,6 +274,44 @@ EOF
     systemctl is-active --quiet hydra-manager.service
 }
 
+configure_manager_repo() {
+    # Config is the service's source of truth: never override an operator's repo.
+    [[ ! -L $MANAGER ]] || { fail 'Refusing manager symlink'; return 1; }
+    # Write as hydra, not root, so both the temporary file and replacement are safely owned.
+    as_hydra python3.12 - "$MANAGER/config.json" "$REPOS/faden" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+config = Path(sys.argv[1])
+if config.is_symlink():
+    sys.exit("Refusing config.json symlink")
+try:
+    data = json.loads(config.read_text())
+except FileNotFoundError:
+    data = {}
+if not isinstance(data, dict):
+    sys.exit("config.json must contain a JSON object")
+if "repo" in data:
+    sys.exit(0)
+data["repo"] = sys.argv[2]
+# Same-directory replacement: readers see either the old complete JSON or the new one.
+fd, temporary = tempfile.mkstemp(prefix=".config.json.", dir=config.parent)
+try:
+    with os.fdopen(fd, "w") as output:
+        json.dump(data, output, indent=2)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, config)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+}
+
 install_manager() {
     # The manager from the hydra-agent checkout (loops/b1.md): code to $MANAGER/app/manager/, rules to
     # $MANAGER/CLAUDE.md, the project venv, both units, the hydra CLI. Replaces the heartbeat unit written by
@@ -283,6 +321,7 @@ install_manager() {
         printf 'PENDING: manager source not found at %s; pull the hydra-agent clone and rerun.\n' "$source"
         return 0
     fi
+    configure_manager_repo || return 1
     [[ ! -L $MANAGER/app ]] || { fail 'Refusing app symlink'; return 1; }
     safe_directory "$MANAGER/app"
     rm -rf -- "$MANAGER/app/manager.new"

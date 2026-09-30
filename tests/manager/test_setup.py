@@ -13,6 +13,7 @@ source "$SCRIPT"
 ROOT="$T"; MANAGER="$ROOT/manager"; REPOS="$ROOT/repos"; STATE="$ROOT/state"; UNIT_DIR="$ROOT/units"
 mkdir -p "$STATE" "$MANAGER" "$REPOS/hydra-agent" "$UNIT_DIR"
 chown() { :; }
+as_hydra() { "$@"; }
 systemctl() { printf '%s\n' "$*" >> "$ROOT/systemctl"; }
 ln() { printf 'ln %s\n' "$*" >> "$ROOT/ln"; }
 install() { cp -- "${@: -2}"; }
@@ -37,6 +38,9 @@ test -f "$UNIT_DIR/hydra-manager.service"; test -f "$UNIT_DIR/hydra-bridge.servi
 grep -q 'ExecStart=/srv/hydra/manager/venv/bin/python /srv/hydra/manager/app/manager/supervisor.py' "$UNIT_DIR/hydra-manager.service"
 ''')
     assert r.returncode == 0, r.stdout + r.stderr
+    import json
+    with open(os.path.join(t, "manager", "config.json")) as config:
+        assert json.load(config)["repo"] == os.path.join(t, "repos", "faden")
     assert "units enabled, not (re)started" in r.stdout
     systemctl = open(os.path.join(t, "systemctl")).read()
     assert "daemon-reload" in systemctl and "enable hydra-manager.service hydra-bridge.service" in systemctl
