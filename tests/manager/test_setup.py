@@ -34,7 +34,7 @@ def test_install_manager_installs_code_rules_venv_units_and_cli():
 test -x "$MANAGER/app/manager/hydra"; test -f "$MANAGER/app/manager/supervisor.py"; test -f "$MANAGER/app/manager/bridge.py"
 test -f "$MANAGER/CLAUDE.md"; test -x "$MANAGER/venv/bin/python"
 test -f "$UNIT_DIR/hydra-manager.service"; test -f "$UNIT_DIR/hydra-bridge.service"
-grep -q 'ExecStart=/usr/bin/python3 /srv/hydra/manager/app/manager/supervisor.py' "$UNIT_DIR/hydra-manager.service"
+grep -q 'ExecStart=/srv/hydra/manager/venv/bin/python /srv/hydra/manager/app/manager/supervisor.py' "$UNIT_DIR/hydra-manager.service"
 ''')
     assert r.returncode == 0, r.stdout + r.stderr
     assert "units enabled, not (re)started" in r.stdout

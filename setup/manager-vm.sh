@@ -295,13 +295,13 @@ install_manager() {
     # The manager's standing rules, root-owned so the session cannot rewrite them.
     install -o root -g root -m 0644 "$MANAGER/app/manager/CLAUDE.md" "$MANAGER/CLAUDE.md"
     ln -sfn "$MANAGER/app/manager/hydra" /usr/local/bin/hydra
-    # Ubuntu 24.04 refuses system-wide pip: slack_bolt lives in the project venv the entry points re-exec into.
-    if ! "$MANAGER/venv/bin/python" -c 'import slack_bolt' >/dev/null 2>&1; then
-        [[ ! -L $MANAGER/venv ]] || { fail 'Refusing venv symlink'; return 1; }
+    # Both systemd units invoke this runtime venv directly, not the checkout's test .venv.
+    [[ ! -L $MANAGER/venv ]] || { fail 'Refusing venv symlink'; return 1; }
+    if ! "$MANAGER/venv/bin/python" -c 'import slack_bolt, slack_sdk' >/dev/null 2>&1; then
         python3.12 -m venv "$MANAGER/venv"
-        PIP_CACHE_DIR="$STATE/pip-cache" "$MANAGER/venv/bin/python" -m pip install --quiet slack_bolt
+        PIP_CACHE_DIR="$STATE/pip-cache" "$MANAGER/venv/bin/python" -m pip install --quiet slack_bolt slack_sdk
     fi
-    chown -R root:root "$MANAGER/venv"
+    chown -R hydra:hydra "$MANAGER/venv"
     for unit in hydra-manager.service hydra-bridge.service; do
         install -o root -g root -m 0644 "$MANAGER/app/manager/systemd/$unit" "$UNIT_DIR/$unit"
     done
