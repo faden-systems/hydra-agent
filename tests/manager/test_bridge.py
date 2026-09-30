@@ -127,13 +127,37 @@ def test_pause_resume_authority(bridge, home, poster):
 
 def test_engine_command(bridge, home, poster):
     bridge.handle_message(msg("<@U_MANAGER> engine codex", user="U_OPERATOR", ts="13.0"))
-    assert open(os.path.join(home, "engine")).read().strip() == "claude-r2d2"
+    assert open(os.path.join(home, "engine")).read().strip() == "claude-r2d2", "an operator cannot switch"
     bridge.handle_message(msg("<@U_MANAGER> engine bogus", ts="13.1"))
     assert "unknown engine" in poster.posted[-1][2] and open(os.path.join(home, "engine")).read().strip() == "claude-r2d2"
     bridge.handle_message(msg("<@U_MANAGER> engine codex", ts="13.2"))
-    assert open(os.path.join(home, "engine")).read().strip() == "codex" and poster.posted[-1][2] == "engine: codex"
+    assert S.read_engine(home) == {"acc": "codex", "model": "gpt-6-astra"}
+    assert poster.posted[-1][2] == "engine: codex (gpt-6-astra)", "the legacy form means the family default model"
     bridge.handle_message(msg("<@U_MANAGER> engine", ts="13.3"))
-    assert poster.posted[-1][2] == "engine: codex"
+    assert poster.posted[-1][2] == "engine: codex (gpt-6-astra)"
+
+
+def test_engine_command_acc_and_model(bridge, home, poster):
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=claude-l model=sonnet5", ts="14.0"))
+    assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-sonnet-5"}
+    assert poster.posted[-1][2] == "engine: claude-l (claude-sonnet-5)"
+    bridge.handle_message(msg("<@U_MANAGER> engine model=opus5", ts="14.1"))
+    assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-opus-5"}, "model alone keeps the account"
+    # wrong family and unknown alias: rejected with the valid list, nothing changes
+    before = open(os.path.join(home, "engine")).read()
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=claude-l model=sol", ts="14.2"))
+    assert "codex family" in poster.posted[-1][2] and "sonnet5" in poster.posted[-1][2] and "nothing changed" in poster.posted[-1][2]
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=zzz", ts="14.3"))
+    assert "unknown model" in poster.posted[-1][2] and "gpt6" in poster.posted[-1][2]
+    assert open(os.path.join(home, "engine")).read() == before
+    # the operator is refused for the new form too
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=gpt6", user="U_OPERATOR", ts="14.4"))
+    assert "not authorized" in poster.posted[-1][2] and open(os.path.join(home, "engine")).read() == before
+    # a full id of the right family and codex aliases
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=gpt-5.6-sol", ts="14.5"))
+    assert S.read_engine(home) == {"acc": "codex", "model": "gpt-5.6-sol"}
+    bridge.handle_message(msg("<@U_MANAGER> status", ts="14.6"))
+    assert "engine: codex (gpt-5.6-sol)" in poster.posted[-1][2]
 
 
 def test_digest_now_queues_a_timer_event(bridge, home, poster):

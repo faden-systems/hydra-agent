@@ -2,7 +2,7 @@
 import json
 import os
 
-from conftest import S, calls, engines, fake_engine, queue_event
+from conftest import S, calls, engine_acc, engines, fake_engine, queue_event
 
 
 def test_claude_engine_contract(home, ok_engine, poster):
@@ -41,8 +41,8 @@ def test_quota_rotates_persists_and_notes(home, quota_engine, ok_engine, poster)
     queue_event(home, "hello")
     sup = S.Supervisor(home=home, engines=engines(quota_engine, ok_engine), poster=poster)
     assert sup.run_once() is True
-    assert "engine: claude-l" in poster.texts and "handled 1 events" in poster.texts
-    assert open(os.path.join(home, "engine")).read().strip() == "claude-l"
+    assert "engine: claude-l (claude-fable-5-1)" in poster.texts and "handled 1 events" in poster.texts
+    assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-fable-5-1"}, "the switch is persisted as JSON"
     assert calls(os.path.dirname(ok_engine))[-1]["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "fake-claude-l"
     # the next turn starts on claude-l and carries no note
     poster.posted.clear()
@@ -58,7 +58,7 @@ def test_non_quota_failure_tries_next_without_persisting(home, ok_engine, poster
     queue_event(home, "hello")
     assert S.Supervisor(home=home, engines=engines(crash, ok_engine), poster=poster).run_once() is True
     assert "handled 1 events" in poster.texts and "engine: claude-l" in poster.texts
-    assert open(os.path.join(home, "engine")).read().strip() == "claude-r2d2", "a crash is not a quota switch"
+    assert engine_acc(home) == "claude-r2d2", "a crash is not a quota switch"
 
 
 def test_codex_fallback_gets_handoff_and_state_on_stdin(home, quota_engine, poster, tmp_path):
@@ -74,8 +74,9 @@ def test_codex_fallback_gets_handoff_and_state_on_stdin(home, quota_engine, post
     assert "resume" not in c["argv"], "the first codex turn is fresh"
     assert "tracks: t9" in c["stdin"] and '"t9"' in c["stdin"] and "source: slack" in c["stdin"]
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in c["env"], "no Claude token reaches codex"
-    assert "engine: codex" in poster.texts
-    assert open(os.path.join(home, "engine")).read().strip() == "codex"
+    assert "engine: codex (gpt-6-astra)" in poster.texts, "a Claude-only alias falls back to the codex default"
+    assert S.read_engine(home) == {"acc": "codex", "model": "gpt-6-astra"}
+    assert c["argv"][c["argv"].index("-m") + 1] == "gpt-6-astra"
     queue_event(home, "and now?")
     assert sup.run_once() is True
     c2 = calls(str(d))[-1]
@@ -129,7 +130,8 @@ def test_handoff_rewrite_and_reply_split(home, ok_engine, poster):
     queue_event(home, "hello")
     S.Supervisor(home=home, engines=engines(ok_engine), poster=poster).run_once()
     handoff = open(os.path.join(home, "MANAGER-HANDOFF.md")).read()
-    assert handoff.startswith("tracks: t1") and handoff.rstrip().endswith("open question: none")
+    assert handoff.startswith("updated_at: ") and handoff.splitlines()[1] == "engine: claude-r2d2"
+    assert S.strip_handoff_header(handoff).startswith("tracks: t1") and handoff.rstrip().endswith("open question: none")
     assert "---HANDOFF---" not in poster.texts and "tracks: t1" not in poster.texts
 
 
@@ -149,7 +151,7 @@ def test_json_output_is_parsed_for_reply_tokens_and_session(home, poster, tmp_pa
     queue_event(home, "hello")
     S.Supervisor(home=home, engines=engines(eng), poster=poster).run_once()
     assert poster.posted[-1][2].strip() == "json reply"
-    assert open(os.path.join(home, "MANAGER-HANDOFF.md")).read().strip() == "tracks: j1"
+    assert S.strip_handoff_header(open(os.path.join(home, "MANAGER-HANDOFF.md")).read()).strip() == "tracks: j1"
     turn = S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))[-1]
     assert turn["tokens"] == 12
     assert open(os.path.join(home, "session-id")).read().strip() == "sess-json"

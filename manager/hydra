@@ -5,15 +5,21 @@
   hydra say "<text>"           queue a console instruction; print the reply (mirrored to #dev as "from L via console")
   hydra logs [n]               the last n turns
   hydra tail <channel> [n]     the last n mirrored messages of a channel
-  hydra engine [name]          show or set the engine (claude-r2d2 | claude-l | codex)
+  hydra engine [acc=<a>] [model=<m>]  show or set the engine: acc claude-r2d2 | claude-l | codex, model an alias
+                               from models.json (fable5.1, sonnet5, opus5, haiku4.5; gpt6/astra, gpt5.6/sol) or a
+                               full id; `hydra engine <acc>` still works and means the family default model
   hydra pause [reason]         create PAUSE; hydra resume removes it
   hydra attach                 take WRITER and run the manager session interactively; releases on exit
+  hydra update                 pull main in the hydra-agent clone, re-copy manager/ into the deploy dir, refresh
+                               the AGENTS.md link, restart hydra-bridge and hydra-manager, print the new commit
 
-Honours HYDRA_HOME (default /srv/hydra/manager).
+Honours HYDRA_HOME (default /srv/hydra/manager); `update` also honours HYDRA_REPO (default
+/srv/hydra/repos/hydra-agent) and HYDRA_APP (default /srv/hydra/manager/app/manager).
 """
 import getpass
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -93,15 +99,17 @@ def cmd_tail(home, args):
 
 
 def cmd_engine(home, args):
+    current = S.read_engine(home)
     if not args:
-        print(S.current_engine(home))
+        print(f"engine: {S.engine_label(current)}")
         return 0
-    name = args[0]
-    if name not in S.ENGINE_ORDER:
-        print(f"unknown engine {name}; one of {', '.join(S.ENGINE_ORDER)}", file=sys.stderr)
+    try:
+        pair = S.parse_engine_command(" ".join(args), current=current)
+    except S.BadEngine as e:
+        print(f"{e}; nothing changed (engine: {S.engine_label(current)})", file=sys.stderr)
         return 2
-    S.set_engine(home, name)
-    print(f"engine: {name}")
+    S.set_engine(home, pair["acc"], pair["model"])
+    print(f"engine: {S.engine_label(pair)}")
     return 0
 
 
@@ -132,7 +140,9 @@ def cmd_attach(home, args):
     spec = engines[engine]
     sup = S.Supervisor(home=home, engines=engines, poster=lambda *a: None, config=cfg)
     sid = sup.session_id()
-    argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", S.MODEL] + list(args)
+    pair = S.read_engine(home, engines)
+    model = pair["model"] if pair["acc"] == engine else S.family_default_model("claude", sup.models)
+    argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", model] + list(args)
     me = who()
     started = time.time()
     try:
@@ -153,8 +163,76 @@ def cmd_attach(home, args):
     return rc
 
 
+DEFAULT_REPO = "/srv/hydra/repos/hydra-agent"
+DEFAULT_APP = "/srv/hydra/manager/app/manager"
+SERVICES = ("hydra-bridge", "hydra-manager")
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=300)
+
+
+def cmd_update(home, args):
+    """Pull main, redeploy manager/ into $HYDRA_APP, refresh $HYDRA_HOME/AGENTS.md, restart both services."""
+    repo = os.environ.get("HYDRA_REPO") or DEFAULT_REPO
+    app = os.path.abspath(os.environ.get("HYDRA_APP") or DEFAULT_APP)
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        print(f"update: {repo} is not a git clone (set HYDRA_REPO)", file=sys.stderr)
+        return 1
+    fetch = _git(repo, "fetch", "-q", "origin", "main")
+    if fetch.returncode != 0:
+        print(f"update: fetch failed: {fetch.stderr.strip()}", file=sys.stderr)
+        return 1
+    branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if branch != "main":
+        co = _git(repo, "checkout", "-q", "main")
+        if co.returncode != 0:
+            print(f"update: cannot check out main in {repo}: {co.stderr.strip()}", file=sys.stderr)
+            return 1
+    merge = _git(repo, "merge", "-q", "--ff-only", "origin/main")
+    if merge.returncode != 0:
+        print(f"update: main in {repo} does not fast-forward: {merge.stderr.strip()}", file=sys.stderr)
+        return 1
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    source = os.path.join(repo, "manager")
+    if not os.path.isfile(os.path.join(source, "supervisor.py")):
+        print(f"update: {source} has no supervisor.py", file=sys.stderr)
+        return 1
+    # Stage the new copy next to the deploy dir, then swap, so a failed copy never leaves a half-deployed app.
+    staging, old = app + ".new", app + ".old"
+    for d in (staging, old):
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+    shutil.copytree(source, staging, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for name in ("hydra", "supervisor.py", "bridge.py"):
+        f = os.path.join(staging, name)
+        if os.path.exists(f):
+            os.chmod(f, 0o755)
+    if os.path.isdir(app):
+        os.rename(app, old)
+    os.makedirs(os.path.dirname(app), exist_ok=True)
+    os.rename(staging, app)
+    if os.path.isdir(old):
+        shutil.rmtree(old, ignore_errors=True)
+    # Claude reads $HYDRA_HOME/CLAUDE.md (a copy installed by bootstrap); Codex reads the AGENTS.md link.
+    rules = os.path.join(app, "CLAUDE.md")
+    if os.path.isfile(rules):
+        shutil.copyfile(rules, os.path.join(home, "CLAUDE.md"))
+        agents = os.path.join(home, "AGENTS.md")
+        if os.path.lexists(agents):
+            os.remove(agents)
+        os.symlink(os.path.relpath(rules, home), agents)
+    restart = subprocess.run(["systemctl", "restart", *SERVICES], capture_output=True, text=True, timeout=300)
+    if restart.returncode != 0:
+        print(f"update: deployed {head[:12]} but systemctl restart failed: {(restart.stderr or restart.stdout).strip()}",
+              file=sys.stderr)
+        return 1
+    print(f"updated to {head[:12]} (deployed {app}, restarted {' '.join(SERVICES)})")
+    return 0
+
+
 COMMANDS = {"status": cmd_status, "say": cmd_say, "logs": cmd_logs, "tail": cmd_tail, "engine": cmd_engine,
-            "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach}
+            "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach, "update": cmd_update}
 
 
 def main(argv):

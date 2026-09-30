@@ -1,0 +1,22 @@
+{
+  "claude": {
+    "default": "fable5.1",
+    "id_prefix": "claude-",
+    "aliases": {
+      "fable5.1": "claude-fable-5-1",
+      "sonnet5": "claude-sonnet-5",
+      "opus5": "claude-opus-5",
+      "haiku4.5": "claude-haiku-4-5-20251001"
+    }
+  },
+  "codex": {
+    "default": "gpt6",
+    "id_prefix": "gpt-",
+    "aliases": {
+      "gpt6": "gpt-6-astra",
+      "astra": "gpt-6-astra",
+      "gpt5.6": "gpt-5.6-sol",
+      "sol": "gpt-5.6-sol"
+    }
+  }
+}
