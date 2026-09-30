@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Root-only Ubuntu 24.04 infrastructure bootstrap. No authentication, agents or factory loops.
+# Root-only Ubuntu 24.04 infrastructure bootstrap. No authentication or factory loops; installs the manager
+# (loops/b1.md) from the hydra-agent clone without starting it.
 # Exit 0: provisioned; 2: infrastructure ready, private clone PENDING; 1: other failure.
 # Sourceable for portable unit tests; main is never dispatched when sourced.
 
@@ -10,6 +11,7 @@ TOOLS=/opt/hydra-tools
 NODE=/opt/hydra-node
 STATE=/var/lib/hydra-bootstrap
 UNIT=/etc/systemd/system/hydra-manager.service
+UNIT_DIR=/etc/systemd/system
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; return 1; }
 
@@ -90,13 +92,18 @@ prepare_user() {
 
 prepare_layout() {
     local directory
-    # Root-owned parents protect the bootstrap and supervisor, not writable state contents.
+    # Root-owned parents protect the bootstrap and the installed code (app/), not writable state contents.
     for directory in "$ROOT" "$MANAGER"; do
         safe_directory "$directory"
         chown root:root "$directory"
         chmod 0755 "$directory"
     done
-    for directory in "$MANAGER/.claude" "$MANAGER/credentials" "$MANAGER/inbox" "$MANAGER/logs" "$REPOS"; do
+    # The manager home holds the supervisor's own state (WRITER, PAUSE, engine, session-id, state.json,
+    # MANAGER-HANDOFF.md): hydra-owned, group root, not world-readable.
+    chown hydra:root "$MANAGER"
+    chmod 0750 "$MANAGER"
+    for directory in "$MANAGER/.claude" "$MANAGER/credentials" "$MANAGER/inbox" "$MANAGER/inbox/files" \
+        "$MANAGER/inbox/replies" "$MANAGER/logs" "$MANAGER/mirror" "$REPOS"; do
         safe_directory "$directory"
         chown hydra:hydra "$directory"
         chmod 0700 "$directory"
@@ -267,6 +274,43 @@ EOF
     systemctl is-active --quiet hydra-manager.service
 }
 
+install_manager() {
+    # The manager from the hydra-agent checkout (loops/b1.md): code to $MANAGER/app/manager/, rules to
+    # $MANAGER/CLAUDE.md, the project venv, both units, the hydra CLI. Replaces the heartbeat unit written by
+    # install_service; the running process is not restarted here (a human starts the services, see manager-vm.md).
+    local source=${HYDRA_MANAGER_SRC:-$REPOS/hydra-agent/manager} unit
+    if [[ ! -f $source/supervisor.py || ! -f $source/bridge.py || ! -f $source/hydra ]]; then
+        printf 'PENDING: manager source not found at %s; pull the hydra-agent clone and rerun.\n' "$source"
+        return 0
+    fi
+    [[ ! -L $MANAGER/app ]] || { fail 'Refusing app symlink'; return 1; }
+    safe_directory "$MANAGER/app"
+    rm -rf -- "$MANAGER/app/manager.new"
+    cp -R -- "$source" "$MANAGER/app/manager.new"
+    rm -rf -- "$MANAGER/app/manager"
+    mv -- "$MANAGER/app/manager.new" "$MANAGER/app/manager"
+    chown -R root:root "$MANAGER/app"
+    chmod -R u=rwX,go=rX "$MANAGER/app"
+    chmod 0755 "$MANAGER/app/manager/hydra" "$MANAGER/app/manager/supervisor.py" "$MANAGER/app/manager/bridge.py"
+    # The manager's standing rules, root-owned so the session cannot rewrite them.
+    install -o root -g root -m 0644 "$MANAGER/app/manager/CLAUDE.md" "$MANAGER/CLAUDE.md"
+    ln -sfn "$MANAGER/app/manager/hydra" /usr/local/bin/hydra
+    # Ubuntu 24.04 refuses system-wide pip: slack_bolt lives in the project venv the entry points re-exec into.
+    if ! "$MANAGER/venv/bin/python" -c 'import slack_bolt' >/dev/null 2>&1; then
+        [[ ! -L $MANAGER/venv ]] || { fail 'Refusing venv symlink'; return 1; }
+        python3.12 -m venv "$MANAGER/venv"
+        PIP_CACHE_DIR="$STATE/pip-cache" "$MANAGER/venv/bin/python" -m pip install --quiet slack_bolt
+    fi
+    chown -R root:root "$MANAGER/venv"
+    for unit in hydra-manager.service hydra-bridge.service; do
+        install -o root -g root -m 0644 "$MANAGER/app/manager/systemd/$unit" "$UNIT_DIR/$unit"
+    done
+    systemctl daemon-reload
+    systemctl enable hydra-manager.service hydra-bridge.service
+    # Not started or restarted here: credentials/slack.env, allowlist.json and config.json are human steps first.
+    printf 'MANAGER: installed to %s/app/manager; units enabled, not (re)started.\n' "$MANAGER"
+}
+
 main() {
     set -euo pipefail
     check_platform
@@ -289,6 +333,7 @@ main() {
     install_service
     local result=0
     clone_repositories || result=$?
+    install_manager
     if [[ $result == 2 ]]; then
         printf '%s\n' 'PENDING: infrastructure and heartbeat ready. A human must run gh auth login as hydra, then rerun this bootstrap (exit 2).'
     elif [[ $result == 0 ]]; then
