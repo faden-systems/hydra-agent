@@ -32,6 +32,7 @@ logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/pos
 engine                      current engine: claude-r2d2 | claude-l | codex
 session-id                  the manager's Claude session id (created on the first turn)
 codex-session               marker: a Codex session exists, later Codex turns `exec resume --last`
+AGENTS.md                   symlink to app/manager/CLAUDE.md: Codex's mirror of the standing rules
 MANAGER-HANDOFF.md          the manager's five-line summary, rewritten from every ---HANDOFF--- block
 state.json                  the working copy of factory/state.json (copied into the faden clone after every turn)
 budgets.json                {"turns_per_hour": n, "claude_turns_per_day": {"claude-r2d2": n, "claude-l": n}}
@@ -44,6 +45,73 @@ WRITER                      "<pid> <who>": the one writer; stale (dead pid) lock
 venv/                       the project venv (slack_bolt); the entry points re-exec into it when it exists
 app/manager/                this directory, installed by setup/manager-vm.sh
 ```
+
+## Engines
+
+The supervisor loads `default_engines()` in `app/manager/supervisor.py`, then applies optional
+`config.json.engines` overrides. Default order is **`claude-r2d2` → `claude-l` → `codex`**. Binary paths
+are resolved with `shutil.which()` using the supervisor process's `PATH` (not the operator's login-shell
+`PATH`). On the manager VM the service resolves Claude and Codex under `/opt/hydra-tools/bin/`:
+
+```json
+{
+  "claude-r2d2": {"bin": "/opt/hydra-tools/bin/claude", "cred": "claude-r2d2.env"},
+  "claude-l": {"bin": "/opt/hydra-tools/bin/claude", "cred": "claude-l.env"},
+  "codex": {"bin": "/opt/hydra-tools/bin/codex", "cred": null}
+}
+```
+
+Claude credential paths are relative to `$HYDRA_HOME/credentials`. Codex uses its own login as `hydra`,
+not a Claude credential (`cred: null`). The table is loaded at supervisor startup; configuration-table
+changes require a supervisor restart, while the current `engine` file is read each turn.
+
+### Switching and forcing an engine
+
+Each turn starts at the current engine and tries the remaining engines in cyclic order. A budget limit
+or a nonzero exit whose stderr matches quota, usage limit, rate, 401, or 403 causes fallback and persists
+the next successful engine. Other nonzero exits (including launch failures and timeouts) also try the
+next engine, but do not persist a switch by themselves. A successful fallback adds `engine: <name>` to
+the reply; `hydra logs 3` records the actual engine per turn even when no switch occurred. If every engine
+fails, events remain pending and the supervisor waits five minutes before retrying.
+
+Force the next turn without exhausting any account (this does not interrupt a turn already running):
+
+```bash
+hydra engine codex
+hydra status
+hydra logs 3
+# Restore the preferred engine after testing:
+hydra engine claude-r2d2
+```
+
+In Slack, the equivalent is `@manager engine codex` or `@manager engine claude-r2d2`, using a real bot
+mention. Switching via Slack requires an allowlisted sender with `instructs: true`. `hydra engine` or
+`@manager engine` without a name reports the current choice; forcing an engine still permits fallback
+if that engine fails or is over budget.
+
+### Shared rules and continuity
+
+Both engines launch in `$HYDRA_HOME` (normally `/srv/hydra/manager`). Claude reads `CLAUDE.md`; Codex reads
+`AGENTS.md`. Bootstrap installs the same standing rules for Claude and creates the relative mirror:
+
+```text
+/srv/hydra/manager/AGENTS.md -> app/manager/CLAUDE.md
+```
+
+This is a symlink, not a second editable rules file; reinstalling manager code refreshes its target.
+The working directory is not a Git checkout, so a direct rules probe as `hydra` needs the same flag used
+by the supervisor: `codex exec --skip-git-repo-check "summarize the rules you were given in three lines"`.
+
+Claude accounts share the manager's Claude session ID and config directory. Codex does **not** inherit
+the Claude transcript. Its first successful `codex exec` creates the `codex-session` marker; subsequent
+Codex turns use `codex exec resume --last` in the same working directory. This marker is not a pinned
+session ID, so avoid unrelated Codex sessions in the manager directory once it is in use.
+
+Every Codex invocation also receives the current `MANAGER-HANDOFF.md` and working `state.json` (falling
+back to `factory/state.json`) before the queued events. Every engine ends with `---HANDOFF---` and the
+five-line handoff, which the supervisor writes back to disk. Files, not the other engine's transcript,
+provide cross-engine continuity: if an old continuity-test word is absent from the available recorded
+memory, say it is unknown rather than inventing it.
 
 ## A turn
 
@@ -100,6 +168,7 @@ and the presence of `credentials/slack.env`.
 ## Install
 
 `setup/manager-vm.sh` copies this directory to `/srv/hydra/manager/app/manager/`, installs `CLAUDE.md` at
-`/srv/hydra/manager/CLAUDE.md`, creates `/srv/hydra/manager/venv` with `slack_bolt`, installs both units and
+`/srv/hydra/manager/CLAUDE.md`, creates `AGENTS.md -> app/manager/CLAUDE.md` in the same working directory,
+creates `/srv/hydra/manager/venv` with `slack_bolt` and `slack_sdk`, installs both units and
 `/usr/local/bin/hydra`. Then (a human, over SSH, never through Slack): `credentials/slack.env`, `allowlist.json`,
 `config.json` with the faden clone and the `#dev` channel id, `systemctl restart hydra-manager hydra-bridge`.

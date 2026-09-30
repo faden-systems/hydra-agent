@@ -54,6 +54,27 @@ test -f "$MANAGER/app/manager/hydra"
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+def test_install_manager_agents_mirrors_rules_and_survives_rerun():
+    r, t = run(r'''
+# Keep the real relative symlink operation; only the system CLI link is mocked.
+ln() {
+    if [[ ${@: -1} == /usr/local/bin/hydra ]]; then return 0; fi
+    command ln "$@"
+}
+install_manager
+test -L "$MANAGER/AGENTS.md"
+test "$(readlink "$MANAGER/AGENTS.md")" = app/manager/CLAUDE.md
+cmp "$MANAGER/AGENTS.md" "$MANAGER/CLAUDE.md"
+# A source update must be visible through the same mirror after a rerun.
+printf '\nUpdated standing rules\n' >> "$REPOS/hydra-agent/manager/CLAUDE.md"
+install_manager
+test "$(readlink "$MANAGER/AGENTS.md")" = app/manager/CLAUDE.md
+cmp "$MANAGER/AGENTS.md" "$MANAGER/CLAUDE.md"
+cmp "$MANAGER/AGENTS.md" "$REPOS/hydra-agent/manager/CLAUDE.md"
+''')
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 def test_install_manager_pending_without_source():
     r, t = run("HYDRA_MANAGER_SRC=/nonexistent install_manager; test ! -e \"$MANAGER/app\"", src=False)
     assert r.returncode == 0, r.stdout + r.stderr
