@@ -22,7 +22,7 @@ def fake_engine(dir_, name="claude", memory_line=None, shared_line=None, notes_l
     if notes_line:
         mem += (f"import os\nm=os.environ['HYDRA_MEMORY_DIR']\nos.makedirs(os.path.join(m,'codex'),exist_ok=True)\nopen(os.path.join(m,'codex','NOTES.md'),'a').write({notes_line!r}+'\\n')\n")
     open(p, "w").write("#!/usr/bin/env python3\nimport sys, os, json\nmsg=sys.stdin.read()\n"
-                       f"open({dir_!r}+'/calls.jsonl','a').write(json.dumps({{'argv': sys.argv[1:], 'env': {{k: v for k, v in os.environ.items() if k.startswith('CLAUDE') or k.startswith('CODEX')}}, 'stdin': msg}})+'\\n')\n"
+                       f"open({dir_!r}+'/calls.jsonl','a').write(json.dumps({{'argv': sys.argv[1:], 'env': {{k: v for k, v in os.environ.items() if k.startswith('CLAUDE') or k.startswith('CODEX') or k.startswith('HYDRA')}}, 'stdin': msg}})+'\\n')\n"
                        + mem +
                        "print('REPLY: ok ' + str(msg.count('source:')))\nprint('---HANDOFF---')\nprint('tracks: t1\\nwaiting on: nobody\\nlast decision: none\\nnext action: none\\nopen question: none')\n")
     os.chmod(p, 0o755); return p
