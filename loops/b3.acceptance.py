@@ -3,12 +3,26 @@
 transcript, flattened, windowed, inline, and the ledger records it. Interfaces: Supervisor(home, engines, poster,
 repo, codex_home=...) with the Claude config dir at $HYDRA_HOME/.claude and the session id in $HYDRA_HOME/session-id;
 transcript.flatten_claude/flatten_codex/render/window as in loops/b3.md."""
-import json, os, subprocess, sys, tempfile, time, uuid
+import datetime as dt, json, os, subprocess, sys, tempfile, time, uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "manager"))
 import supervisor as S  # noqa: E402
 import transcript as Tr  # noqa: E402
+
+
+T0 = dt.datetime(2026, 10, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+NOW = [T0]
+
+
+def clock():
+    """Controlled clock: every call advances one second, so ledger times are monotonic and test-controlled."""
+    NOW[0] = NOW[0] + dt.timedelta(seconds=1); return NOW[0]
+
+
+def ts(seconds):
+    """A transcript timestamp `seconds` after T0 (negative = before)."""
+    return (T0 + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def fake_engine(dir_, name):
@@ -65,7 +79,7 @@ def codex_rollout(h, cwd, lines):
     d = os.path.join(h, "codex-home", "sessions", "2026", "09", "30"); os.makedirs(d, exist_ok=True)
     p = os.path.join(d, "rollout-2026-09-30T22-00-00-abc.jsonl")
     with open(p, "w") as f:
-        f.write(json.dumps({"timestamp": "2026-09-30T22:00:00Z", "type": "session_meta", "payload": {"cwd": cwd, "id": "abc"}}) + "\n")
+        f.write(json.dumps({"timestamp": ts(100), "type": "session_meta", "payload": {"cwd": cwd, "id": "abc"}}) + "\n")
         for at, role, text in lines:
             f.write(json.dumps({"timestamp": at, "type": "response_item", "payload": {"type": "message", "role": role, "content": [{"type": "output_text" if role == "assistant" else "input_text", "text": text}]}}) + "\n")
     return p
@@ -75,20 +89,22 @@ def main():
     h = home(); r = repo(); cwd = os.getcwd()
     cl_dir = tempfile.mkdtemp(); cl = fake_engine(cl_dir, "claude"); cx_dir = tempfile.mkdtemp(); cx = fake_engine(cx_dir, "codex")
     engines = {"claude-r2d2": {"bin": cl, "cred": "claude-r2d2.env"}, "claude-l": {"bin": cl, "cred": "claude-l.env"}, "codex": {"bin": cx, "cred": None}}
-    post = Poster(); sup = S.Supervisor(home=h, engines=engines, poster=post, repo=r, codex_home=os.path.join(h, "codex-home"))
+    post = Poster(); sup = S.Supervisor(home=h, engines=engines, poster=post, repo=r, codex_home=os.path.join(h, "codex-home"), clock=clock)
     mem = os.path.join(r, "factory", "manager-memory")
 
-    # a Claude transcript with a fact that is nowhere in the memory folder, plus a long tool result and a thinking block
+    # 1. a claude turn first (so the ledger has a claude-family turn at clock time), then a Claude transcript written
+    #    AFTER that turn with a fact that is nowhere in the memory folder, a long tool result and a thinking block;
+    #    then switch to codex: the transition read is inline
+    event(h, "warm up"); assert sup.run_once() is True
     big = "x" * 9000
     claude_transcript(h, cwd, [
-        ("2026-09-30T21:00:00Z", "user", "the vendor for the iOS device farm is Kobiton, decided today"),
-        ("2026-09-30T21:00:05Z", "assistant", [{"type": "thinking", "thinking": "private reasoning that must not appear"}, {"type": "text", "text": "Noted: Kobiton for the device farm."}]),
-        ("2026-09-30T21:01:00Z", "assistant", [{"type": "tool_use", "name": "Bash", "input": {"command": "cat big.log"}}]),
-        ("2026-09-30T21:01:02Z", "user", [{"type": "tool_result", "content": big}]),
-        ("2026-09-30T21:02:00Z", "assistant", [{"type": "text", "text": "Log reviewed, nothing to act on."}]),
+        (ts(30), "user", "the vendor for the iOS device farm is Kobiton, decided today"),
+        (ts(35), "assistant", [{"type": "thinking", "thinking": "private reasoning that must not appear"}, {"type": "text", "text": "Noted: Kobiton for the device farm."}]),
+        (ts(40), "assistant", [{"type": "tool_use", "name": "Bash", "input": {"command": "cat big.log"}}]),
+        (ts(42), "user", [{"type": "tool_result", "content": big}]),
+        (ts(50), "assistant", [{"type": "text", "text": "Log reviewed, nothing to act on."}]),
     ])
-    # 1. a claude turn first (so the ledger has a claude family turn), then switch to codex: the transition read is inline
-    event(h, "warm up"); assert sup.run_once() is True
+    NOW[0] = T0 + dt.timedelta(seconds=60)
     open(os.path.join(h, "engine"), "w").write(json.dumps({"acc": "codex", "model": "gpt-6-astra"}))
     event(h, "which vendor did we pick for the device farm?"); assert sup.run_once() is True
     stdin = calls(cx_dir)[-1]["stdin"]
@@ -101,14 +117,17 @@ def main():
     assert "tool Bash(" in stdin and "more chars omitted" in stdin and big not in stdin, "tool call kept, long tool result cut at the cap with a marker"
     ledger = [json.loads(l) for l in open(os.path.join(mem, "LEDGER.jsonl")) if l.strip()]
     tr = ledger[-1].get("transition"); assert tr and tr["from"] == "claude" and tr["to"] == "codex" and tr["entries_kept"] >= 4 and tr["est_tokens"] > 0, ledger[-1]
-    assert any(f.startswith("transition/claude-to-codex-") for f in os.listdir(mem) and os.listdir(os.path.join(mem, "transition"))), "window written to the record"
+    tdir = os.path.join(mem, "transition"); tfiles = sorted(f for f in os.listdir(tdir) if f.startswith("claude-to-codex-")) if os.path.isdir(tdir) else []
+    assert tfiles, "window must be written under manager-memory/transition/ as claude-to-codex-<at>.md"
+    saved = open(os.path.join(tdir, tfiles[-1])).read(); assert "Kobiton" in saved and "Transcript window:" in saved, "the saved window must equal the inline one"
     print("1 ok: claude -> codex carries the Claude-only fact inline, thinking dropped, tool result capped, ledger has transition")
 
     # 2. codex says something only in its rollout; switch back to claude: the Codex-only fact is inline
     codex_rollout(h, cwd, [
-        ("2026-09-30T22:05:00Z", "user", "any change to the device farm plan?"),
-        ("2026-09-30T22:05:10Z", "assistant", "Yes: the founder said the Kobiton contract starts on October 15, budget code DF-7."),
+        (ts(120), "user", "any change to the device farm plan?"),
+        (ts(125), "assistant", "Yes: the founder said the Kobiton contract starts on October 15, budget code DF-7."),
     ])
+    NOW[0] = T0 + dt.timedelta(seconds=150)
     open(os.path.join(h, "engine"), "w").write(json.dumps({"acc": "claude-l", "model": "claude-fable-5-1"}))
     event(h, "when does the device farm contract start?"); assert sup.run_once() is True
     stdin = calls(cl_dir)[-1]["stdin"]
@@ -123,11 +142,13 @@ def main():
 
     # 4. the window respects max_tokens: newest kept, oldest dropped, meta says so
     open(os.path.join(h, "config.json"), "w").write(json.dumps({"transition": {"max_tokens": 1500, "tool_result_max_chars": 4000, "enabled": True}}))
-    many = [(f"2026-09-30T21:{m:02d}:00Z", "user", f"filler note number {m} " + "y" * 300) for m in range(10, 40)]
-    many += [("2026-09-30T21:50:00Z", "user", "the newest fact is code NEWEST-42")]
+    sup2 = S.Supervisor(home=h, engines=engines, poster=post, repo=r, codex_home=os.path.join(h, "codex-home"), clock=clock)
+    event(h, "warm"); assert sup2.run_once() is True  # claude-r2d2 turn at clock time
+    base = int((NOW[0] - T0).total_seconds()) + 10
+    many = [(ts(base + m), "user", f"filler note number {m} " + "y" * 300) for m in range(10, 40)]
+    many += [(ts(base + 60), "user", "the newest fact is code NEWEST-42")]
     claude_transcript(h, cwd, many)
-    sup2 = S.Supervisor(home=h, engines=engines, poster=post, repo=r, codex_home=os.path.join(h, "codex-home"))
-    event(h, "warm"); assert sup2.run_once() is True  # claude-r2d2 turn
+    NOW[0] = T0 + dt.timedelta(seconds=base + 120)
     open(os.path.join(h, "engine"), "w").write(json.dumps({"acc": "codex", "model": "gpt-6-astra"}))
     event(h, "what is the newest fact?"); assert sup2.run_once() is True
     stdin = calls(cx_dir)[-1]["stdin"]
@@ -143,6 +164,14 @@ def main():
     ce = Tr.flatten_claude(os.path.join(fx, cfx)); xe = Tr.flatten_codex(os.path.join(fx, xfx))
     assert ce and xe and all(set(e) >= {"at", "role", "kind", "text"} for e in ce + xe), "flatteners must parse the recorded real files"
     assert any(e["kind"] == "text" and e["role"] == "assistant" for e in ce) and any(e["kind"] == "text" and e["role"] == "assistant" for e in xe)
+    raw = [json.loads(l) for l in open(os.path.join(fx, xfx)) if l.strip()]
+    n_calls = sum(1 for o in raw if (o.get("payload") or {}).get("type") in ("function_call", "custom_tool_call"))
+    n_outs = sum(1 for o in raw if (o.get("payload") or {}).get("type") in ("function_call_output", "custom_tool_call_output"))
+    assert n_calls > 0 and sum(1 for e in xe if e["kind"] == "tool_call") == n_calls, ("every Codex tool call item must become a tool_call entry", n_calls, sum(1 for e in xe if e["kind"] == "tool_call"))
+    assert sum(1 for e in xe if e["kind"] == "tool_result") == n_outs, ("every tool output item must become a tool_result entry", n_outs)
+    craw = [json.loads(l) for l in open(os.path.join(fx, cfx)) if l.strip()]
+    n_cu = sum(1 for o in craw for b in ((o.get("message") or {}).get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use")
+    assert sum(1 for e in ce if e["kind"] == "tool_call") == n_cu, ("every Claude tool_use block must become a tool_call entry", n_cu)
     txt, meta = Tr.window(Tr.render(ce), 500); assert meta["est_tokens"] <= 600 and "Transcript window:" in txt
     print("5 ok: recorded fixtures parse; window meta")
     print("b3 acceptance OK")
