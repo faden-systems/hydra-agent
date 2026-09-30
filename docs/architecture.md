@@ -189,8 +189,11 @@ How the coding loop works, node by node:
 2. **Review before launch.** The spec reviewer (GPT-6) posts up to four rounds of findings in eight kinds
    (untested claims, vacuous checks, symptom-versus-cause, machine or path assumptions, ambiguities, fence
    problems, fixture-versus-real acceptance, missing regression tests). The Architect posts findings on fit with
-   the design. The manager fixes or declines each on the PR. Founder "go" is standing for loops inside an approved
-   plan; explicit for rule changes and spending. Merge at ready or at the cap.
+   the design. The manager fixes or declines each on the PR. The founder's go when a track opens covers that track
+   through merge and launch; there is no separate go before merge unless the founder asks for one in the thread.
+   Explicit go is still needed for rule changes, spending beyond the track's approved budget, autonomy changes, and
+   design decisions. A declined reviewer blocker is posted in the track thread so the founder can object; the merge
+   does not wait for a reply. Merge at ready or at the cap.
 3. **Launch.** A `launch:<machine>` label on the merged spec PR starts the launcher on that operator's VM. It writes
    the run record on start, refuses to start over budget or when `factory/PAUSE` exists, creates a worktree from
    `main`, and runs attempt 1: a fresh Claude Code session with the spec as its prompt, told to implement and run
