@@ -53,7 +53,7 @@ everything lives, how it is verified and secured, and in what order to build it.
 | Node | What it is | Runs where | Model / account | Autonomy now → target | Verified by | Escalates to |
 |---|---|---|---|---|---|---|
 | Founder (L) | decides at gates; owns accounts and spend | MacAir, browser + Slack only | | | | |
-| Manager | drafts specs and exit-owned harnesses from evidence, answers review rounds, merges, assigns tasks, writes the digest | dev VM: persistent Claude Code session behind a Slack bot identity (`@manager` in `#dev`); Codex as second engine | Claude Fable (R2D2 or L) ⇄ Codex GPT-6 on quota | L1 → L2 (agent drafts, founder edits) | spec reviewer + architect | founder |
+| Manager | drafts specs and exit-owned harnesses from evidence, answers review rounds, merges, assigns tasks, writes the digest | `hydra-manager` (Google Cloud): persistent Claude Code session behind the Slack bot `@manager` in `#faden-relay`; Codex as the third engine | engines in order `claude-r2d2` → `claude-l` → `codex` (GPT-6 via the ChatGPT plan); automatic switch on quota, forced with `hydra engine <name>` or `@manager engine <name>`; the same rules reach both engine families through `CLAUDE.md` and its `AGENTS.md` mirror; Codex continues from `MANAGER-HANDOFF.md` and `state.json`, not from the Claude transcript | L1 → L2 (agent drafts, founder edits) | spec reviewer + architect | founder |
 | Architect | owns `docs/design/` and the decision log; reviews specs and loop PRs for fit; answers "does this fit?" in threads; drives the migration backlog (R1 Codex adapter, context policy) | iMac (Hermes Agent profile) or the dev VM | GPT-6 Astra via Codex; `@architect` in `#dev` | new, L2 | its findings are read by the manager and the founder | founder |
 | Spec reviewer | correctness review of every spec PR, four rounds, findings only | iMac watcher | GPT-6 Astra via Codex | L2 | | manager |
 | Machine supervisor (script, no LLM) | the routine path on every machine: launches on labels, writes run records and tails to the repo, runs scheduled measurement, commits evidence, watches for dead processes and stalls, raises alerts, honours `PAUSE` and budgets | every machine (dev VM, MacBook, iMac) | none | L3 | its own run records | the on-call agent |
@@ -116,7 +116,8 @@ flowchart LR
 ```
 
 ### Slack: channels are departments, bots are roles
-- A Slack channel is a department: `#dev` now; `#marketing`, `#sales`, `#pr` when those teams exist. Every bot
+- A Slack channel is a department: `#faden-relay` is the engineering department today (the name predates the
+  structure; `#dev` in this document means that channel); `#marketing`, `#sales`, `#pr` when those teams exist. Every bot
   subscribes to the channels of its department; track threads live inside the department channel; a request across
   departments is a mention in the other channel.
 - One Slack app (bot identity) per role: `@manager`, `@coder`, `@simba`, `@hermes`, `@architect`. Identity is the
