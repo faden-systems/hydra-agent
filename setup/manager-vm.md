@@ -8,32 +8,83 @@ OpenClaw, or other agent framework is installed or launched. See
 complete `m1` deployment. In particular the architecture's separate coder account
 and its service user are out of scope.
 
-## 1. L provisions the machine; the iMac prepares the code
+## 1. Agent-led GCP provisioning from the iMac (human-gated)
 
-1. L provisions Ubuntu **24.04 LTS**, amd64 or arm64, with systemd, working DNS and
-   outbound HTTPS. Architecture sizing: 4 vCPU, 16 GB RAM, 100 GB persistent disk.
-2. L installs the **iMac public SSH key** on a provisioning account with root/sudo
-   access. Never copy its private key to the VM. `hydra` is **not** the SSH admin:
-   "sudo-less shell" means a usable `/bin/bash` with **no sudo entitlement**, not
-   passwordless sudo. The script locks its password and removes supplementary
-   groups. Use a dedicated VM, not an existing shared `hydra` account.
-3. L posts the IP, SSH admin username/port, confirmation the key is installed, and
-   verifies the SSH host-key fingerprint through the provider console. The iMac
-   verifies the fingerprint before connecting; do not disable host-key checking.
-4. Review/merge the `setup/manager-vm` PR or explicitly approve its exact revision.
-   Phase 1 runs **only on the iMac**: tests and PR creation, no VM provisioning.
+L authorizes the project and spend; the agent on the **iMac** can create the VM
+with the reviewed script. L need not manually provision a VPS. Code preparation,
+cloud creation, and remote bootstrap are separate gates: do not execute creation
+or bootstrap just to test this PR. Review/merge the `setup/manager-vm` PR or
+explicitly approve its exact revision before deployment.
 
-## 2. Bootstrap over SSH (after L's handoff)
+Prerequisites, checked on the iMac after L's human login:
 
-From the reviewed checkout on the iMac (substitute the real SSH destination):
+1. Install the Google Cloud CLI and let L complete `gcloud auth login` privately.
+   Check `gcloud auth list` and `gcloud projects list`; a browser-console login
+   alone does not authenticate the CLI. L supplies the intended **project ID**.
+2. L completes any terms acceptance, project creation, billing linkage and Compute
+   Engine API enablement. The CLI principal needs permission to create the VM and
+   use the project's network/service account. Report failures and stop; do not
+   silently switch projects or enable paid services beyond approval.
+3. Ensure `~/.ssh/id_ed25519.pub` contains the iMac's Ed25519 **public** key. Preserve
+   existing keys; never copy the private key to GCP, the VM, the repo or chat.
+   The script rejects missing/malformed key text and metadata delimiters.
+4. Confirm the project permits metadata-based SSH keys (OS Login, if enforced,
+   requires a separately approved IAM/OS Login path). The requested command uses
+   the default VPC; it must exist and allow the approved SSH route from the iMac.
+   The `hydra-manager` tag does **not** create a firewall rule. Do not open SSH to
+   the world or change organization policy to work around a failure.
+
+After explicit creation authorization, from the reviewed checkout on the iMac:
 
 ```sh
-scp setup/manager-vm.sh ADMIN@VM:/tmp/hydra-manager-vm.sh
-ssh -t ADMIN@VM 'sudo bash /tmp/hydra-manager-vm.sh'
+PROJECT_ID='REPLACE_WITH_APPROVED_PROJECT_ID'
+bash setup/gcp-vm.sh "$PROJECT_ID"
 ```
 
-L supplies any sudo password directly, never in chat. Root SSH may use `bash`
-without sudo. The bootstrap does not copy any local login, token or environment.
+The project argument is mandatory; the script never relies on a CLI/environment
+project default. It issues one `gcloud compute instances create hydra-manager`
+with zone `us-west1-b`, machine `e2-standard-4` (4 vCPU, 16 GB RAM), image family
+`ubuntu-2404-lts-amd64` in `ubuntu-os-cloud`, a **100GB pd-balanced** boot disk,
+`ssh-keys=hermes:<iMac public key>` metadata, and tag `hydra-manager`. This is Ubuntu
+24.04 LTS amd64 with systemd; working DNS/outbound HTTPS is required for bootstrap.
+The image family tracks Google's current family image, not an immutable image pin.
+No startup/bootstrap script, SSH session, firewall mutation or factory loop runs.
+Creation is **not idempotent**: an existing name returns a gcloud error; the script
+propagates failure without retrying, deleting or replacing an existing VM. If the
+VM already exists, inspect it rather than rerunning creation.
+
+After successful creation (or for the already-created VM), inspect it explicitly:
+
+```sh
+gcloud compute instances describe hydra-manager \
+  --project "$PROJECT_ID" --zone us-west1-b
+```
+
+Record the actual IP, status, zone, sizing and SSH identity. Verify the SSH host-key
+fingerprint through the trusted provider console before connecting; never disable
+host-key checking. Do not report creation success after a failed create operation.
+
+## 2. Bootstrap over SSH as hermes (after target verification and approval)
+
+The metadata key maps to the **hermes admin account**, with sudo provided by the
+GCP guest environment when metadata SSH is supported. Verify that access on the
+actual VM; **no root SSH is needed**. `hydra` is the separate, unprivileged service
+user, not the SSH admin: "sudo-less shell" means `/bin/bash` with **no sudo
+entitlement**, not passwordless sudo. The bootstrap locks hydra's password and
+removes its supplementary groups. Use a dedicated VM, not a shared hydra account.
+
+From the reviewed checkout on the iMac (replace `VM_IP` with the verified address):
+
+```sh
+ssh -i ~/.ssh/id_ed25519 hermes@VM_IP 'id; sudo -n true'
+scp -i ~/.ssh/id_ed25519 setup/manager-vm.sh hermes@VM_IP:/tmp/hydra-manager-vm.sh
+ssh -t -i ~/.ssh/id_ed25519 hermes@VM_IP 'sudo bash /tmp/hydra-manager-vm.sh'
+```
+
+If sudo is unavailable, stop and resolve admin access with L; do not enable root
+SSH. If a sudo password is required, L supplies it directly, never in chat. The
+existing bootstrap runs under sudo without modification and does not copy any
+local login, token or environment.
 
 Exit codes:
 - **0**: packages, directories, heartbeat service and both clones are present.
@@ -314,9 +365,11 @@ Local Phase 1 checks (macOS, **not Ubuntu integration**):
 
 ```sh
 bash -n setup/manager-vm.sh
-python3 -m unittest discover -s tests -p test_manager_vm.py -v
+bash -n setup/gcp-vm.sh
+python3 -m unittest discover -s tests -v
+# GCP tests intercept gcloud; no actual cloud calls or bootstrap main runs.
 # Optional when installed:
-shellcheck --severity=style setup/manager-vm.sh
+shellcheck --severity=style setup/manager-vm.sh setup/gcp-vm.sh
 ```
 
 Post the provisioning result and both experiments' raw evidence to the original
