@@ -294,6 +294,8 @@ install_manager() {
     chmod 0755 "$MANAGER/app/manager/hydra" "$MANAGER/app/manager/supervisor.py" "$MANAGER/app/manager/bridge.py"
     # The manager's standing rules, root-owned so the session cannot rewrite them.
     install -o root -g root -m 0644 "$MANAGER/app/manager/CLAUDE.md" "$MANAGER/CLAUDE.md"
+    # Codex reads AGENTS.md in the engine working directory; share the installed standing rules.
+    ln -sfnT app/manager/CLAUDE.md "$MANAGER/AGENTS.md"
     ln -sfn "$MANAGER/app/manager/hydra" /usr/local/bin/hydra
     # Both systemd units invoke this runtime venv directly, not the checkout's test .venv.
     [[ ! -L $MANAGER/venv ]] || { fail 'Refusing venv symlink'; return 1; }
