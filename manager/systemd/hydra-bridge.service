@@ -1,0 +1,29 @@
+[Unit]
+Description=Hydra manager: the Slack bridge (@manager, Socket Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hydra
+Group=hydra
+WorkingDirectory=/srv/hydra/manager
+Environment=HOME=/home/hydra
+Environment=HYDRA_HOME=/srv/hydra/manager
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /srv/hydra/manager/app/manager/bridge.py
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/hydra/manager /home/hydra
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hydra-bridge
+
+[Install]
+WantedBy=multi-user.target

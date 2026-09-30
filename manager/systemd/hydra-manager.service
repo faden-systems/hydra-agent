@@ -1,0 +1,32 @@
+[Unit]
+Description=Hydra manager: the supervisor (one persistent Claude Code session behind @manager)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hydra
+Group=hydra
+WorkingDirectory=/srv/hydra/manager
+Environment=HOME=/home/hydra
+Environment=HYDRA_HOME=/srv/hydra/manager
+Environment=CLAUDE_CONFIG_DIR=/srv/hydra/manager/.claude
+Environment=GH_CONFIG_DIR=/home/hydra/.config/gh
+Environment=GIT_TERMINAL_PROMPT=0
+Environment=PATH=/opt/hydra-tools/bin:/opt/hydra-node/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /srv/hydra/manager/app/manager/supervisor.py
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/hydra/manager /srv/hydra/repos /home/hydra
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hydra-manager
+
+[Install]
+WantedBy=multi-user.target

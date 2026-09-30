@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""hydra: the console side of the manager. Slack drives; the console observes and repairs.
+
+  hydra status                 engine, last turn, queue depth, tracks
+  hydra say "<text>"           queue a console instruction; print the reply (mirrored to #dev as "from L via console")
+  hydra logs [n]               the last n turns
+  hydra tail <channel> [n]     the last n mirrored messages of a channel
+  hydra engine [name]          show or set the engine (claude-r2d2 | claude-l | codex)
+  hydra pause [reason]         create PAUSE; hydra resume removes it
+  hydra attach                 take WRITER and run the manager session interactively; releases on exit
+
+Honours HYDRA_HOME (default /srv/hydra/manager).
+"""
+import getpass
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import supervisor as S  # noqa: E402
+
+
+def who():
+    try:
+        return f"{getpass.getuser()}@console"
+    except Exception:
+        return "console"
+
+
+def supervisor_alive(home):
+    """True when a service loop (not a one-off run_once) is running: its pid file names a live process."""
+    pid = S.read_text(os.path.join(home, "logs", "supervisor.pid")).strip()
+    return pid.isdigit() and S.pid_alive(int(pid))
+
+
+def cmd_status(home, args):
+    print(S.status_text(home))
+    return 0
+
+
+def cmd_say(home, args):
+    if not args:
+        print("usage: hydra say \"<text>\"", file=sys.stderr)
+        return 2
+    text = " ".join(args)
+    cfg = S.load_config(home)
+    ev = S.append_event(home, S.new_event("cli", {"text": text, "user": "founder-console", "instructs": True,
+                                                 "channel": cfg.get("dev_channel") or S.DEFAULT_DEV_CHANNEL,
+                                                 "thread_ts": None}))
+    reply_path = os.path.join(home, "inbox", "replies", f"{ev['id']}.txt")
+    timeout = float(os.environ.get("HYDRA_SAY_TIMEOUT", "600"))
+    if not supervisor_alive(home):
+        print(f"queued {ev['id']}; no live supervisor loop, the reply will land in {reply_path}")
+        return 0
+    print(f"queued {ev['id']}; waiting for the reply", file=sys.stderr)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(reply_path):
+            print(S.read_text(reply_path).rstrip())
+            return 0
+        time.sleep(1)
+    print(f"no reply within {timeout:.0f}s; it will land in {reply_path}", file=sys.stderr)
+    return 1
+
+
+def cmd_logs(home, args):
+    n = int(args[0]) if args else 10
+    for t in S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))[-n:]:
+        when = S.now_iso(t.get("at")) if isinstance(t.get("at"), (int, float)) else t.get("at")
+        line = f"{when} turn {t.get('n', '?')} {t.get('engine')} events={len(t.get('events') or [])} {t.get('duration_s', 0):.0f}s"
+        if t.get("tokens") is not None:
+            line += f" tokens={t['tokens']}"
+        if t.get("error"):
+            line += f" error={t['error'][:120]}"
+        print(line)
+    return 0
+
+
+def cmd_tail(home, args):
+    if not args:
+        print("usage: hydra tail <channel> [n]", file=sys.stderr)
+        return 2
+    n = int(args[1]) if len(args) > 1 else 20
+    path = os.path.join(home, "mirror", f"{args[0]}.jsonl")
+    if not os.path.exists(path):
+        print(f"no mirror for {args[0]}", file=sys.stderr)
+        return 1
+    for r in S.read_jsonl(path)[-n:]:
+        print(f"{r.get('ts')} {r.get('user') or r.get('bot_id') or '-'}: {(r.get('text') or r.get('reaction') or '')}")
+    return 0
+
+
+def cmd_engine(home, args):
+    if not args:
+        print(S.current_engine(home))
+        return 0
+    name = args[0]
+    if name not in S.ENGINE_ORDER:
+        print(f"unknown engine {name}; one of {', '.join(S.ENGINE_ORDER)}", file=sys.stderr)
+        return 2
+    S.set_engine(home, name)
+    print(f"engine: {name}")
+    return 0
+
+
+def cmd_pause(home, args):
+    reason = " ".join(args) if args else who()
+    S.write_text(os.path.join(home, "PAUSE"), reason + "\n")
+    print(f"paused (by {reason})")
+    return 0
+
+
+def cmd_resume(home, args):
+    p = os.path.join(home, "PAUSE")
+    if os.path.exists(p):
+        os.remove(p)
+        print("resumed")
+    else:
+        print("not paused")
+    return 0
+
+
+def cmd_attach(home, args):
+    """Take WRITER, run the manager session interactively, release, post a two-line summary to #dev."""
+    cfg = S.load_config(home)
+    engines = S.default_engines(home, cfg)
+    engine = S.current_engine(home)
+    if engine not in engines or engine == "codex":
+        engine = next((n for n in S.ENGINE_ORDER if n in engines and n != "codex"), engine)
+    spec = engines[engine]
+    sup = S.Supervisor(home=home, engines=engines, poster=lambda *a: None, config=cfg)
+    sid = sup.session_id()
+    argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", S.MODEL] + list(args)
+    me = who()
+    started = time.time()
+    try:
+        with S.acquire_writer(home, me):
+            rc = subprocess.call(argv, env=sup.engine_env(spec), cwd=home)
+    except S.WriterHeld as e:
+        print(f"cannot attach: {e}", file=sys.stderr)
+        return 1
+    ended = time.time()
+    summary = (f"console session by {me} (hydra attach): {S.now_iso(started)} to {S.now_iso(ended)}, "
+               f"{(ended - started) / 60:.0f} min, exit {rc}\n"
+               f"engine {engine}, session {sid or 'new'}; the manager's next turn reads MANAGER-HANDOFF.md and state.json")
+    try:
+        S.default_poster(home, echo=False)(cfg.get("dev_channel") or S.DEFAULT_DEV_CHANNEL, None, summary)
+    except Exception as e:
+        print(f"summary not posted: {e}", file=sys.stderr)
+    print(summary)
+    return rc
+
+
+COMMANDS = {"status": cmd_status, "say": cmd_say, "logs": cmd_logs, "tail": cmd_tail, "engine": cmd_engine,
+            "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help") or argv[0] not in COMMANDS:
+        print(__doc__.strip())
+        return 0 if argv and argv[0] in ("-h", "--help", "help") else 2
+    home = S.home_dir()
+    return COMMANDS[argv[0]](home, argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

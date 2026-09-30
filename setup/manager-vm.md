@@ -1,8 +1,9 @@
 # Headless manager VM: human-gated provisioning
 
-Scope: Ubuntu 24.04, one `hydra` service user, Claude Code and Codex CLI, and a
-**heartbeat only**. No factory loop, Slack bridge, coder service, backups, Hermes,
-OpenClaw, or other agent framework is installed or launched. See
+Scope: Ubuntu 24.04, one `hydra` service user, Claude Code and Codex CLI, and the
+manager (`manager/`, spec `loops/b1.md`) installed but **not started**: section 8
+below is the human-gated start. No coder service, backups, Hermes, OpenClaw, or
+other agent framework is installed or launched. See
 [`docs/architecture.md`](../docs/architecture.md) sections 2 and 4 and
 [`docs/setup.md`](../docs/setup.md). This is infrastructure preparation, not the
 complete `m1` deployment. In particular the architecture's separate coder account
@@ -117,18 +118,31 @@ not a cross-machine immutable image. Routine security updates remain an admin ta
 Layout:
 
 ```text
-/srv/hydra/manager/                 root-owned; not a git checkout
-  supervisor.sh                    root-owned, preserved on reruns
+/srv/hydra/manager/                 hydra:root 0750, the manager's home ($HYDRA_HOME); not a git checkout
+  app/manager/                     root-owned copy of the repo's manager/ (supervisor.py, bridge.py, hydra, units)
+  venv/                            root-owned project venv (slack_bolt); the entry points re-exec into it
+  CLAUDE.md                        root-owned copy of manager/CLAUDE.md, the manager's standing rules
+  supervisor.sh                    root-owned heartbeat placeholder, preserved on reruns, no longer run by the unit
   .claude/                         hydra:hydra 0700, initially empty
   credentials/                     hydra:hydra 0700, initially empty
-  inbox/                           hydra:hydra 0700
-  logs/                            hydra:hydra 0700
+  inbox/ inbox/files inbox/replies hydra:hydra 0700
+  logs/ mirror/                    hydra:hydra 0700
+  engine, session-id, state.json, MANAGER-HANDOFF.md, PAUSE, WRITER: written by the supervisor at runtime
 /srv/hydra/repos/                   hydra:hydra 0700
   faden/                           private; deferred until authorized
   hydra-agent/                     public
 /usr/local/sbin/hydra-manager-bootstrap
-/etc/systemd/system/hydra-manager.service
+/usr/local/bin/hydra -> /srv/hydra/manager/app/manager/hydra
+/etc/systemd/system/hydra-manager.service   the supervisor loop (replaces the heartbeat unit)
+/etc/systemd/system/hydra-bridge.service    the Slack bridge
 ```
+
+`install_manager` runs after the clones. It copies `manager/` from the hydra-agent
+clone (override the source with `HYDRA_MANAGER_SRC=<path>`), installs both units and
+**enables** them, and does not start or restart anything: the running heartbeat
+keeps running until a human restarts the units in section 8. When the clone does
+not contain `manager/` yet (it is never pulled automatically), the bootstrap prints
+`PENDING: manager source not found` and continues; pull as hydra and rerun.
 
 The systemd service sets `HOME=/home/hydra` and
 `CLAUDE_CONFIG_DIR=/srv/hydra/manager/.claude`, runs as hydra with no new privileges,
@@ -395,3 +409,46 @@ shellcheck --severity=style setup/manager-vm.sh setup/gcp-vm.sh
 Post the provisioning result and both experiments' raw evidence to the original
 thread. Stop here. Actual supervisor policy, Slack identity/allowlist, work
 launch, additional service users and backups are separate reviewed work.
+
+## 8. Starting the manager (after the `loops/b1` merge, Hermes on the VM)
+
+Everything here is a human or Hermes step over SSH. Tokens go in through the GCP
+web SSH or a hidden prompt, never through Slack or a chat transcript.
+
+1. As hydra: `git -C /srv/hydra/repos/hydra-agent pull --ff-only`. As root:
+   `sudo /usr/local/sbin/hydra-manager-bootstrap` (rerun; expects
+   `MANAGER: installed ...` and exit 0). Check `hydra --help` and
+   `sudo -u hydra HYDRA_HOME=/srv/hydra/manager /srv/hydra/manager/venv/bin/python -c 'import slack_bolt'`.
+2. L creates the Slack app (`@manager`): Socket Mode on, an app-level token with
+   `connections:write`, bot scopes `chat:write`, `channels:history`,
+   `groups:history`, `im:history`, `files:read`, `reactions:read`, `users:read`;
+   events `message.channels`, `message.groups`, `message.im`, `app_mention`,
+   `reaction_added`, `file_shared`; installed to the workspace and invited to `#dev`.
+3. As hydra, `umask 077`, write `/srv/hydra/manager/credentials/slack.env` (mode 0600)
+   with `SLACK_BOT_TOKEN=...` and `SLACK_APP_TOKEN=...` through a hidden prompt, the
+   same way the Claude tokens went in (section 3). Never paste a token on a command line.
+4. As hydra write `/srv/hydra/manager/allowlist.json`: the founder's Slack user id with
+   `{"instructs": true}`, the operators' bot ids with `{"instructs": false}`; and
+   `/srv/hydra/manager/config.json`:
+
+   ```json
+   {"repo": "/srv/hydra/repos/faden", "dev_channel": "C_THE_DEV_CHANNEL_ID"}
+   ```
+
+   Optional: `budgets.json` (`{"turns_per_hour": 20, "claude_turns_per_day": {"claude-r2d2": 200, "claude-l": 200}}`)
+   and `credentials/buildlog.env` with `BUILDLOG_WEBHOOK=...` for the dead-man.
+5. Dry checks as hydra, no network to Slack yet:
+   `HYDRA_HOME=/srv/hydra/manager python3 /srv/hydra/manager/app/manager/bridge.py --check`
+   must print the allowlist counts and exit 0; `hydra status` must render.
+6. As root: `systemctl restart hydra-manager.service hydra-bridge.service`, then
+   `journalctl -u hydra-bridge -n 20` shows `bridge up as U...`, and
+   `journalctl -u hydra-manager -n 20` shows `service loop`.
+7. From `#dev`: `@manager status`. Then one shadow cycle: `@manager read the repo and
+   post what you would do next`; the manager answers in the thread and rewrites
+   `MANAGER-HANDOFF.md`; L confirms; then it is live. `@manager pause` (founder only)
+   stops turns at any time; `hydra pause` does the same from the console.
+
+The first Claude turn creates `session-id` (a fresh session; `--resume` afterwards).
+Rotation to the L account or Codex happens on quota and is visible as `engine: ...`
+in the thread and in `hydra status`; `hydra engine claude-r2d2` moves back.
+
