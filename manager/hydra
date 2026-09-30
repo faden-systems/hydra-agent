@@ -75,6 +75,7 @@ def cmd_logs(home, args):
         if t.get("error"):
             line += f" error={t['error'][:120]}"
         print(line)
+        print(S.model_line(t.get("engine"), t))
     return 0
 
 
@@ -132,7 +133,7 @@ def cmd_attach(home, args):
     spec = engines[engine]
     sup = S.Supervisor(home=home, engines=engines, poster=lambda *a: None, config=cfg)
     sid = sup.session_id()
-    argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", S.MODEL] + list(args)
+    argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", spec["model"]] + list(args)
     me = who()
     started = time.time()
     try:
