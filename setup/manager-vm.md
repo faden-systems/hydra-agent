@@ -232,6 +232,26 @@ No rclone authentication, remote or backup schedule is configured in this phase.
 Future backups must exclude `credentials/`, Claude auth artifacts and both
 `/home/hydra/.codex` and `/home/hydra/.config/gh` (or encrypt them separately).
 
+### Explicit VM-only Codex decision — 2026-09-30 (L)
+
+L approved running Codex **without its sandbox and without approval prompts** on
+this non-production, single-purpose VM. This is not a production default. The
+`hydra` user's actual home is `/home/hydra`; set these top-level defaults in
+`/home/hydra/.codex/config.toml` (owner hydra:hydra, mode 0600):
+
+```toml
+sandbox_mode = "danger-full-access"
+approval_policy = "never"
+```
+
+Codex commands now have the full permissions of the unprivileged `hydra` user;
+read-only task wording is not a security boundary. Do **not** change the kernel
+setting: `kernel.apparmor_restrict_unprivileged_userns` remains `1`. This decision
+avoids the prior `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`
+failure without weakening the host's kernel policy. Test B must use these defaults,
+not override them with `--sandbox read-only`; keep its read-only prompt, clean
+environment, both Claude tokens quarantined, and guaranteed restoration.
+
 ## 5. Test A — same Claude session across R2D2 → L
 
 Requires **both** approved tokens. Use a clean hydra shell as above, with no
@@ -318,7 +338,7 @@ and their runtime directory for the duration of the test. Do not delete them.
    sudo -u hydra env -i HOME=/home/hydra USER=hydra LOGNAME=hydra \
      PATH=/usr/local/bin:/usr/bin:/bin \
      CLAUDE_CONFIG_DIR=/srv/hydra/manager/.claude \
-     codex exec --sandbox read-only -C /srv/hydra/repos/faden \
+     codex exec -C /srv/hydra/repos/faden \
        'Read /srv/hydra/manager/MANAGER-HANDOFF.md and /srv/hydra/repos/faden/factory/state.json from disk. State where things stand, what is running, and the next gate. Cite both paths. Do not modify anything or read credential files.'
    ```
 
