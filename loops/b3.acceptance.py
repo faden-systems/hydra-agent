@@ -86,7 +86,7 @@ def codex_rollout(h, cwd, lines):
 
 
 def main():
-    h = home(); r = repo(); cwd = os.getcwd()
+    h = home(); r = repo(); cwd = h  # engines run in $HYDRA_HOME; transcripts are keyed by that cwd
     cl_dir = tempfile.mkdtemp(); cl = fake_engine(cl_dir, "claude"); cx_dir = tempfile.mkdtemp(); cx = fake_engine(cx_dir, "codex")
     engines = {"claude-r2d2": {"bin": cl, "cred": "claude-r2d2.env"}, "claude-l": {"bin": cl, "cred": "claude-l.env"}, "codex": {"bin": cx, "cred": None}}
     post = Poster(); sup = S.Supervisor(home=h, engines=engines, poster=post, repo=r, codex_home=os.path.join(h, "codex-home"), clock=clock)
@@ -122,6 +122,19 @@ def main():
     saved = open(os.path.join(tdir, tfiles[-1])).read(); assert "Kobiton" in saved and "Transcript window:" in saved, "the saved window must equal the inline one"
     print("1 ok: claude -> codex carries the Claude-only fact inline, thinking dropped, tool result capped, ledger has transition")
 
+    # 2a. a rollout from another project (different cwd) must never be used
+    d_other = os.path.join(h, "codex-home", "sessions", "2026", "09", "29"); os.makedirs(d_other, exist_ok=True)
+    with open(os.path.join(d_other, "rollout-2026-09-29T10-00-00-zzz.jsonl"), "w") as f:
+        f.write(json.dumps({"timestamp": ts(1), "type": "session_meta", "payload": {"cwd": "/somewhere/else", "id": "zzz"}}) + "\n")
+        f.write(json.dumps({"timestamp": ts(2), "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "UNRELATED-PROJECT-FACT"}]}}) + "\n")
+    open(os.path.join(h, "engine"), "w").write(json.dumps({"acc": "claude-l", "model": "claude-fable-5-1"}))
+    event(h, "anything new from codex?"); assert sup.run_once() is True
+    stdin = calls(cl_dir)[-1]["stdin"]
+    assert "UNRELATED-PROJECT-FACT" not in stdin, "a rollout from another cwd must not be used as the transition read"
+    assert "no codex transcript found" in stdin, ("with no matching rollout the preamble must say so", stdin[:800])
+    open(os.path.join(h, "engine"), "w").write(json.dumps({"acc": "codex", "model": "gpt-6-astra"}))
+    event(h, "ok"); assert sup.run_once() is True  # back on codex so the next switch is codex -> claude
+    print("2a ok: no cross-project fallback; missing transcript stated")
     # 2. codex says something only in its rollout; switch back to claude: the Codex-only fact is inline
     codex_rollout(h, cwd, [
         (ts(120), "user", "any change to the device farm plan?"),
@@ -157,6 +170,18 @@ def main():
     ledger = [json.loads(l) for l in open(os.path.join(mem, "LEDGER.jsonl")) if l.strip()]
     assert ledger[-1]["transition"]["entries_kept"] < ledger[-1]["transition"]["entries_total"] and ledger[-1]["transition"]["est_tokens"] <= 1800, ledger[-1]["transition"]
     print("4 ok: max_tokens respected, meta correct")
+    # 4b. a single oversized newest entry is never cut silently mid-entry
+    huge = "the key is HUGE-7 " + "z" * 20000
+    text = Tr.render([{"at": ts(1), "role": "user", "kind": "text", "text": "small older entry"}, {"at": ts(2), "role": "assistant", "kind": "text", "text": huge}])
+    wtxt, wmeta = Tr.window(text, 1000)
+    assert wmeta.get("cut_entry") is True and "[entry truncated:" in wtxt and "chars omitted]" in wtxt, (wmeta, wtxt[:200])
+    assert "small older entry" not in wtxt and wtxt.rstrip().endswith("z"), "the newest entry is kept (its end), older ones dropped"
+    text2 = Tr.render([{"at": ts(1), "role": "user", "kind": "text", "text": "A" * 1200}, {"at": ts(2), "role": "assistant", "kind": "text", "text": "B" * 1200}])
+    w2, m2 = Tr.window(text2, 500)
+    assert m2.get("cut_entry") is True and "A" * 50 not in w2, "when even one entry exceeds the budget, only the newest is kept, truncated with the marker"
+    w3, m3 = Tr.window(text2, 2000)
+    assert m3["entries_kept"] == 1 and not m3.get("cut_entry") and "B" * 1200 in w3 and "A" * 1200 not in w3, "whole-entry boundary: the older entry is dropped, the newest kept whole"
+    print("4b ok: entry-boundary rule, explicit truncation marker for an oversized entry")
 
     # 5. flatteners against the recorded real fixtures
     fx = os.path.join(ROOT, "tests", "manager", "fixtures", "transcripts")
