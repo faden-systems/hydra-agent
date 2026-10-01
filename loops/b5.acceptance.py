@@ -78,6 +78,9 @@ def main():
     event(h3, "doomed", ts="30.1"); sup3.run_once()
     names = [(c[0], c[3]) for c in rec3.calls if c[2] == "30.1"]
     assert ("add", "eyes") in names and ("remove", "eyes") in names and ("add", "x") in names, names
+    # the failed turn armed the wall-clock back-off (logs/retry-after, five minutes); clear it as tests/manager/test_engines.py
+    # does, the back-off is b1 behaviour and not what this case checks
+    os.remove(os.path.join(h3, "logs", "retry-after"))
     good = fake_engine(tempfile.mkdtemp()); sup3.engines = engines(good)
     assert sup3.run_once() is True, "the still-pending event is handled by a working engine"
     assert ("remove", "x") in [(c[0], c[3]) for c in rec3.calls if c[2] == "30.1"], "x cleared once handled"
