@@ -87,6 +87,7 @@ def main():
         os.chmod(os.path.join(fakebin, tool), 0o755)
     bare = tempfile.mkdtemp(); subprocess.run(["git", "init", "-q", "--bare", bare], check=True)
     src = tempfile.mkdtemp(); subprocess.run(["git", "clone", "-q", bare, src], check=True); os.makedirs(os.path.join(src, "manager")); open(os.path.join(src, "manager", "CLAUDE.md"), "w").write("v1\n")
+    open(os.path.join(src, "manager", "supervisor.py"), "w").write("# stand-in: hydra update refuses a manager/ without supervisor.py\n")
     genv = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
     subprocess.run(["git", "-C", src, "add", "-A"], check=True); subprocess.run(["git", "-C", src, "commit", "-qm", "v1"], check=True, env=genv); subprocess.run(["git", "-C", src, "push", "-q", "-u", "origin", "HEAD:main"], check=True)
     clone = tempfile.mkdtemp(); subprocess.run(["git", "clone", "-q", "-b", "main", bare, clone], check=True); app = tempfile.mkdtemp(); hu = tempfile.mkdtemp(); os.makedirs(os.path.join(hu, "inbox"))
