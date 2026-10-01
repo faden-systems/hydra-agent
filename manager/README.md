@@ -29,9 +29,10 @@ inbox/pending-replies.jsonl replies whose delivery failed; delivered first on th
 inbox/replies/<id>.txt      replies to console (`hydra say`) events
 inbox/files/<ts>-<name>     attachments downloaded by the bridge
 mirror/<channel>.jsonl      every message in a channel the bot is in (copied to factory/log/ and committed)
-logs/turns.jsonl            {n, at, engine, model, events, duration_s, tokens?, input_tokens?, kind?, error?} per turn (kind: compaction for the compaction turn)
+logs/turns.jsonl            {n, at, engine, model, events, reacted, duration_s, tokens?, input_tokens?, kind?, error?} per turn (kind: compaction for the compaction turn; reacted: the Slack message ts the working indicator went on)
 logs/compaction.json        the compaction policy's state: pending, verify, last, failed_at, fail_posted, baseline_bytes
-logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/posts.jsonl (dry mode)
+logs/reactions.json         {event id: {channel, ts, thread_ts, name, at}}: the reactions the working indicator has standing on messages
+logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/posts.jsonl and logs/reactions.jsonl (dry mode)
 threads.json                {channel: {thread_ts: {joined_at, last_seen}}}: the threads the manager is part of (bridge and supervisor both write it, under threads.json.lock)
 COMPACT                     present: a compaction runs before the next turn (hydra compact, @manager compact); content is who asked
 engine                      JSON {"acc": claude-r2d2 | claude-l | codex, "model": <full id>}; a legacy one-word file is upgraded on the next turn
@@ -166,7 +167,8 @@ memory, say it is unknown rather than inventing it.
 1. `run_once()`: heartbeat; `PAUSE` present, nothing queued, a pending reply that still cannot be delivered, a
    retry-after from a failed turn, or `WRITER` held by a live process: no turn.
 2. Every unhandled event is batched into one message: a fixed header per event (`source`, `channel`, `thread`,
-   `sender`, `instructs`, `attachments`) and the text.
+   `sender`, `instructs`, `attachments`) and the text. Before the engine runs, every Slack message in the batch
+   gets the working indicator, an `eyes` reaction (see "The working indicator").
 3. Engines in order from the current one: `claude -p --resume <session-id> --model <id>
    --dangerously-skip-permissions --output-format json` with `CLAUDE_CONFIG_DIR=$HYDRA_HOME/.claude`, `HYDRA_HOME`,
    `HYDRA_MEMORY_DIR` and only the chosen credential file's `CLAUDE_CODE_OAUTH_TOKEN` in that process's environment
@@ -186,15 +188,40 @@ memory, say it is unknown rather than inventing it.
    events get `inbox/replies/<id>.txt` and a mirror post in `#dev` ("from L via console"); replies over 40 lines go
    to a file (`factory/log/replies/turn-<n>.md` in the clone, linked). If the poster raises, the reply is saved to
    `pending-replies.jsonl` and the events stay unhandled; the next tick delivers it without a new engine turn.
+   As each thread's reply lands, the `eyes` reaction comes off that thread's messages; a pending reply keeps it.
 6. Bookkeeping: `logs/turns.jsonl`, `handled.jsonl`, the manager's own reply appended to `mirror/<channel>.jsonl`
    (`user: manager`), then `mirror/*.jsonl` to `<repo>/factory/log/`, `state.json` to `<repo>/factory/state.json`
    and `factory/manager-memory/`, commit `manager: turn <n>`, push.
 7. Every engine failing: the turn is logged with `error`, one "manager unavailable, will retry" note per thread per
-   hour, no retry for five minutes.
+   hour, the `eyes` on the batch's messages replaced by `x`, no retry for five minutes.
 
 The service loop adds a timer event every 15 minutes (`timer-<slot>`), and a watchdog thread trips the dead-man
 (events queued, no turn and no heartbeat for 30 minutes): a post to the buildlog webhook and exit 3, so systemd
 restarts the service.
+
+## The working indicator (`loops/b5.md`)
+
+A turn can run minutes with nothing visible in Slack, so the supervisor reacts to the messages it is working on:
+
+- At the start of a turn, `reactor.add(channel, ts, "eyes")` for every Slack event in the batch (the payload's
+  `ts`, which is also the event id). Timer and console events have no message and get nothing.
+- When the reply for a thread is posted, `reactor.remove(channel, ts, "eyes")` for that thread's messages. A reply
+  kept pending (the poster raised) keeps the reaction until the pending reply is delivered.
+- When every engine failed, `eyes` becomes `x`; the `x` comes off when a later turn handles the event (the turn
+  that picks it up puts `eyes` back on first).
+- Reactions are best effort: a failing `add` or `remove` (missing scope, rate limit, deleted message) is logged
+  once per hour (`logs/notes.json`, key `reactions`) and never blocks the turn or the reply.
+
+`Supervisor(..., reactor=)` takes anything with `add(channel, ts, name)` and `remove(channel, ts, name)`; the default
+is the bridge's `SdkReactor` (reactions.add / reactions.remove over a `slack_sdk` WebClient, the bot token from
+`credentials/slack.env`; "already reacted" and "no reaction" count as done), or `DryReactor` without a token (appends
+to `logs/reactions.jsonl`). What stands on which message is kept in `logs/reactions.json`, keyed by event id, so a
+restart or a pending reply still knows what to take off; `logs/turns.jsonl` records `reacted: [ts...]` per turn.
+
+The bot needs the `reactions:write` scope (`setup/slack-manifest.json` has it). `bridge.py --check` probes it when a
+bot token is present: `auth.test` cannot list scopes, so it does a dry `reactions.add` (then `remove`) on the bot's
+own last mirrored message and prints `reactions:write: ok`, a `WARNING` when Slack answers `missing_scope`, or
+`unverified` when there is no own message yet, no token, or no network. The check never fails on this.
 
 ## The compaction policy (`loops/b4.md`)
 
@@ -335,9 +362,10 @@ that does not fast-forward, or a failed restart, exits 1 and says so.
 
 ## Dry mode
 
-Without `SLACK_BOT_TOKEN` in `credentials/slack.env` the poster appends to `logs/posts.jsonl` and prints.
-`python3 manager/supervisor.py --once` runs one tick; `python3 manager/bridge.py --check` validates `allowlist.json`
-and the presence of `credentials/slack.env`.
+Without `SLACK_BOT_TOKEN` in `credentials/slack.env` the poster appends to `logs/posts.jsonl` and prints, and the
+working indicator's reactor appends to `logs/reactions.jsonl`. `python3 manager/supervisor.py --once` runs one tick;
+`python3 manager/bridge.py --check` validates `allowlist.json` and the presence of `credentials/slack.env`, and reports
+the `reactions:write` scope as unverified without a token.
 
 ## Install
 

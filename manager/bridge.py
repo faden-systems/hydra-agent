@@ -11,7 +11,10 @@ Anything else is mirrored only. The commands (`status`, `pause`, `resume`, `engi
 `digest now`, `leave`, `compact`) are answered without a turn.
 
 Entry points: `bridge.py --check` validates `allowlist.json` and the presence of `credentials/slack.env` without
-connecting; no argument runs the Socket Mode service (systemd).
+connecting; with a bot token it also probes the `reactions:write` scope (loops/b5.md: `auth.test` cannot show scopes,
+so a dry `reactions.add` goes on the bot's own last mirrored message, when there is one) and warns, never fails, when
+the scope is missing or unverified. `SdkReactor(client)` is the working indicator's reactor over `slack_sdk`, the same
+`add/remove(channel, ts, name)` interface the supervisor takes. No argument runs the Socket Mode service (systemd).
 """
 import argparse
 import json
@@ -238,7 +241,7 @@ class Bridge:
         else:
             return None  # an unjoined thread, or a top-level post without a mention: mirrored only
         event = S.append_event(self.home, S.new_event(
-            "slack", {"channel": channel, "thread_ts": thread_ts, "user": sender, "text": text,
+            "slack", {"channel": channel, "ts": ts, "thread_ts": thread_ts, "user": sender, "text": text,
                       "instructs": bool(entry.get("instructs")), "addressed": addressed, "files": files},
             event_id=ts))
         if addressed:
@@ -324,9 +327,111 @@ class Bridge:
         return {"command": word, "ok": True}
 
 
+# ----------------------------------------------------------------------------------------------- reactions
+
+class SdkReactor:
+    """The working indicator's reactor over a `slack_sdk` WebClient (`App.client`, or `sdk_reactor(token)` for the
+    supervisor): `add` and `remove` raise on failure, except when Slack says the reaction is already there or
+    already gone; the supervisor treats every failure as best effort."""
+
+    def __init__(self, client):
+        self.client = client
+
+    def _call(self, action, channel, ts, name):
+        method = getattr(self.client, f"reactions_{action}")
+        try:
+            return method(channel=channel, timestamp=ts, name=name)
+        except Exception as e:
+            if _slack_error(e) in S.REACTION_IDEMPOTENT[action]:
+                return None
+            raise
+
+    def add(self, channel, ts, name):
+        return self._call("add", channel, ts, name)
+
+    def remove(self, channel, ts, name):
+        return self._call("remove", channel, ts, name)
+
+
+def _slack_error(e):
+    """Slack's error string out of a `SlackApiError` (its `response`, a SlackResponse or a dict), else None."""
+    response = getattr(e, "response", None)
+    try:
+        return response.get("error") if response is not None else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def sdk_reactor(token):
+    """The real reactor for `token`: `SdkReactor` over a fresh `slack_sdk.WebClient`. Raises ImportError without
+    slack_sdk (the supervisor then falls back to its dry reactor)."""
+    from slack_sdk import WebClient
+    return SdkReactor(WebClient(token=token))
+
+
+def own_last_message(home):
+    """(channel, ts) of the latest post the supervisor mirrored with a Slack ts, or None (dry posts carry none)."""
+    best = None
+    mirror = os.path.join(home, "mirror")
+    for name in sorted(os.listdir(mirror)) if os.path.isdir(mirror) else []:
+        if not name.endswith(".jsonl"):
+            continue
+        channel = name[:-len(".jsonl")]
+        for rec in S.read_jsonl(os.path.join(mirror, name)):
+            if rec.get("subtype") != "manager_reply" or not rec.get("ts"):
+                continue
+            at = rec.get("mirrored_at") or 0
+            if best is None or at > best[0]:
+                best = (at, channel, str(rec["ts"]))
+    return (best[1], best[2]) if best else None
+
+
+def sdk_scope_probe(token, channel, ts):
+    """A dry `reactions.add` (then `reactions.remove`) of `eyes` on (channel, ts) with `token`. Returns None when
+    the scope works, else Slack's error string (`missing_scope` when the token lacks `reactions:write`)."""
+    from slack_sdk.errors import SlackApiError
+    reactor = sdk_reactor(token)
+    try:
+        reactor.add(channel, ts, S.REACTION_WORKING)
+    except SlackApiError as e:
+        return _slack_error(e) or str(e)
+    try:
+        reactor.remove(channel, ts, S.REACTION_WORKING)
+    except SlackApiError:
+        pass  # the probe worked; a reaction left behind is harmless
+    return None
+
+
+def check_reactions_scope(home, token, probe=None):
+    """One line about `reactions:write`, printed; never fails the check. The token is never printed."""
+    if not token:
+        print("reactions:write: unverified (no SLACK_BOT_TOKEN in credentials/slack.env)")
+        return
+    target = own_last_message(home)
+    if target is None:
+        print("reactions:write: unverified (no own message to probe yet; add the scope at api.slack.com if the eyes "
+              "never appear)")
+        return
+    channel, ts = target
+    try:
+        error = (probe or sdk_scope_probe)(token, channel, ts)
+    except Exception as e:  # no network, no slack_sdk, anything: unverified, not a failure
+        print(f"reactions:write: unverified ({type(e).__name__}: {e})")
+        return
+    if error is None:
+        print(f"reactions:write: ok (probed on {channel}/{ts})")
+    elif error == "missing_scope":
+        print("WARNING: reactions:write: missing (the bot token lacks the scope: add it under OAuth & Permissions at "
+              "api.slack.com and reinstall the app; the working indicator stays off until then)")
+    else:
+        print(f"reactions:write: unverified ({error})")
+
+
 # ----------------------------------------------------------------------------------------------- entry points
 
-def check(home):
+def check(home, probe=None):
+    """`--check`: the allowlist, the credentials file, and the `reactions:write` scope (a warning at most).
+    `probe(token, channel, ts)` replaces the slack_sdk probe in tests."""
     ok = True
     try:
         allow = load_allowlist(home)
@@ -335,12 +440,16 @@ def check(home):
         print(f"allowlist.json: invalid ({e})")
         ok = False
     slack_env = os.path.join(home, "credentials", "slack.env")
+    token = None
     if os.path.exists(slack_env):
-        keys = sorted(S.read_env_file(slack_env))
+        env = S.read_env_file(slack_env)
+        keys = sorted(env)
+        token = env.get("SLACK_BOT_TOKEN")
         print(f"credentials/slack.env: present ({', '.join(keys) if keys else 'empty'})")
     else:
         print("credentials/slack.env: missing")
         ok = False
+    check_reactions_scope(home, token, probe=probe)
     return ok
 
 

@@ -421,7 +421,10 @@ web SSH or a hidden prompt, never through Slack or a chat transcript.
    `sudo -u hydra HYDRA_HOME=/srv/hydra/manager /srv/hydra/manager/venv/bin/python -c 'import slack_bolt'`.
 2. L creates the Slack app (`@manager`): Socket Mode on, an app-level token with
    `connections:write`, bot scopes `chat:write`, `channels:history`,
-   `groups:history`, `im:history`, `files:read`, `reactions:read`, `users:read`;
+   `groups:history`, `im:history`, `files:read`, `reactions:read`, `reactions:write`,
+   `users:read` (`setup/slack-manifest.json` is the creation manifest with all of them;
+   `reactions:write` is the working indicator's scope, loops/b5.md: an app created
+   before it needs the scope added under OAuth & Permissions and a reinstall);
    events `message.channels`, `message.groups`, `message.im`, `app_mention`,
    `reaction_added`, `file_shared`; installed to the workspace and invited to `#dev`.
 3. As hydra, `umask 077`, write `/srv/hydra/manager/credentials/slack.env` (mode 0600)
@@ -439,7 +442,10 @@ web SSH or a hidden prompt, never through Slack or a chat transcript.
    and `credentials/buildlog.env` with `BUILDLOG_WEBHOOK=...` for the dead-man.
 5. Dry checks as hydra, no network to Slack yet:
    `HYDRA_HOME=/srv/hydra/manager python3 /srv/hydra/manager/app/manager/bridge.py --check`
-   must print the allowlist counts and exit 0; `hydra status` must render.
+   must print the allowlist counts and exit 0; `hydra status` must render. With a bot
+   token present the check also probes `reactions:write` on the manager's last own
+   post (`reactions:write: ok`); a `WARNING ... missing` means the scope was not added,
+   and `unverified` before the first reply is expected. Neither fails the check.
 6. As root: `systemctl restart hydra-manager.service hydra-bridge.service`, then
    `journalctl -u hydra-bridge -n 20` shows `bridge up as U...`, and
    `journalctl -u hydra-manager -n 20` shows `service loop`.
