@@ -29,6 +29,14 @@ events have no message. Reactions are best-effort: a failure is logged once per 
 is the bridge's `SdkReactor` (reactions.add/remove over `slack_sdk`) with a bot token, else `DryReactor`
 (`logs/reactions.jsonl`).
 The reactions standing on messages are kept in `logs/reactions.json`; `turns.jsonl` lines carry `reacted: [ts...]`.
+Heartbeat (loops/b6.md): while a turn runs, every `reactions.heartbeat_seconds` (config.json, default 20, 0 disables)
+a background ticker swaps the reaction on each triggering message between `eyes` and `hourglass_flowing_sand`
+(remove the standing one, add the other); it is stopped before delivery, which removes whatever stands. A failed
+remove does not stop the add that follows; the recorded name is the last add attempted.
+Direct posts (loops/b6.md): every post the manager makes goes through `post_and_record` (post, record the join,
+mirror the line with its `thread_ts`): the supervisor's deliveries and the bridge's `post`. `hydra post` writes
+`inbox/outbox.jsonl` (`queue_post`); the bridge drains it (`drain_outbox`) through that path, in order; a line whose
+post keeps failing is set aside in `inbox/outbox-failed.jsonl` after `OUTBOX_MAX_ATTEMPTS`; `logs/outbox.json` counts.
 The engine file `$HYDRA_HOME/engine` is JSON `{"acc", "model"}`; `parse_engine_command` handles
 `engine acc=<account> [model=<alias>]` for the CLI and the bridge; model aliases live in `models.json`.
 
@@ -95,6 +103,10 @@ REACTION_WORKING = "eyes"
 REACTION_FAILED = "x"
 SLACK_TS_RE = re.compile(r"^\d+\.\d+$")
 REACTION_IDEMPOTENT = {"add": ("already_reacted",), "remove": ("no_reaction",)}  # Slack errors that mean "done"
+REACTION_HEARTBEAT = "hourglass_flowing_sand"
+HEARTBEAT_DEFAULT_S = 20
+HEARTBEAT_JOIN_S = 60  # how long delivery waits for a swap in flight before going on without the ticker
+OUTBOX_MAX_ATTEMPTS = 5
 
 
 # ----------------------------------------------------------------------------------------------- paths and files
@@ -416,6 +428,165 @@ def reaction_target(ev):
     return channel, str(ts), p.get("thread_ts")
 
 
+def heartbeat_seconds(config):
+    """`reactions.heartbeat_seconds` from config: a number of seconds (fractional allowed), default 20; 0 or less
+    disables the swap; anything that is not a number means the default."""
+    reactions = (config or {}).get("reactions")
+    if not isinstance(reactions, dict) or "heartbeat_seconds" not in reactions:
+        return HEARTBEAT_DEFAULT_S
+    value = reactions.get("heartbeat_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return HEARTBEAT_DEFAULT_S
+    return value if value > 0 else 0
+
+
+# ----------------------------------------------------------------------------------------------- the one posting path (loops/b6.md)
+
+def response_ts(res):
+    """The `ts` out of what a poster returned (Slack's chat.postMessage answer, or anything with `get`), else None."""
+    if res is None:
+        return None
+    try:
+        ts = res.get("ts")
+    except (AttributeError, TypeError):
+        return None
+    return str(ts) if ts else None
+
+
+def mirror_own_post(home, channel, thread_ts, text, ts=None, turn=None, subtype="manager_reply", user=None):
+    """The bridge mirrors everyone but the manager; the manager's own posts land in the channel log here, with the
+    thread they belong to (a top-level post belongs to the thread it starts, when its ts is known)."""
+    if not channel:
+        return
+    append_jsonl(os.path.join(home, "mirror", f"{channel}.jsonl"),
+                 {"mirrored_at": time.time(), "type": "message", "ts": ts, "thread_ts": thread_ts, "user": "manager",
+                  "bot_id": None, "subtype": subtype, "turn": turn, "by": user, "text": text})
+
+
+def post_and_record(home, poster, channel, thread_ts, text, turn=None, subtype="manager_reply", user=None):
+    """Every post the manager makes goes through here: `poster(channel, thread_ts, text)`, then the thread is
+    recorded as joined and the line mirrored with its `thread_ts`. `thread_ts` None posts top level; the `ts` the
+    poster returns then names the thread (a poster that returns nothing, dry mode, records no join). Raises what
+    the poster raises, before anything is recorded."""
+    res = poster(channel, thread_ts, text)
+    ts = response_ts(res)
+    joined = str(thread_ts) if thread_ts else ts
+    mirror_own_post(home, channel, joined, text, ts=ts, turn=turn, subtype=subtype, user=user)
+    if joined:
+        note_thread(home, channel, joined)
+    return res
+
+
+# ----------------------------------------------------------------------------------------------- the outbox (hydra post)
+
+def outbox_path(home):
+    return os.path.join(home, "inbox", "outbox.jsonl")
+
+
+def outbox_failed_path(home):
+    return os.path.join(home, "inbox", "outbox-failed.jsonl")
+
+
+def outbox_stats_path(home):
+    return os.path.join(home, "logs", "outbox.json")
+
+
+@contextlib.contextmanager
+def _outbox_lock(home):
+    """`hydra post` appends and the bridge rewrites: a short flock around every change of the outbox file."""
+    path = outbox_path(home) + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        with contextlib.suppress(OSError):
+            fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def read_outbox(home):
+    return read_jsonl(outbox_path(home))
+
+
+def _write_outbox(home, items):
+    path = outbox_path(home)
+    if not items:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+        return
+    write_text(path, "".join(json.dumps(it, ensure_ascii=False) + "\n" for it in items))
+
+
+def queue_post(home, channel, thread_ts, text, user=None):
+    """One line for the bridge to post: {id, at, channel, thread_ts, text, user}. `-`, empty or None means top
+    level. Returns the record."""
+    if not channel or not (text or "").strip():
+        raise ValueError("a post needs a channel and a text")
+    rec = {"id": str(uuid.uuid4()), "at": time.time(), "channel": channel,
+           "thread_ts": None if thread_ts in (None, "", "-") else str(thread_ts), "text": text, "user": user}
+    with _outbox_lock(home):
+        append_jsonl(outbox_path(home), rec)
+    return rec
+
+
+def outbox_stats(home):
+    try:
+        data = json.loads(read_text(outbox_stats_path(home), "{}") or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    return {"posted": int(data.get("posted") or 0), "failed": int(data.get("failed") or 0), "last_at": data.get("last_at")}
+
+
+def _count_outbox(home, posted=0, failed=0):
+    st = outbox_stats(home)
+    st["posted"] += posted
+    st["failed"] += failed
+    if posted:
+        st["last_at"] = now_iso()
+    write_text(outbox_stats_path(home), json.dumps(st) + "\n")
+
+
+def drain_outbox(home, post):
+    """Post every queued line, oldest first, through `post(channel, thread_ts, text)` (the bridge's `post`, which is
+    `post_and_record`). A line whose post raises stays, with `attempts` and `error`, and the drain stops there so
+    order is kept; after OUTBOX_MAX_ATTEMPTS it is moved to inbox/outbox-failed.jsonl and the next line goes out.
+    Lines queued while posting are kept. Returns the number posted."""
+    with _outbox_lock(home):
+        items = read_outbox(home)
+    if not items:
+        return 0
+    done, failed = [], []
+    for item in items:
+        try:
+            post(item.get("channel"), item.get("thread_ts"), item.get("text") or "")
+        except Exception as e:
+            item["attempts"] = int(item.get("attempts") or 0) + 1
+            item["error"] = str(e)[:500]
+            if item["attempts"] >= OUTBOX_MAX_ATTEMPTS:
+                log(f"outbox: post {item.get('id')} to {item.get('channel')}/{item.get('thread_ts') or '-'} set aside "
+                    f"after {item['attempts']} attempts: {e}")
+                failed.append(item)
+                continue
+            log(f"outbox: post {item.get('id')} to {item.get('channel')}/{item.get('thread_ts') or '-'} failed "
+                f"(attempt {item['attempts']}): {e}; kept for the next drain")
+            break
+        done.append(item)
+    taken = {it["id"] for it in done} | {it["id"] for it in failed}
+    touched = {it["id"]: it for it in items}
+    with _outbox_lock(home):
+        current = read_outbox(home)
+        rest = [touched.get(it.get("id"), it) for it in current if it.get("id") not in taken]
+        _write_outbox(home, rest)
+        for it in failed:
+            append_jsonl(outbox_failed_path(home), {**it, "failed_at": now_iso()})
+        if done or failed:
+            _count_outbox(home, posted=len(done), failed=len(failed))
+    return len(done)
+
+
 # ----------------------------------------------------------------------------------------------- state and status
 
 def state_path(home, repo=None):
@@ -635,6 +806,11 @@ def status_text(home, repo=None):
         lines.append("last turn: none yet")
     lines.append(f"queue: {queue_depth(home)} pending")
     lines.append(f"threads: {threads_count(home)} joined")
+    st = outbox_stats(home)
+    direct = f"direct posts: {st['posted']} posted, {len(read_outbox(home))} queued"
+    if st["failed"]:
+        direct += f", {st['failed']} set aside"
+    lines.append(direct)
     lines.append(compaction_status_line(home))
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
@@ -969,14 +1145,16 @@ class AllEnginesFailed(Exception):
 
 class Supervisor:
     def __init__(self, home=None, engines=None, poster=None, repo=None, config=None, engine_timeout=ENGINE_TIMEOUT_S,
-                 codex_home=None, clock=None, buildlog_poster=None, reactor=None):
+                 codex_home=None, clock=None, buildlog_poster=None, reactor=None, sleep=None):
         """`codex_home` is where Codex keeps its rollouts (`$CODEX_HOME`, default `~/.codex`); when given here or in
         config.json it is also exported to the engines. `clock` is an optional callable returning an aware datetime
         (or a unix time) so tests control the ledger's, the transition's and the compaction's times.
         `buildlog_poster(channel, thread_ts, text)` receives the one-line notes for the buildlog (a failed
         compaction); the default posts to the buildlog webhook when one is configured, else logs. `reactor` has
         `add(channel, ts, name)` and `remove(channel, ts, name)` (the working indicator, loops/b5.md); the default
-        is the bridge's slack_sdk reactor with a bot token, else `DryReactor` (`logs/reactions.jsonl`)."""
+        is the bridge's slack_sdk reactor with a bot token, else `DryReactor` (`logs/reactions.jsonl`). `sleep(seconds)`
+        is what the heartbeat ticker waits with between swaps (loops/b6.md); the default is an interruptible wait
+        on the ticker's stop flag."""
         self.home = home or home_dir()
         self.config = dict(load_config(self.home))
         if config:
@@ -988,6 +1166,8 @@ class Supervisor:
         self.engines = engines if engines is not None else default_engines(self.home, self.config)
         self.poster = poster if poster is not None else default_poster(self.home)
         self.reactor = reactor if reactor is not None else default_reactor(self.home)
+        self.sleep = sleep
+        self._reactions_lock = threading.Lock()
         self.buildlog_poster = buildlog_poster if buildlog_poster is not None else self._default_buildlog
         self.repo = repo if repo is not None else self.config.get("repo")
         self.dev_channel = self.config.get("dev_channel") or DEFAULT_DEV_CHANNEL
@@ -1078,9 +1258,16 @@ class Supervisor:
         message = build_message(events)
         notes = []
         reacted = self.react_start(events)
+        ticker = self.start_heartbeat([ev["id"] for ev in events])
+        failure = None
         try:
             engine, model, stdout, usage, transition = self.run_engines(message, notes)
         except AllEnginesFailed as e:
+            failure = e
+        finally:
+            self.stop_heartbeat(ticker)  # before anything else touches the reactions
+        if failure is not None:
+            e = failure
             log(f"turn {n}: every engine failed: {e}")
             pair = read_engine(self.home, self.engines)
             append_jsonl(self.path("logs", "turns.jsonl"),
@@ -1780,75 +1967,136 @@ class Supervisor:
     def react_start(self, events):
         """The turn starts: `eyes` on every Slack message in the batch (an `x` left by a failed turn comes off
         first). Returns the message ts reacted to, for the turn record."""
-        state = self.reactions_state()
-        reacted = []
-        for ev in events:
-            target = reaction_target(ev)
-            if target is None:
-                continue
-            channel, ts, thread_ts = target
-            old = state.get(ev["id"])
-            if old and old.get("name"):
-                self.react("remove", old.get("channel") or channel, old.get("ts") or ts, old["name"])
-            self.react("add", channel, ts, REACTION_WORKING)
-            state[ev["id"]] = {"channel": channel, "ts": ts, "thread_ts": thread_ts, "name": REACTION_WORKING,
-                               "at": self.now()}
-            reacted.append(ts)
-        if reacted:
-            self.save_reactions_state(state)
+        with self._reactions_lock:
+            state = self.reactions_state()
+            reacted = []
+            for ev in events:
+                target = reaction_target(ev)
+                if target is None:
+                    continue
+                channel, ts, thread_ts = target
+                old = state.get(ev["id"])
+                if old and old.get("name"):
+                    self.react("remove", old.get("channel") or channel, old.get("ts") or ts, old["name"])
+                self.react("add", channel, ts, REACTION_WORKING)
+                state[ev["id"]] = {"channel": channel, "ts": ts, "thread_ts": thread_ts, "name": REACTION_WORKING,
+                                   "at": self.now()}
+                reacted.append(ts)
+            if reacted:
+                self.save_reactions_state(state)
         return reacted
 
     def react_delivered(self, event_ids, channel=None, thread_ts=None):
-        """The reply for (channel, thread_ts) is posted: its messages lose their reaction. Without a thread, every
-        reaction standing on `event_ids` comes off (the delivery is complete)."""
-        state = self.reactions_state()
-        changed = False
-        for eid in event_ids:
-            rec = state.get(eid)
-            if not rec:
-                continue
-            if channel is not None and (rec.get("channel") != channel or rec.get("thread_ts") != thread_ts):
-                continue
-            self.react("remove", rec.get("channel"), rec.get("ts"), rec.get("name") or REACTION_WORKING)
-            del state[eid]
-            changed = True
-        if changed:
-            self.save_reactions_state(state)
+        """The reply for (channel, thread_ts) is posted: its messages lose their reaction (whichever name stands,
+        `eyes` or the heartbeat's hourglass). Without a thread, every reaction standing on `event_ids` comes off
+        (the delivery is complete)."""
+        with self._reactions_lock:
+            state = self.reactions_state()
+            changed = False
+            for eid in event_ids:
+                rec = state.get(eid)
+                if not rec:
+                    continue
+                if channel is not None and (rec.get("channel") != channel or rec.get("thread_ts") != thread_ts):
+                    continue
+                self.react("remove", rec.get("channel"), rec.get("ts"), rec.get("name") or REACTION_WORKING)
+                del state[eid]
+                changed = True
+            if changed:
+                self.save_reactions_state(state)
 
     def react_failed(self, events):
-        """Every engine failed: `eyes` becomes `x` on the batch's messages until a later turn handles them."""
+        """Every engine failed: the standing reaction becomes `x` on the batch's messages until a later turn
+        handles them."""
+        with self._reactions_lock:
+            state = self.reactions_state()
+            changed = False
+            for ev in events:
+                rec = state.get(ev["id"])
+                if not rec or rec.get("name") == REACTION_FAILED:
+                    continue
+                self.react("remove", rec.get("channel"), rec.get("ts"), rec.get("name") or REACTION_WORKING)
+                self.react("add", rec.get("channel"), rec.get("ts"), REACTION_FAILED)
+                rec["name"] = REACTION_FAILED
+                changed = True
+            if changed:
+                self.save_reactions_state(state)
+
+    # ---- the heartbeat (loops/b6.md)
+    def heartbeat_interval(self):
+        """Seconds between swaps: `reactions.heartbeat_seconds` (default 20); 0 means no heartbeat."""
+        return heartbeat_seconds(self.config)
+
+    def react_swap(self, event_ids):
+        """One heartbeat: on every message of `event_ids` still wearing `eyes` or the hourglass, remove the standing
+        name and add the other. Each call is best effort; the recorded name is the last add attempted, so a failed
+        remove never stops the add that follows, and delivery removes what was last added."""
+        with self._reactions_lock:
+            state = self.reactions_state()
+            changed = False
+            for eid in event_ids:
+                rec = state.get(eid)
+                if not rec or rec.get("name") not in (REACTION_WORKING, REACTION_HEARTBEAT):
+                    continue
+                current = rec["name"]
+                other = REACTION_HEARTBEAT if current == REACTION_WORKING else REACTION_WORKING
+                self.react("remove", rec.get("channel"), rec.get("ts"), current)
+                self.react("add", rec.get("channel"), rec.get("ts"), other)
+                rec["name"] = other
+                changed = True
+            if changed:
+                self.save_reactions_state(state)
+        return changed
+
+    def _heartbeat_wait(self, stop, seconds):
+        """Wait one interval; True when the ticker was told to stop. The injected `sleep` is used when given, else
+        an interruptible wait on the stop flag."""
+        if self.sleep is None:
+            return stop.wait(seconds)
+        self.sleep(seconds)
+        return stop.is_set()
+
+    def _heartbeat_loop(self, event_ids, interval, stop):
+        while not self._heartbeat_wait(stop, interval):
+            try:
+                self.react_swap(event_ids)
+            except Exception as e:  # the ticker never dies on a bad swap, and never raises into the turn
+                if self.note_once("reactions"):
+                    log(f"heartbeat swap failed: {e} (further failures muted for an hour)")
+
+    def start_heartbeat(self, event_ids):
+        """Start the ticker for this turn's messages, or return None when the heartbeat is off or nothing reacted."""
+        interval = self.heartbeat_interval()
+        if interval <= 0 or not event_ids:
+            return None
         state = self.reactions_state()
-        changed = False
-        for ev in events:
-            rec = state.get(ev["id"])
-            if not rec or rec.get("name") == REACTION_FAILED:
-                continue
-            self.react("remove", rec.get("channel"), rec.get("ts"), rec.get("name") or REACTION_WORKING)
-            self.react("add", rec.get("channel"), rec.get("ts"), REACTION_FAILED)
-            rec["name"] = REACTION_FAILED
-            changed = True
-        if changed:
-            self.save_reactions_state(state)
+        wearing = [eid for eid in event_ids if (state.get(eid) or {}).get("name") == REACTION_WORKING]
+        if not wearing:
+            return None
+        stop = threading.Event()
+        thread = threading.Thread(target=self._heartbeat_loop, args=(wearing, interval, stop), daemon=True,
+                                  name="heartbeat")
+        thread.start()
+        return thread, stop
+
+    def stop_heartbeat(self, ticker):
+        """Stop the ticker and wait for a swap in flight, so nothing is added after delivery."""
+        if ticker is None:
+            return
+        thread, stop = ticker
+        stop.set()
+        thread.join(HEARTBEAT_JOIN_S)
+        if thread.is_alive():
+            log(f"heartbeat ticker still busy after {HEARTBEAT_JOIN_S}s; delivering anyway")
 
     def post_and_note(self, channel, thread_ts, text, n):
-        """Post, mirror the post with the thread it went to, and record the thread as joined (a top-level post
-        starts the thread named by the ts the poster returns, when it returns one)."""
-        res = self.poster(channel, thread_ts, text)
-        ts = res.get("ts") if isinstance(res, dict) else None
-        self.mirror_own_reply(channel, thread_ts, text, n, ts=ts)
-        joined = thread_ts or ts
-        if joined:
-            note_thread(self.home, channel, joined)
-        return res
+        """One delivery through the one posting path (loops/b6.md): post, mirror with the thread, record the join
+        (a top-level post starts the thread named by the ts the poster returns, when it returns one)."""
+        return post_and_record(self.home, self.poster, channel, thread_ts, text, turn=n)
 
     def mirror_own_reply(self, channel, thread_ts, text, n, ts=None):
-        """The bridge mirrors everyone but the manager; the supervisor mirrors its own posts into the channel log,
-        with the `thread_ts` they were posted to (null only for a true top-level post)."""
-        if not channel:
-            return
-        append_jsonl(self.path("mirror", f"{channel}.jsonl"),
-                     {"mirrored_at": time.time(), "type": "message", "ts": ts, "thread_ts": thread_ts,
-                      "user": "manager", "bot_id": None, "subtype": "manager_reply", "turn": n, "text": text})
+        """Kept for callers that mirror without posting; `post_and_note` mirrors through `post_and_record`."""
+        mirror_own_post(self.home, channel, thread_ts, text, ts=ts, turn=n)
 
     def deliver_pending(self):
         path = self.path("inbox", "pending-replies.jsonl")
