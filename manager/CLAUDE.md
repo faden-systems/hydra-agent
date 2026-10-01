@@ -71,3 +71,8 @@ open question: <one line or none>
 
 The supervisor writes the text after the marker to `MANAGER-HANDOFF.md`; Codex reads it when it takes a turn for you,
 and so do you after a restart. Keep it current and short.
+
+## The transition read (a family switch)
+
+After a `[transition]` block: read it entirely before acting. Anything in it that must survive the next switch goes
+into `MEMORY.md` this turn, dated and tagged with the engine that originally said it.

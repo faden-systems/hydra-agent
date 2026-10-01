@@ -10,6 +10,9 @@ folder `factory/manager-memory/` in the faden clone.
 Shared memory (loops/b2.md): every engine gets `HYDRA_HOME` and `HYDRA_MEMORY_DIR` in its environment and a three-line
 `[memory]` preamble computed from `LEDGER.jsonl`; after the turn the supervisor snapshots Claude's memory files, stamps
 the handoff header, appends the ledger line (files written = hash diff of the folder) and mirrors its own reply.
+At a family switch (loops/b3.md) the incoming engine's preamble carries a `[transition]` block: the other family's
+transcript since this family last ran, flattened by `transcript.py`, windowed to `transition.max_tokens`, saved under
+`manager-memory/transition/` and recorded in the ledger line as `transition`.
 The engine file `$HYDRA_HOME/engine` is JSON `{"acc", "model"}`; `parse_engine_command` handles
 `engine acc=<account> [model=<alias>]` for the CLI and the bridge; model aliases live in `models.json`.
 
@@ -31,6 +34,10 @@ import time
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from transcript import (claude_project_dirs, find_claude_transcript, find_codex_rollout, flatten_claude,  # noqa: E402,F401
+                        flatten_codex, iso as _iso, render, window)
+
 ENGINE_ORDER = ("claude-r2d2", "claude-l", "codex")
 MODEL = "claude-fable-5-1"  # the Claude family default; kept for callers that predate models.json
 FAMILIES = ("claude", "codex")
@@ -48,6 +55,12 @@ NOTE_EVERY_S = 3600
 RETRY_AFTER_S = 300
 ENGINE_TIMEOUT_S = 1800
 DEFAULT_HOME = "/srv/hydra/manager"
+TRANSITION_DEFAULTS = {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": True}
+TRANSITION_DIRNAME = "transition"
+TRANSITION_HEADER = ("[transition] engine family switched from {a} to {b} at {at}. Below is the other engine's transcript "
+                     "since the last switch, flattened, nothing summarized. Read it fully before acting. Then write to "
+                     "MEMORY.md anything in it that must survive the next switch.")
+CODEX_ROLLOUT_RE = re.compile(r"(/[^\s'\"]*rollout-[^\s'\"]*\.jsonl)")
 DEFAULT_DEV_CHANNEL = "C_DEV"
 TIMER_TEXT = ("timer: read state.json, check open PRs and loop labels with `gh`, act only if something changed; "
               "reply `nothing changed` otherwise.")
@@ -546,8 +559,9 @@ def read_ledger(memory_dir):
     return [r for r in read_jsonl(os.path.join(memory_dir, "LEDGER.jsonl")) if isinstance(r, dict)]
 
 
-def dir_hashes(root, skip=("LEDGER.jsonl",)):
-    """{relative path: sha256} of every regular file under `root` (the ledger itself excluded)."""
+def dir_hashes(root, skip=("LEDGER.jsonl", TRANSITION_DIRNAME + "/")):
+    """{relative path: sha256} of every regular file under `root` (the ledger and the supervisor's own transition
+    records excluded; a `skip` entry ending in `/` is a directory prefix)."""
     out = {}
     if not os.path.isdir(root):
         return out
@@ -556,7 +570,7 @@ def dir_hashes(root, skip=("LEDGER.jsonl",)):
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root)
-            if rel in skip or not os.path.isfile(full):
+            if rel in skip or any(rel.startswith(x) for x in skip if x.endswith("/")) or not os.path.isfile(full):
                 continue
             try:
                 out[rel] = _digest(full)
@@ -597,18 +611,6 @@ def handoff_header(text):
             out["updated_at"] = line.split(":", 1)[1].strip()
         elif line.startswith("engine:"):
             out["engine"] = line.split(":", 1)[1].strip()
-    return out
-
-
-def claude_project_dirs(config_dir, cwd):
-    """Candidate `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>` directories for the engine's working directory."""
-    cwd = os.path.abspath(cwd)
-    encodings = [cwd.replace("/", "-"), re.sub(r"[^A-Za-z0-9]", "-", cwd)]
-    seen, out = set(), []
-    for enc in encodings:
-        if enc not in seen:
-            seen.add(enc)
-            out.append(os.path.join(config_dir, "projects", enc))
     return out
 
 
@@ -739,11 +741,19 @@ class AllEnginesFailed(Exception):
 
 
 class Supervisor:
-    def __init__(self, home=None, engines=None, poster=None, repo=None, config=None, engine_timeout=ENGINE_TIMEOUT_S):
+    def __init__(self, home=None, engines=None, poster=None, repo=None, config=None, engine_timeout=ENGINE_TIMEOUT_S,
+                 codex_home=None, clock=None):
+        """`codex_home` is where Codex keeps its rollouts (`$CODEX_HOME`, default `~/.codex`); when given here or in
+        config.json it is also exported to the engines. `clock` is an optional callable returning an aware datetime
+        (or a unix time) so tests control the ledger's and the transition's times."""
         self.home = home or home_dir()
         self.config = dict(load_config(self.home))
         if config:
             self.config.update(config)
+        self.clock = clock
+        explicit_codex_home = codex_home or self.config.get("codex_home")
+        self.codex_home = explicit_codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+        self.export_codex_home = bool(explicit_codex_home)
         self.engines = engines if engines is not None else default_engines(self.home, self.config)
         self.poster = poster if poster is not None else default_poster(self.home)
         self.repo = repo if repo is not None else self.config.get("repo")
@@ -757,6 +767,13 @@ class Supervisor:
     # ---- small helpers
     def path(self, *parts):
         return os.path.join(self.home, *parts)
+
+    def now(self):
+        """The supervisor's time as UTC ISO: the controlled clock when one was given, else the wall clock."""
+        if self.clock is None:
+            return now_iso()
+        t = self.clock()
+        return _iso(t) if isinstance(t, _dt.datetime) else now_iso(float(t))
 
     def heartbeat(self):
         write_text(self.path("logs", "heartbeat"), now_iso() + "\n")
@@ -814,7 +831,7 @@ class Supervisor:
         message = build_message(events)
         notes = []
         try:
-            engine, model, stdout, tokens = self.run_engines(message, notes)
+            engine, model, stdout, tokens, transition = self.run_engines(message, notes)
         except AllEnginesFailed as e:
             log(f"turn {n}: every engine failed: {e}")
             pair = read_engine(self.home, self.engines)
@@ -833,7 +850,7 @@ class Supervisor:
             self.write_handoff(handoff, engine)
         if family_of(engine, self.engines) == "claude":
             self.snapshot_claude_memory()
-        self.append_ledger(n, engine, model, before)
+        self.append_ledger(n, engine, model, before, transition)
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
         record = {"n": n, "at": started, "engine": engine, "model": model, "events": [ev["id"] for ev in events],
@@ -871,7 +888,7 @@ class Supervisor:
             os.symlink(new, old)
 
     def write_handoff(self, handoff, engine):
-        write_text(self.handoff_path(), stamp_handoff(handoff, engine))
+        write_text(self.handoff_path(), stamp_handoff(handoff, engine, at=self.now()))
 
     def read_handoff(self):
         return read_text(self.handoff_path()) or read_text(self.path("MANAGER-HANDOFF.md"))
@@ -879,17 +896,87 @@ class Supervisor:
     def snapshot_claude_memory(self):
         return snapshot_claude_memory(self.path(".claude"), self.home, os.path.join(self.memory_dir, "claude"))
 
-    def append_ledger(self, n, engine, model, before):
+    def append_ledger(self, n, engine, model, before, transition=None):
         after = dir_hashes(self.memory_dir)
         handoff_text = read_text(self.handoff_path())
-        record = {"turn": n, "at": now_iso(), "engine": engine, "model": model,
+        record = {"turn": n, "at": self.now(), "engine": engine, "model": model,
                   "files_written": files_changed(before, after),
                   "handoff_sha": hashlib.sha256(handoff_text.encode("utf-8")).hexdigest() if handoff_text else None}
+        if transition:
+            record["transition"] = transition
         append_jsonl(os.path.join(self.memory_dir, "LEDGER.jsonl"), record)
         return record
 
     def preamble_for(self, name):
         return memory_preamble(self.memory_dir, family_of(name, self.engines), self.engines)
+
+    # ---- the transition read (loops/b3.md)
+    def transition_config(self):
+        cfg = self.config.get("transition")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        out = dict(TRANSITION_DEFAULTS)
+        for k in ("max_tokens", "tool_result_max_chars"):
+            if cfg.get(k) is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    out[k] = int(cfg[k])
+        if cfg.get("enabled") is not None:
+            out["enabled"] = bool(cfg["enabled"])
+        return out
+
+    def switch_for(self, name):
+        """(from_family, to_family) when a turn on `name` changes the engine family from the last ledger turn's,
+        else None (same family, or no turn yet). The account does not matter: claude-r2d2 <-> claude-l is no switch."""
+        ledger = read_ledger(self.memory_dir)
+        if not ledger:
+            return None
+        last = family_of(str(ledger[-1].get("engine") or ""), self.engines)
+        to = family_of(name, self.engines)
+        return (last, to) if last != to else None
+
+    def family_last_at(self, family):
+        """The `at` of the last ledger turn run by `family`; None when that family never ran."""
+        for e in reversed(read_ledger(self.memory_dir)):
+            if family_of(str(e.get("engine") or ""), self.engines) == family:
+                return e.get("at")
+        return None
+
+    def transcript_source(self, family):
+        """(path or None, where the supervisor looked) of `family`'s transcript."""
+        if family == "codex":
+            hint = read_text(self.path("logs", "codex-rollout")).strip() or None
+            return find_codex_rollout(self.codex_home, self.home, hint), os.path.join(self.codex_home, "sessions")
+        config_dir = self.path(".claude")
+        sid = self.session_id()
+        return find_claude_transcript(config_dir, self.home, sid), os.path.join(config_dir, "projects") + (f" (session {sid})" if sid else "")
+
+    def transition_read(self, from_family, to_family, at):
+        """The `[transition]` block for a turn on `to_family` after turns on `from_family`: the other family's
+        transcript since `to_family` last ran (from the start when it never did), flattened, windowed. Returns
+        (block, ledger record); when the transcript cannot be found the block is one line and the turn proceeds."""
+        cfg = self.transition_config()
+        since = self.family_last_at(to_family)
+        path, looked = self.transcript_source(from_family)
+        record = {"from": from_family, "to": to_family, "source_path": path, "since": since,
+                  "first_at": None, "last_at": None, "entries_kept": 0, "entries_total": 0, "est_tokens": 0}
+        if path is None:
+            block = (f"[transition] engine family switched from {from_family} to {to_family} at {at}. The {from_family} "
+                     f"transcript could not be found (looked under {looked}); nothing to read, go on from the memory files.")
+            return block, record
+        flatten = flatten_codex if from_family == "codex" else flatten_claude
+        entries = flatten(path, since, cfg["tool_result_max_chars"])
+        text, meta = window(render(entries), cfg["max_tokens"])
+        kept = entries[len(entries) - meta["entries_kept"]:] if meta["entries_kept"] else []
+        record.update({"first_at": kept[0]["at"] if kept else None, "last_at": kept[-1]["at"] if kept else None,
+                       "entries_kept": meta["entries_kept"], "entries_total": meta["entries_total"],
+                       "est_tokens": meta["est_tokens"]})
+        block = TRANSITION_HEADER.format(a=from_family, b=to_family, at=at) + "\n" + text
+        return block, record
+
+    def save_transition(self, record, block, at):
+        """The same window, for the record: `manager-memory/transition/<from>-to-<to>-<at>.md`."""
+        path = os.path.join(self.memory_dir, TRANSITION_DIRNAME, f"{record['from']}-to-{record['to']}-{at}.md")
+        write_text(path, block.rstrip("\n") + "\n")
+        return path
 
     # ---- engines
     def engine_order(self):
@@ -922,8 +1009,9 @@ class Supervisor:
         return False
 
     def run_engines(self, message, notes):
-        """Try the engines from the current one. Returns (engine, model, stdout, tokens). Each attempt gets its own
-        memory preamble (the family may differ) and the model carried over from the current pair."""
+        """Try the engines from the current one. Returns (engine, model, stdout, tokens, transition). Each attempt
+        gets its own memory preamble (the family may differ), the transition read when the attempt is a family
+        switch, and the model carried over from the current pair."""
         if engine_file_is_legacy(self.home):
             pair = read_engine(self.home, self.engines)
             set_engine(self.home, pair["acc"], pair["model"], self.engines)  # upgrade the one-word file to JSON
@@ -941,14 +1029,22 @@ class Supervisor:
                 persist_switch = True
                 continue
             model = carry_model(pair["model"], family_of(current, self.engines), family_of(name, self.engines), self.models)
-            full = self.preamble_for(name) + "\n\n" + message
-            rc, out, err, tokens = self.invoke(name, spec, full, model)
+            preamble = self.preamble_for(name)
+            transition = block = switch_at = None
+            switch = self.switch_for(name)
+            if switch and self.transition_config()["enabled"]:
+                switch_at = self.now()
+                block, transition = self.transition_read(switch[0], switch[1], switch_at)
+                preamble += "\n\n" + block
+            rc, out, err, tokens = self.invoke(name, spec, message, model, preamble=preamble)
             if rc == 0:
+                if transition and transition.get("source_path"):
+                    self.save_transition(transition, block, switch_at)
                 if name != current:
                     if persist_switch:
                         set_engine(self.home, name, model, self.engines)
                     notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
-                return name, model, out, tokens
+                return name, model, out, tokens, transition
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
             log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
             if QUOTA_RE.search(err or ""):
@@ -959,6 +1055,8 @@ class Supervisor:
         env = {k: v for k, v in os.environ.items()
                if not (k.startswith("CLAUDE") or k.startswith("ANTHROPIC"))}
         env["CLAUDE_CONFIG_DIR"] = self.path(".claude")
+        if self.export_codex_home:
+            env["CODEX_HOME"] = self.codex_home
         env["HYDRA_HOME"] = self.home
         env["HYDRA_MEMORY_DIR"] = self.memory_dir
         cred = spec.get("cred")
@@ -972,11 +1070,14 @@ class Supervisor:
     def session_id(self):
         return read_text(self.path("session-id")).strip()
 
-    def invoke(self, name, spec, message, model=None):
-        """Run one engine on the batched message. Returns (rc, stdout, stderr, tokens)."""
+    def invoke(self, name, spec, message, model=None, preamble=""):
+        """Run one engine on the batched message behind its preamble (the `[memory]` lines and, at a switch, the
+        `[transition]` block). Returns (rc, stdout, stderr, tokens)."""
         model = model or family_default_model(family_of(name, self.engines), self.models)
         if name == "codex" or spec.get("kind") == "codex":
-            return self.invoke_codex(spec, message, model)
+            return self.invoke_codex(spec, message, model, preamble)
+        if preamble:
+            message = preamble + "\n\n" + message
         sid = self.session_id()
         resume = bool(sid)
         if not sid:
@@ -1014,9 +1115,12 @@ class Supervisor:
                 return str(data.get("result") or ""), tokens, bool(data.get("is_error")), data.get("session_id")
         return stdout, None, False, None
 
-    def invoke_codex(self, spec, message, model=None):
+    def invoke_codex(self, spec, message, model=None, preamble=""):
+        """Codex has no session memory of its own: the preamble, then the handoff and state, then the message."""
         model = model or family_default_model("codex", self.models)
-        preamble, sep, body = message.partition("\n\n") if message.startswith("[memory]") else ("", "", message)
+        body = message
+        if not preamble and message.startswith("[memory]"):
+            preamble, _, body = message.partition("\n\n")
         prefix = ["# MANAGER-HANDOFF.md", (self.read_handoff() or "(none)").rstrip(),
                   "", "# factory/state.json", read_text(state_path(self.home, self.repo), "{}").rstrip(), ""]
         full = (preamble + "\n\n" if preamble else "") + "\n".join(prefix) + "\n" + body
@@ -1032,6 +1136,9 @@ class Supervisor:
         rc, out, err = self._run(argv, full, env)
         if rc == 0:
             write_text(self.path("codex-session"), now_iso() + "\n")
+            m = CODEX_ROLLOUT_RE.search((err or "") + "\n" + (out or ""))
+            if m and os.path.isfile(m.group(1)):
+                write_text(self.path("logs", "codex-rollout"), m.group(1) + "\n")  # the rollout codex exec reported
             final = read_text(last)
             if final.strip():
                 out = final
