@@ -13,6 +13,14 @@ the handoff header, appends the ledger line (files written = hash diff of the fo
 At a family switch (loops/b3.md) the incoming engine's preamble carries a `[transition]` block: the other family's
 transcript since this family last ran, flattened by `transcript.py`, windowed to `transition.max_tokens`, saved under
 `manager-memory/transition/` and recorded in the ledger line as `transition`.
+Threads (loops/b4.md): `$HYDRA_HOME/threads.json` records the threads the manager is part of (`note_thread`,
+`thread_joined`, `forget_thread`, `prune_threads`); the supervisor records a join whenever it posts into a thread.
+Compaction (loops/b4.md): every Claude turn records its input tokens; over `compaction.threshold_tokens`, or when the
+session file grew past `compaction.max_bytes`, a compaction is scheduled before the next turn (quiet hours when the
+limit is crossed by less than 25%, else immediately): a `[compaction]` turn on the same session, then `/compact`
+through `claude -p --resume <id>`, verified by the next turn's input tokens and recorded as `compaction` in the
+ledger; a failure posts one buildlog line, backs off, and never discards the session. State: `logs/compaction.json`;
+`COMPACT` (hydra compact, @manager compact) forces it. Codex gets a `[flush]` line every `codex_every_turns` turns.
 The engine file `$HYDRA_HOME/engine` is JSON `{"acc", "model"}`; `parse_engine_command` handles
 `engine acc=<account> [model=<alias>]` for the CLI and the bridge; model aliases live in `models.json`.
 
@@ -22,6 +30,7 @@ The `Supervisor` class, `acquire_writer` and the queue helpers are importable wi
 import argparse
 import contextlib
 import datetime as _dt
+import fcntl
 import hashlib
 import json
 import os
@@ -33,10 +42,11 @@ import threading
 import time
 import urllib.request
 import uuid
+import zoneinfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transcript import (claude_project_dirs, find_claude_transcript, find_codex_rollout, flatten_claude,  # noqa: E402,F401
-                        flatten_codex, iso as _iso, render, window)
+                        flatten_codex, iso as _iso, parse_ts as parse_iso, render, window)
 
 ENGINE_ORDER = ("claude-r2d2", "claude-l", "codex")
 MODEL = "claude-fable-5-1"  # the Claude family default; kept for callers that predate models.json
@@ -62,6 +72,15 @@ TRANSITION_HEADER = ("[transition] engine family switched from {a} to {b} at {at
                      "MEMORY.md anything in it that must survive the next switch.")
 CODEX_ROLLOUT_RE = re.compile(r"(/[^\s'\"]*rollout-[^\s'\"]*\.jsonl)")
 DEFAULT_DEV_CHANNEL = "C_DEV"
+THREAD_PRUNE_DAYS = 14
+COMPACTION_DEFAULTS = {"threshold_tokens": 300000, "max_bytes": 50 * 1000 * 1000, "codex_every_turns": 25,
+                       "quiet_hours": [2, 5], "quiet_hours_tz": "local", "over_ratio": 1.25, "retry_after_s": 6 * 3600}
+COMPACTION_MESSAGE = ("[compaction] Compact: write everything from this session that must survive into MEMORY.md "
+                      "(facts, decisions, open questions, with dates), update MANAGER-HANDOFF.md, then reply only "
+                      "`compacted`.")
+FLUSH_LINE = ("[flush] every {n} Codex turns: before handling the events below, write everything durable since your "
+              "last flush to MEMORY.md and codex/NOTES.md (dated, tagged codex).")
+USAGE_LINE_RE = re.compile(r"^\[usage\][ \t]+(.*)\n?", re.MULTILINE)
 TIMER_TEXT = ("timer: read state.json, check open PRs and loop labels with `gh`, act only if something changed; "
               "reply `nothing changed` otherwise.")
 
@@ -540,12 +559,145 @@ def status_text(home, repo=None):
     else:
         lines.append("last turn: none yet")
     lines.append(f"queue: {queue_depth(home)} pending")
+    lines.append(f"threads: {threads_count(home)} joined")
+    lines.append(compaction_status_line(home))
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
         lines.append(f"heartbeat: {now_iso(os.path.getmtime(hb))}")
     tracks = tracks_summary(read_state(home, repo))
     lines.append("tracks: " + ("; ".join(tracks) if tracks else "none in state.json"))
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------------------------- threads
+
+def threads_path(home):
+    return os.path.join(home, "threads.json")
+
+
+@contextlib.contextmanager
+def _threads_lock(home):
+    """The bridge and the supervisor both write threads.json: a short flock around every read-modify-write."""
+    path = threads_path(home) + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        with contextlib.suppress(OSError):
+            fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def load_threads(home):
+    """`threads.json`: {channel: {thread_ts: {joined_at, last_seen}}}; empty when absent or unreadable."""
+    try:
+        data = json.loads(read_text(threads_path(home), "{}") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {c: t for c, t in data.items() if isinstance(t, dict)}
+
+
+def save_threads(home, data):
+    write_text(threads_path(home), json.dumps(data, indent=1, sort_keys=True) + "\n")
+
+
+def note_thread(home, channel, thread_ts, at=None):
+    """The manager is part of (channel, thread_ts): a join when new, a touch of `last_seen` otherwise. Returns the
+    record; None without a channel or a thread."""
+    if not channel or not thread_ts:
+        return None
+    at = at or now_iso()
+    key = str(thread_ts)
+    with _threads_lock(home):
+        data = load_threads(home)
+        rec = data.setdefault(channel, {}).get(key)
+        if isinstance(rec, dict) and rec.get("joined_at"):
+            rec = {"joined_at": rec["joined_at"], "last_seen": at}
+        else:
+            rec = {"joined_at": at, "last_seen": at}
+        data[channel][key] = rec
+        save_threads(home, data)
+    return rec
+
+
+def thread_joined(home, channel, thread_ts):
+    return bool(channel and thread_ts and str(thread_ts) in (load_threads(home).get(channel) or {}))
+
+
+def forget_thread(home, channel, thread_ts):
+    """Leave a thread. True when it was joined."""
+    key = str(thread_ts)
+    with _threads_lock(home):
+        data = load_threads(home)
+        if key not in (data.get(channel) or {}):
+            return False
+        del data[channel][key]
+        if not data[channel]:
+            del data[channel]
+        save_threads(home, data)
+    return True
+
+
+def threads_count(home):
+    return sum(len(t) for t in load_threads(home).values())
+
+
+def prune_threads(home, days=THREAD_PRUNE_DAYS, now=None):
+    """Drop threads without a message for `days`. Returns [(channel, thread_ts)] removed."""
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    cutoff = now - _dt.timedelta(days=days)
+    removed = []
+    with _threads_lock(home):
+        data = load_threads(home)
+        for channel in list(data):
+            for key, rec in list(data[channel].items()):
+                seen = parse_iso((rec.get("last_seen") or rec.get("joined_at")) if isinstance(rec, dict) else None)
+                if seen is None or seen < cutoff:
+                    del data[channel][key]
+                    removed.append((channel, key))
+            if not data[channel]:
+                del data[channel]
+        if removed:
+            save_threads(home, data)
+    return removed
+
+
+# ----------------------------------------------------------------------------------------------- compaction state
+
+def compaction_state_path(home):
+    return os.path.join(home, "logs", "compaction.json")
+
+
+def read_compaction_state(home):
+    try:
+        data = json.loads(read_text(compaction_state_path(home), "{}") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def compaction_status_line(home):
+    """`last compaction: <at> (<before> -> <after>)` plus `; compaction: pending (...)` when one is scheduled."""
+    state = read_compaction_state(home)
+    last = state.get("last") or {}
+    if last:
+        after = last.get("after_tokens")
+        shown = after if after is not None else ("failed" if last.get("ok") is False else "unverified")
+        line = f"last compaction: {last.get('at')} ({last.get('before_tokens')} -> {shown})"
+    else:
+        line = "last compaction: none"
+    pending = state.get("pending") or {}
+    if os.path.exists(os.path.join(home, "COMPACT")):
+        line += "; compaction: pending (forced)"
+    elif pending:
+        line += f"; compaction: pending ({pending.get('reason')} {pending.get('value')} over {pending.get('limit')})"
+    elif state.get("verify"):
+        line += "; compaction: awaiting the next turn's verification"
+    return line
 
 
 # ----------------------------------------------------------------------------------------------- shared memory
@@ -742,10 +894,12 @@ class AllEnginesFailed(Exception):
 
 class Supervisor:
     def __init__(self, home=None, engines=None, poster=None, repo=None, config=None, engine_timeout=ENGINE_TIMEOUT_S,
-                 codex_home=None, clock=None):
+                 codex_home=None, clock=None, buildlog_poster=None):
         """`codex_home` is where Codex keeps its rollouts (`$CODEX_HOME`, default `~/.codex`); when given here or in
         config.json it is also exported to the engines. `clock` is an optional callable returning an aware datetime
-        (or a unix time) so tests control the ledger's and the transition's times."""
+        (or a unix time) so tests control the ledger's, the transition's and the compaction's times.
+        `buildlog_poster(channel, thread_ts, text)` receives the one-line notes for the buildlog (a failed
+        compaction); the default posts to the buildlog webhook when one is configured, else logs."""
         self.home = home or home_dir()
         self.config = dict(load_config(self.home))
         if config:
@@ -756,6 +910,7 @@ class Supervisor:
         self.export_codex_home = bool(explicit_codex_home)
         self.engines = engines if engines is not None else default_engines(self.home, self.config)
         self.poster = poster if poster is not None else default_poster(self.home)
+        self.buildlog_poster = buildlog_poster if buildlog_poster is not None else self._default_buildlog
         self.repo = repo if repo is not None else self.config.get("repo")
         self.dev_channel = self.config.get("dev_channel") or DEFAULT_DEV_CHANNEL
         self.engine_timeout = engine_timeout
@@ -774,6 +929,15 @@ class Supervisor:
             return now_iso()
         t = self.clock()
         return _iso(t) if isinstance(t, _dt.datetime) else now_iso(float(t))
+
+    def clock_dt(self):
+        """The supervisor's time as an aware datetime (the controlled clock when one was given)."""
+        if self.clock is None:
+            return _dt.datetime.now(_dt.timezone.utc)
+        t = self.clock()
+        if isinstance(t, _dt.datetime):
+            return t if t.tzinfo else t.replace(tzinfo=_dt.timezone.utc)
+        return _dt.datetime.fromtimestamp(float(t), _dt.timezone.utc)
 
     def heartbeat(self):
         write_text(self.path("logs", "heartbeat"), now_iso() + "\n")
@@ -809,14 +973,19 @@ class Supervisor:
         if os.path.exists(self.path("inbox", "pending-replies.jsonl")):
             return self.deliver_pending()
         events = pending_events(self.home)
-        if not events:
+        due, reason = self.compaction_due()
+        if not events and not due:
             return False
         retry_after = read_text(self.path("logs", "retry-after")).strip()
         if retry_after and time.time() < float(retry_after or 0):
             return False
         try:
             with acquire_writer(self.home, "supervisor"):
-                return self.turn(events)
+                if due:
+                    self.run_compaction(reason)
+                if events:
+                    return self.turn(events)
+                return True
         except WriterHeld as e:
             log(f"skip: {e}")
             return False
@@ -831,7 +1000,7 @@ class Supervisor:
         message = build_message(events)
         notes = []
         try:
-            engine, model, stdout, tokens, transition = self.run_engines(message, notes)
+            engine, model, stdout, usage, transition = self.run_engines(message, notes)
         except AllEnginesFailed as e:
             log(f"turn {n}: every engine failed: {e}")
             pair = read_engine(self.home, self.engines)
@@ -848,16 +1017,23 @@ class Supervisor:
         reply = sanitize_reply(reply)
         if handoff:
             self.write_handoff(handoff, engine)
-        if family_of(engine, self.engines) == "claude":
+        usage = usage or {}
+        is_claude = family_of(engine, self.engines) == "claude"
+        compaction = None
+        if is_claude:
             self.snapshot_claude_memory()
-        self.append_ledger(n, engine, model, before, transition)
+            compaction = self.verify_compaction(usage.get("input_tokens"))
+        self.append_ledger(n, engine, model, before, transition, compaction=compaction)
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
         record = {"n": n, "at": started, "engine": engine, "model": model, "events": [ev["id"] for ev in events],
                   "duration_s": round(time.time() - started, 3)}
-        if tokens is not None:
-            record["tokens"] = tokens
+        for k in ("tokens", "input_tokens"):
+            if usage.get(k) is not None:
+                record[k] = usage[k]
         append_jsonl(self.path("logs", "turns.jsonl"), record)
+        if is_claude:
+            self.schedule_compaction(usage.get("input_tokens"))
         deliveries = self.plan_deliveries(events, reply, n)
         self.deliver(deliveries, [ev["id"] for ev in events], n)
         self.persist(n)
@@ -896,14 +1072,18 @@ class Supervisor:
     def snapshot_claude_memory(self):
         return snapshot_claude_memory(self.path(".claude"), self.home, os.path.join(self.memory_dir, "claude"))
 
-    def append_ledger(self, n, engine, model, before, transition=None):
+    def append_ledger(self, n, engine, model, before, transition=None, compaction=None, kind=None):
         after = dir_hashes(self.memory_dir)
         handoff_text = read_text(self.handoff_path())
         record = {"turn": n, "at": self.now(), "engine": engine, "model": model,
                   "files_written": files_changed(before, after),
                   "handoff_sha": hashlib.sha256(handoff_text.encode("utf-8")).hexdigest() if handoff_text else None}
+        if kind:
+            record["kind"] = kind
         if transition:
             record["transition"] = transition
+        if compaction:
+            record["compaction"] = compaction
         append_jsonl(os.path.join(self.memory_dir, "LEDGER.jsonl"), record)
         return record
 
@@ -1010,9 +1190,10 @@ class Supervisor:
         return False
 
     def run_engines(self, message, notes):
-        """Try the engines from the current one. Returns (engine, model, stdout, tokens, transition). Each attempt
-        gets its own memory preamble (the family may differ), the transition read when the attempt is a family
-        switch, and the model carried over from the current pair."""
+        """Try the engines from the current one. Returns (engine, model, stdout, usage, transition), usage being
+        {"tokens", "input_tokens"} or None. Each attempt gets its own memory preamble (the family may differ), the
+        transition read when the attempt is a family switch, the `[flush]` line on Codex when one is due, and the
+        model carried over from the current pair."""
         if engine_file_is_legacy(self.home):
             pair = read_engine(self.home, self.engines)
             set_engine(self.home, pair["acc"], pair["model"], self.engines)  # upgrade the one-word file to JSON
@@ -1037,7 +1218,9 @@ class Supervisor:
                 switch_at = self.now()
                 block, transition = self.transition_read(switch[0], switch[1], switch_at)
                 preamble += "\n\n" + block
-            rc, out, err, tokens = self.invoke(name, spec, message, model, preamble=preamble)
+            if family_of(name, self.engines) == "codex" and self.codex_flush_due():
+                preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
+            rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
             if rc == 0:
                 if transition and transition.get("source_path"):
                     self.save_transition(transition, block, switch_at)
@@ -1045,7 +1228,7 @@ class Supervisor:
                     if persist_switch:
                         set_engine(self.home, name, model, self.engines)
                     notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
-                return name, model, out, tokens, transition
+                return name, model, out, usage, transition
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
             log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
             if QUOTA_RE.search(err or ""):
@@ -1073,7 +1256,7 @@ class Supervisor:
 
     def invoke(self, name, spec, message, model=None, preamble=""):
         """Run one engine on the batched message behind its preamble (the `[memory]` lines and, at a switch, the
-        `[transition]` block). Returns (rc, stdout, stderr, tokens)."""
+        `[transition]` block). Returns (rc, stdout, stderr, usage) with usage {"tokens", "input_tokens"} or None."""
         model = model or family_default_model(family_of(name, self.engines), self.models)
         if name == "codex" or spec.get("kind") == "codex":
             return self.invoke_codex(spec, message, model, preamble)
@@ -1091,17 +1274,29 @@ class Supervisor:
             argv = [spec["bin"], "-p", "--session-id", sid, "--model", model, "--dangerously-skip-permissions",
                     "--output-format", "json"]
             rc, out, err = self._run(argv, message, self.engine_env(spec))
-        tokens = None
+        usage = None
         if rc == 0:
-            out, tokens, is_error, new_sid = self._parse_claude_output(out)
+            out, usage, is_error, new_sid = self._parse_claude_output(out)
             write_text(self.path("session-id"), (new_sid or sid) + "\n")
             if is_error:
                 return 1, "", out, None
-        return rc, out, err, tokens
+        return rc, out, err, usage
+
+    @staticmethod
+    def _usage_from(usage):
+        """{"tokens": every *tokens count summed, "input_tokens": the input-side ones (input, cache creation, cache
+        read): the context the turn carried}; None when the engine reported nothing."""
+        if not isinstance(usage, dict):
+            return None
+        nums = {k: v for k, v in usage.items() if isinstance(v, (int, float)) and "tokens" in k}
+        if not nums:
+            return None
+        return {"tokens": int(sum(nums.values())), "input_tokens": int(sum(v for k, v in nums.items() if "input" in k))}
 
     @staticmethod
     def _parse_claude_output(stdout):
-        """`--output-format json` gives one object with result/usage/session_id; anything else is the reply itself."""
+        """`--output-format json` gives one object with result/usage/session_id; plain text is the reply itself, in
+        which `[usage] key=value ...` lines are read as usage and removed. Returns (reply, usage, is_error, session_id)."""
         text = stdout.strip()
         if text.startswith("{"):
             try:
@@ -1109,11 +1304,20 @@ class Supervisor:
             except json.JSONDecodeError:
                 data = None
             if isinstance(data, dict) and "result" in data:
-                usage = data.get("usage") or {}
-                tokens = None
-                if isinstance(usage, dict) and usage:
-                    tokens = sum(v for k, v in usage.items() if isinstance(v, (int, float)) and "tokens" in k)
-                return str(data.get("result") or ""), tokens, bool(data.get("is_error")), data.get("session_id")
+                return (str(data.get("result") or ""), Supervisor._usage_from(data.get("usage")),
+                        bool(data.get("is_error")), data.get("session_id"))
+        found = {}
+
+        def take(m):
+            for part in m.group(1).split():
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    with contextlib.suppress(ValueError):
+                        found[k.strip()] = int(float(v))
+            return ""
+        cleaned = USAGE_LINE_RE.sub(take, stdout)
+        if found:
+            return cleaned, Supervisor._usage_from(found), False, None
         return stdout, None, False, None
 
     def invoke_codex(self, spec, message, model=None, preamble=""):
@@ -1154,6 +1358,254 @@ class Supervisor:
         except OSError as e:
             return 127, "", str(e)
         return p.returncode, p.stdout, p.stderr
+
+    # ---- the buildlog
+    def buildlog_url(self):
+        return os.environ.get("HYDRA_BUILDLOG_WEBHOOK") or \
+            read_env_file(self.path("credentials", "buildlog.env")).get("BUILDLOG_WEBHOOK") or \
+            self.config.get("buildlog_webhook")
+
+    def _default_buildlog(self, channel, thread_ts, text):
+        log(f"buildlog: {text}")
+        url = self.buildlog_url()
+        if url:
+            post_webhook(url, text)
+
+    def buildlog(self, text):
+        try:
+            self.buildlog_poster(self.config.get("buildlog_channel") or "#buildlog", None, text)
+        except Exception as e:  # a note is best effort
+            log(f"buildlog post failed: {e}")
+
+    # ---- compaction (loops/b4.md)
+    def compaction_config(self):
+        cfg = self.config.get("compaction")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        out = dict(COMPACTION_DEFAULTS)
+        for k in ("threshold_tokens", "max_bytes", "codex_every_turns", "retry_after_s"):
+            if cfg.get(k) is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    out[k] = int(cfg[k])
+        if cfg.get("over_ratio") is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                out["over_ratio"] = float(cfg["over_ratio"])
+        qh = cfg.get("quiet_hours")
+        if isinstance(qh, (list, tuple)) and len(qh) == 2:
+            with contextlib.suppress(TypeError, ValueError):
+                out["quiet_hours"] = [int(qh[0]) % 24, int(qh[1]) % 24]
+        if cfg.get("quiet_hours_tz"):
+            out["quiet_hours_tz"] = str(cfg["quiet_hours_tz"])
+        return out
+
+    def compaction_state(self):
+        return read_compaction_state(self.home)
+
+    def save_compaction_state(self, state):
+        write_text(compaction_state_path(self.home), json.dumps(state, indent=1) + "\n")
+
+    def quiet_hours_now(self, when=None):
+        """Is the supervisor's clock inside `compaction.quiet_hours` [start, end) in `compaction.quiet_hours_tz`
+        (`local` = the VM's zone, `UTC`, or any IANA name; an unknown name falls back to local time)?"""
+        cfg = self.compaction_config()
+        start, end = cfg["quiet_hours"]
+        when = when or self.clock_dt()
+        tz = cfg["quiet_hours_tz"]
+        if tz.lower() == "local":
+            local = when.astimezone()
+        elif tz.upper() == "UTC":
+            local = when.astimezone(_dt.timezone.utc)
+        else:
+            try:
+                local = when.astimezone(zoneinfo.ZoneInfo(tz))
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+                log(f"compaction.quiet_hours_tz {tz!r} unknown; using local time")
+                local = when.astimezone()
+        h = local.hour
+        if start == end:
+            return False
+        return start <= h < end if start < end else (h >= start or h < end)
+
+    def session_file_size(self):
+        path = find_claude_transcript(self.path(".claude"), self.home, self.session_id() or None)
+        try:
+            return os.path.getsize(path) if path else 0
+        except OSError:
+            return 0
+
+    def last_claude_input_tokens(self):
+        for t in reversed(self.turns()):
+            if t.get("input_tokens") is not None and t.get("kind") != "compaction" \
+                    and family_of(str(t.get("engine") or ""), self.engines) == "claude":
+                return t["input_tokens"]
+        return None
+
+    def compaction_pending(self):
+        """A compaction is scheduled (by tokens, by bytes, or forced) and has not run yet."""
+        return bool(self.compaction_state().get("pending")) or os.path.exists(self.path("COMPACT"))
+
+    def compaction_due(self):
+        """(due, reason): forced always; a scheduled one when the limit is crossed by `over_ratio` (25%) or more,
+        else inside quiet hours; never twice without a verifying Claude turn in between, nor inside the back-off
+        after a failure."""
+        if os.path.exists(self.path("COMPACT")):
+            return True, "forced"
+        state = self.compaction_state()
+        pending = state.get("pending")
+        if not pending or state.get("verify"):
+            return False, None
+        cfg = self.compaction_config()
+        failed = parse_iso(state.get("failed_at"))
+        if failed and (self.clock_dt() - failed).total_seconds() < cfg["retry_after_s"]:
+            return False, None
+        try:
+            ratio = float(pending.get("value") or 0) / float(pending.get("limit") or 1)
+        except (TypeError, ValueError):
+            ratio = 0.0
+        if ratio >= cfg["over_ratio"] or self.quiet_hours_now():
+            return True, pending.get("reason") or "tokens"
+        return False, None
+
+    def schedule_compaction(self, input_tokens):
+        """After a Claude turn: input tokens over `threshold_tokens`, or the session file grown by more than
+        `max_bytes` since the last compaction (the file never shrinks, so growth is what counts), schedules a
+        compaction before the next turn. A turn under both limits clears the schedule; a turn without usage keeps it."""
+        cfg = self.compaction_config()
+        state = self.compaction_state()
+        at = self.now()
+        pending = None
+        if input_tokens is not None and input_tokens > cfg["threshold_tokens"]:
+            pending = {"reason": "tokens", "value": int(input_tokens), "limit": cfg["threshold_tokens"], "since": at}
+        else:
+            size = self.session_file_size()
+            grown = size - int(state.get("baseline_bytes") or 0)
+            if size > cfg["max_bytes"] and grown > cfg["max_bytes"]:
+                pending = {"reason": "bytes", "value": grown, "limit": cfg["max_bytes"], "bytes": size, "since": at}
+        if pending is None and input_tokens is None and state.get("pending"):
+            return state["pending"]
+        previous = state.get("pending") or {}
+        if pending and previous.get("reason") == pending["reason"] and previous.get("since"):
+            pending["since"] = previous["since"]
+        state["pending"] = pending
+        self.save_compaction_state(state)
+        return pending
+
+    def _compaction_outcome(self, state, rec):
+        """Failure: start the back-off and post one buildlog line per streak; success: clear both."""
+        if rec.get("ok") is False:
+            state["failed_at"] = self.now()
+            if not state.get("fail_posted"):
+                hours = self.compaction_config()["retry_after_s"] // 3600
+                self.buildlog(f"hydra-manager compaction failed: {rec.get('error')}; session {self.session_id() or '-'} "
+                              f"kept ({rec.get('before_tokens')} input tokens); next try in {hours}h, or `hydra compact`")
+                state["fail_posted"] = True
+        elif rec.get("ok"):
+            state["failed_at"] = None
+            state["fail_posted"] = False
+
+    def verify_compaction(self, input_tokens):
+        """At the first Claude turn after a compaction: did its input tokens drop below the threshold? Returns the
+        ledger record `{before_tokens, after_tokens, at, ok, reason}`; None when nothing awaits verification."""
+        state = self.compaction_state()
+        v = state.get("verify")
+        if not v:
+            return None
+        cfg = self.compaction_config()
+        ok = None if input_tokens is None else bool(input_tokens < cfg["threshold_tokens"])
+        rec = {"before_tokens": v.get("before_tokens"), "after_tokens": input_tokens, "at": v.get("at"), "ok": ok,
+               "reason": v.get("reason")}
+        if ok is False:
+            rec["error"] = f"input tokens still {input_tokens} after /compact (threshold {cfg['threshold_tokens']})"
+        state["verify"] = None
+        state["last"] = rec
+        self._compaction_outcome(state, rec)
+        self.save_compaction_state(state)
+        log(f"compaction verified: {rec}")
+        return rec
+
+    def compaction_engine(self):
+        """The Claude engine for the compaction turn: the current account when it is Claude, else the first Claude
+        engine with a binary. (None, None) when there is none."""
+        current = current_engine(self.home)
+        for name in [current] + [n for n in self.engine_order() if n != current]:
+            spec = self.engines.get(name) or {}
+            if spec.get("bin") and family_of(name, self.engines) == "claude":
+                return name, spec
+        return None, None
+
+    def run_compaction(self, reason="tokens"):
+        """The compaction: a `[compaction]` turn on the same Claude session (memory written by the engine), then
+        `claude -p --resume <id> "/compact"`; the next Claude turn verifies it. The session id is never touched. A
+        failure (either step) is recorded in the ledger, posted once to the buildlog, and backed off."""
+        state = self.compaction_state()
+        started = time.time()
+        n = len(self.turns()) + 1
+        at = self.now()
+        pending = state.get("pending") or {}
+        before_tokens = pending.get("value") if pending.get("reason") == "tokens" else self.last_claude_input_tokens()
+        if state.get("verify"):  # the previous compaction never got its verifying turn: close it as unverified
+            state["last"] = dict(state["verify"], after_tokens=None, ok=None)
+        rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None, "reason": reason}
+        name, spec = self.compaction_engine()
+        compact_ok, error, model, usage, before = False, None, None, None, None
+        sid = self.session_id()
+        if name is None:
+            error = "no Claude engine configured"
+        else:
+            pair = read_engine(self.home, self.engines)
+            model = pair["model"] if family_of(pair["acc"], self.engines) == "claude" \
+                else family_default_model("claude", self.models)
+            self.ensure_memory_layout()
+            before = dir_hashes(self.memory_dir)
+            log(f"compaction ({reason}) on {name}: [compaction] turn")
+            rc, out, err, usage = self.invoke(name, spec, COMPACTION_MESSAGE, model)
+            if rc != 0:
+                error = f"[compaction] turn failed on {name} (rc={rc}): {(err or '').strip()[-200:]}"
+            else:
+                _reply, handoff = split_handoff(out)
+                if handoff:
+                    self.write_handoff(handoff, name)
+                self.snapshot_claude_memory()
+                sid = self.session_id()
+                argv = [spec["bin"], "-p", "--resume", sid, "--model", model, "--dangerously-skip-permissions", "/compact"]
+                rc2, out2, err2 = self._run(argv, "", self.engine_env(spec))
+                if rc2 == 0:
+                    compact_ok = True
+                else:
+                    error = f"/compact failed (rc={rc2}): {(err2 or out2 or '').strip()[-200:]}"
+        if not compact_ok:
+            rec.update({"ok": False, "error": error})
+        if name is not None:
+            self.append_ledger(n, name, model, before, kind="compaction", compaction=None if compact_ok else rec)
+            record = {"n": n, "at": started, "engine": name, "model": model, "events": [],
+                      "duration_s": round(time.time() - started, 3), "kind": "compaction"}
+            for k in ("tokens", "input_tokens"):
+                if (usage or {}).get(k) is not None:
+                    record[k] = usage[k]
+            if error:
+                record["error"] = error[:2000]
+            append_jsonl(self.path("logs", "turns.jsonl"), record)
+        state["pending"] = None
+        state["baseline_bytes"] = self.session_file_size()
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.path("COMPACT"))
+        if compact_ok:
+            state["verify"] = {"before_tokens": before_tokens, "at": at, "reason": reason, "turn": n}
+            log(f"compaction done on session {sid}; the next Claude turn verifies it")
+        else:
+            state["last"] = rec
+            self._compaction_outcome(state, rec)
+            log(f"compaction failed: {error}; session {sid} kept")
+        self.save_compaction_state(state)
+        return rec
+
+    def codex_flush_due(self):
+        """Every `codex_every_turns` completed Codex turns the next one carries the `[flush]` line."""
+        every = self.compaction_config()["codex_every_turns"]
+        if every <= 0:
+            return False
+        done = sum(1 for t in self.turns() if not t.get("error") and t.get("kind") != "compaction"
+                   and family_of(str(t.get("engine") or ""), self.engines) == "codex")
+        return (done + 1) % every == 0
 
     # ---- delivery
     def long_reply_link(self, reply, n):
@@ -1208,8 +1660,7 @@ class Supervisor:
         try:
             while pending["slack"]:
                 item = pending["slack"][0]
-                self.poster(item["channel"], item["thread_ts"], item["text"])
-                self.mirror_own_reply(item["channel"], item["thread_ts"], item["text"], n)
+                self.post_and_note(item["channel"], item["thread_ts"], item["text"], n)
                 pending["slack"].pop(0)
             while pending["cli"]:
                 item = pending["cli"][0]
@@ -1217,8 +1668,7 @@ class Supervisor:
                 if mirror.count("\n") + 1 > LONG_REPLY_LINES:
                     mirror = "\n".join(mirror.splitlines()[:LONG_REPLY_HEAD]) + \
                              f"\n… full reply in inbox/replies/{item['id']}.txt"
-                self.poster(item["channel"], None, mirror)
-                self.mirror_own_reply(item["channel"], None, mirror, n)
+                self.post_and_note(item["channel"], None, mirror, n)
                 pending["cli"].pop(0)
         except Exception as e:  # delivery failed: keep the reply, do not handle the events
             log(f"delivery failed, reply kept pending: {e}")
@@ -1227,12 +1677,24 @@ class Supervisor:
         mark_handled(self.home, event_ids, turn=n)
         return True
 
-    def mirror_own_reply(self, channel, thread_ts, text, n):
-        """The bridge mirrors everyone but the manager; the supervisor mirrors its own posts into the channel log."""
+    def post_and_note(self, channel, thread_ts, text, n):
+        """Post, mirror the post with the thread it went to, and record the thread as joined (a top-level post
+        starts the thread named by the ts the poster returns, when it returns one)."""
+        res = self.poster(channel, thread_ts, text)
+        ts = res.get("ts") if isinstance(res, dict) else None
+        self.mirror_own_reply(channel, thread_ts, text, n, ts=ts)
+        joined = thread_ts or ts
+        if joined:
+            note_thread(self.home, channel, joined)
+        return res
+
+    def mirror_own_reply(self, channel, thread_ts, text, n, ts=None):
+        """The bridge mirrors everyone but the manager; the supervisor mirrors its own posts into the channel log,
+        with the `thread_ts` they were posted to (null only for a true top-level post)."""
         if not channel:
             return
         append_jsonl(self.path("mirror", f"{channel}.jsonl"),
-                     {"mirrored_at": time.time(), "type": "message", "ts": None, "thread_ts": thread_ts,
+                     {"mirrored_at": time.time(), "type": "message", "ts": ts, "thread_ts": thread_ts,
                       "user": "manager", "bot_id": None, "subtype": "manager_reply", "turn": n, "text": text})
 
     def deliver_pending(self):
@@ -1342,9 +1804,7 @@ class Supervisor:
         return now - max(last_hb, last_t) > DEADMAN_S
 
     def deadman_alert(self):
-        url = os.environ.get("HYDRA_BUILDLOG_WEBHOOK") or \
-            read_env_file(self.path("credentials", "buildlog.env")).get("BUILDLOG_WEBHOOK") or \
-            self.config.get("buildlog_webhook")
+        url = self.buildlog_url()
         text = f"hydra-manager dead-man: no turn and no heartbeat for {DEADMAN_S // 60} minutes with events queued; exiting for restart"
         log(text)
         if url:

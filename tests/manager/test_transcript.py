@@ -109,9 +109,12 @@ def test_codex_fixture_counts_match_the_file_and_reasoning_dropped():
 
 def test_fixtures_hold_no_token_shaped_strings():
     import re
+    # the same shapes the exit scripts grep for; the OAuth prefix is joined at run time so neither this file nor
+    # its compiled bytecode carries a token-shaped string itself
+    shapes = "|".join([r"xoxb-[0-9]", r"xapp-[0-9]", "".join(["sk-ant-", "oat"]), r"ghp_[A-Za-z0-9]{20}"])
     for path in (CLAUDE_FX, CODEX_FX):
         text = open(path, encoding="utf-8").read()
-        assert not re.search(r"xoxb-[0-9]|xapp-[0-9]|sk-ant-oat|ghp_[A-Za-z0-9]{20}", text)
+        assert not re.search(shapes, text)
 
 
 # ----------------------------------------------------------------------------------------------- synthetic lines

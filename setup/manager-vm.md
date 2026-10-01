@@ -473,3 +473,21 @@ and the ledger line records `transition`. Codex's rollouts are read from `$CODEX
 (`~/.codex` of the hydra user; `"codex_home"` in `config.json` overrides and is exported to the
 engines).
 
+Threads (`loops/b4.md`): the manager is part of a thread once it is mentioned in it, once it
+posts in it, or once an `assignee:` line in it names it; from then on every message in that
+thread from an allowlisted sender reaches it without a mention, and its replies stay in the
+thread. `@manager leave` (founder) leaves; 14 days of silence prunes. The record is
+`/srv/hydra/manager/threads.json`; `hydra status` shows `threads: <n> joined`.
+
+Compaction (`loops/b4.md`): every Claude turn records its input tokens; over
+`compaction.threshold_tokens` (default 300000), or when the session file grew by more than
+`compaction.max_bytes` (default 50 MB), the supervisor runs a `[compaction]` turn and then
+`/compact` on the same session before the next turn, in `compaction.quiet_hours` (default
+`[2, 5]`, evaluated in `compaction.quiet_hours_tz`, default `local`, the VM's timezone; `UTC` or
+an IANA name) when the limit is crossed by less than 25%, immediately above that. The next turn
+verifies the drop and the ledger records `compaction`; `hydra status` shows
+`last compaction: <at> (<before> -> <after>)`. A failure posts one line to the buildlog
+webhook and keeps the session. `hydra compact` (or `@manager compact`, founder only) forces it.
+Codex is not compacted; every `compaction.codex_every_turns` Codex turns (default 25) start
+with a `[flush]` line. All keys live under `"compaction"` in `config.json`; nothing is required.
+

@@ -10,6 +10,8 @@
                                full id; `hydra engine <acc>` still works and means the family default model
   hydra pause [reason]         create PAUSE; hydra resume removes it
   hydra attach                 take WRITER and run the manager session interactively; releases on exit
+  hydra compact                force a compaction of the manager's Claude session (the COMPACT flag; it runs
+                               before the next turn; with a live loop, waits for it and prints the outcome)
   hydra update                 pull main in the hydra-agent clone, re-copy manager/ into the deploy dir, refresh
                                the AGENTS.md link, restart hydra-bridge and hydra-manager, print the new commit
 
@@ -76,8 +78,12 @@ def cmd_logs(home, args):
     for t in S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))[-n:]:
         when = S.now_iso(t.get("at")) if isinstance(t.get("at"), (int, float)) else t.get("at")
         line = f"{when} turn {t.get('n', '?')} {t.get('engine')} events={len(t.get('events') or [])} {t.get('duration_s', 0):.0f}s"
+        if t.get("kind"):
+            line += f" kind={t['kind']}"
         if t.get("tokens") is not None:
             line += f" tokens={t['tokens']}"
+        if t.get("input_tokens") is not None:
+            line += f" input_tokens={t['input_tokens']}"
         if t.get("error"):
             line += f" error={t['error'][:120]}"
         print(line)
@@ -163,6 +169,38 @@ def cmd_attach(home, args):
     return rc
 
 
+def cmd_compact(home, args):
+    """Write the COMPACT flag; with a live loop, wait for the compaction and print its outcome (0 ok, 1 failed)."""
+    def marks():
+        st = S.read_compaction_state(home)
+        return ((st.get("last") or {}).get("at"), (st.get("verify") or {}).get("at"))
+    before = marks()
+    S.write_text(os.path.join(home, "COMPACT"), who() + "\n")
+    if not supervisor_alive(home):
+        print("compaction scheduled (COMPACT): it runs before the manager's next turn; no live supervisor loop right now")
+        return 0
+    timeout = float(os.environ.get("HYDRA_COMPACT_TIMEOUT", "900"))
+    print("compaction scheduled; waiting for the supervisor", file=sys.stderr)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        now = marks()
+        if now != before and not os.path.exists(os.path.join(home, "COMPACT")):
+            st = S.read_compaction_state(home)
+            last, verify = st.get("last") or {}, st.get("verify") or {}
+            if verify and verify.get("at") != before[1]:
+                print(f"compacted at {verify.get('at')} ({verify.get('before_tokens')} input tokens before); "
+                      "the next turn verifies the reduction and `hydra status` shows it")
+                return 0
+            if last.get("ok") is False:
+                print(f"compaction failed at {last.get('at')}: {last.get('error')}; the session is unchanged")
+                return 1
+            print(f"compaction at {last.get('at')}: {last.get('before_tokens')} -> {last.get('after_tokens')}")
+            return 0
+        time.sleep(1)
+    print(f"no compaction within {timeout:.0f}s; the COMPACT flag stays, it runs before the next turn", file=sys.stderr)
+    return 1
+
+
 DEFAULT_REPO = "/srv/hydra/repos/hydra-agent"
 DEFAULT_APP = "/srv/hydra/manager/app/manager"
 SERVICES = ("hydra-bridge", "hydra-manager")
@@ -232,7 +270,7 @@ def cmd_update(home, args):
 
 
 COMMANDS = {"status": cmd_status, "say": cmd_say, "logs": cmd_logs, "tail": cmd_tail, "engine": cmd_engine,
-            "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach, "update": cmd_update}
+            "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach, "compact": cmd_compact, "update": cmd_update}
 
 
 def main(argv):
