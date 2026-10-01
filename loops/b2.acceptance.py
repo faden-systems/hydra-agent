@@ -161,7 +161,10 @@ def main():
     app = tempfile.mkdtemp(); open(os.path.join(app, "CLAUDE.md"), "w").write("rules v1\n")  # stale deploy
     hu = tempfile.mkdtemp(); os.makedirs(os.path.join(hu, "inbox")); open(os.path.join(hu, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-fable-5-1"}))
     fakebin = tempfile.mkdtemp(); open(os.path.join(fakebin, "systemctl"), "w").write("#!/usr/bin/env python3\nimport sys\nopen(%r,'a').write(' '.join(sys.argv[1:])+'\\n')\n" % os.path.join(fakebin, "calls.log")); os.chmod(os.path.join(fakebin, "systemctl"), 0o755)
-    r7 = subprocess.run([sys.executable, os.path.join(ROOT, "manager", "hydra"), "update"], env={**os.environ, "HYDRA_HOME": hu, "HYDRA_REPO": clone, "HYDRA_APP": app, "PATH": fakebin + os.pathsep + os.environ["PATH"]}, capture_output=True, text=True, timeout=120)
+    # since b6 the update runs its git steps as `hydra` via sudo when root; this case is the root run (HYDRA_FAKE_UID=0,
+    # how the real deploy runs), so a fake sudo that drops its options and runs the command is on PATH
+    open(os.path.join(fakebin, "sudo"), "w").write("#!/usr/bin/env python3\nimport subprocess, sys\na = sys.argv[1:]\nwhile a and a[0].startswith('-'):\n    a = a[2:] if a[0] == '-u' else a[1:]\nsys.exit(subprocess.call(a) if a else 0)\n"); os.chmod(os.path.join(fakebin, "sudo"), 0o755)
+    r7 = subprocess.run([sys.executable, os.path.join(ROOT, "manager", "hydra"), "update"], env={**os.environ, "HYDRA_HOME": hu, "HYDRA_REPO": clone, "HYDRA_APP": app, "PATH": fakebin + os.pathsep + os.environ["PATH"], "HYDRA_FAKE_UID": "0"}, capture_output=True, text=True, timeout=120)
     assert r7.returncode == 0, r7.stdout + r7.stderr
     assert open(os.path.join(app, "CLAUDE.md")).read() == "rules v2\n", "deploy dir must be refreshed from the pulled main"
     assert os.path.exists(os.path.join(app, "supervisor.py")), "all of manager/ is copied"
