@@ -3,6 +3,7 @@ verbatim, long tool results cut at the cap, reasoning dropped), both Codex tool-
 `window` (cut at an entry boundary, newest kept, meta) and the transcript finders."""
 import json
 import os
+import re
 import time
 
 from conftest import ROOT  # conftest puts manager/ on sys.path
@@ -223,7 +224,7 @@ def test_window_without_a_cut_and_empty():
     text = Tr.render(entries_n(3, size=10))
     out, meta = Tr.window(text, 1000)
     assert meta == {"entries_total": 3, "entries_kept": 3, "first_at": "10:00Z", "last_at": "10:02Z",
-                    "est_tokens": meta["est_tokens"], "cut": False}
+                    "est_tokens": meta["est_tokens"], "cut": False, "cut_entry": False}
     assert out.endswith(text) and out.splitlines()[0].endswith("3 of 3 entries; 0 earlier entries not included.")
     out, meta = Tr.window("", 100)
     assert meta["entries_total"] == 0 and meta["entries_kept"] == 0 and meta["cut"] is False
@@ -239,45 +240,75 @@ def test_window_entries_with_blank_lines_inside_stay_whole():
     assert "\n\n".join(Tr.split_entries(Tr.render(es))) == Tr.render(es), "split and join round-trip the rendered text"
 
 
-def test_window_single_entry_over_budget_keeps_its_tail():
-    es = [{"at": "2026-10-01T10:00:00Z", "role": "user", "kind": "text", "text": "old " * 500 + "END"}]
-    out, meta = Tr.window(Tr.render(es), 100)
-    assert meta["entries_kept"] == 1 and meta["entries_total"] == 1 and meta["cut"] is True
-    assert out.endswith("END") and "chars of this entry omitted" in out and meta["est_tokens"] <= 130
+def test_window_single_oversized_newest_entry_is_truncated_with_the_marker_as_first_line():
+    older = {"at": "2026-10-01T10:00:00Z", "role": "user", "kind": "text", "text": "small older entry"}
+    newest = {"at": "2026-10-01T10:01:00Z", "role": "assistant", "kind": "text", "text": "the key is HUGE-7 " + "z" * 20000}
+    out, meta = Tr.window(Tr.render([older, newest]), 1000)
+    assert meta["entries_kept"] == 1 and meta["entries_total"] == 2 and meta["cut"] is True and meta["cut_entry"] is True
+    body = out.split("\n\n", 1)[1]
+    assert re.match(r"^\[entry truncated: \d+ chars omitted\]\n", body) and body.endswith("z")
+    assert "small older entry" not in out and meta["est_tokens"] <= 1000, "the budget holds, the newest entry's end is kept"
+    omitted = int(re.search(r"\[entry truncated: (\d+) chars omitted\]", body).group(1))
+    rendered = Tr.split_entries(Tr.render([older, newest]))[-1]
+    assert body == f"[entry truncated: {omitted} chars omitted]\n" + rendered[omitted:], "N is exactly what was cut"
+    # one entry alone, oversized: same rule
+    out, meta = Tr.window(Tr.render([newest]), 100)
+    assert meta["entries_kept"] == 1 and meta["cut_entry"] is True and meta["cut"] is True and out.endswith("z")
+
+
+def test_window_never_cuts_inside_an_entry_that_fits():
+    """Two 1200-char entries: 1200 chars is about 343 tokens, so a 500-token budget holds the newest whole and
+    drops the older, and a 2000-token budget holds both; a 200-token budget (700 chars) holds neither, so the
+    newest is truncated with the marker."""
+    es = [{"at": "2026-10-01T10:00:00Z", "role": "user", "kind": "text", "text": "A" * 1200},
+          {"at": "2026-10-01T10:01:00Z", "role": "assistant", "kind": "text", "text": "B" * 1200}]
+    out, meta = Tr.window(Tr.render(es), 500)
+    assert meta["entries_kept"] == 1 and meta["cut_entry"] is False and meta["cut"] is True
+    assert "B" * 1200 in out and "A" * 50 not in out and "[entry truncated:" not in out
+    out, meta = Tr.window(Tr.render(es), 2000)
+    assert meta["entries_kept"] == 2 and meta["cut_entry"] is False and meta["cut"] is False and "A" * 1200 in out and "B" * 1200 in out
+    out, meta = Tr.window(Tr.render(es), 200)
+    assert meta["entries_kept"] == 1 and meta["cut_entry"] is True and "[entry truncated:" in out and "A" * 50 not in out
+    assert out.endswith("B" * 100) and meta["est_tokens"] <= 200
 
 
 def test_estimate_is_chars_over_3_5():
     assert Tr.estimate_tokens("x" * 350) == 100 and Tr.estimate_tokens("") == 0 and Tr.estimate_tokens("abcd") == 2
+    assert Tr.CHARS_PER_TOKEN == 3.5
 
 
 # ----------------------------------------------------------------------------------------------- finders
 
-def test_find_claude_transcript_by_cwd_then_session_id_then_newest(tmp_path):
+def test_find_claude_transcript_is_keyed_by_cwd_and_session_id(tmp_path):
     cfg = str(tmp_path / "cfg"); home = "/srv/hydra/manager"
     proj = os.path.join(cfg, "projects", home.replace("/", "-"))
     other = os.path.join(cfg, "projects", "-elsewhere")
     assert Tr.find_claude_transcript(cfg, home, "sid") is None
-    a = write_jsonl(os.path.join(other, "sid.jsonl"), [])
-    assert Tr.find_claude_transcript(cfg, home, "sid") == a, "the session id wins over the project directory"
+    write_jsonl(os.path.join(other, "sid.jsonl"), [])
+    assert Tr.find_claude_transcript(cfg, home, "sid") is None, "another project's session file is never used"
     b = write_jsonl(os.path.join(proj, "sid.jsonl"), [])
     assert Tr.find_claude_transcript(cfg, home, "sid") == b
     c = write_jsonl(os.path.join(proj, "zzz.jsonl"), []); os.utime(c, (time.time() + 100, time.time() + 100))
     assert Tr.find_claude_transcript(cfg, home, "") == c, "no session id: the newest file of the cwd's project"
-    assert Tr.find_claude_transcript(cfg, home, "missing") == c
+    assert Tr.find_claude_transcript(cfg, home, "missing") is None, "a named session that is not there is not replaced by another"
+    assert Tr.find_claude_transcript(cfg, "/elsewhere", "sid").endswith(os.path.join("-elsewhere", "sid.jsonl"))
 
 
-def test_find_codex_rollout_prefers_cwd_match_then_newest_then_hint(tmp_path):
+def test_find_codex_rollout_is_keyed_by_cwd_with_no_cross_project_fallback(tmp_path):
     ch = str(tmp_path / "codex"); home = str(tmp_path / "home")
     assert Tr.find_codex_rollout(ch, home) is None
     meta = lambda cwd: {"timestamp": "2026-10-01T10:00:00Z", "type": "session_meta", "payload": {"cwd": cwd, "id": "x"}}  # noqa: E731
     a = write_jsonl(os.path.join(ch, "sessions", "2026", "09", "30", "rollout-2026-09-30T10-00-00-a.jsonl"), [meta("/other")])
+    assert Tr.find_codex_rollout(ch, home) is None, "a rollout from another cwd is never used"
     b = write_jsonl(os.path.join(ch, "sessions", "2026", "10", "01", "rollout-2026-10-01T10-00-00-b.jsonl"), [meta(home)])
     c = write_jsonl(os.path.join(ch, "sessions", "2026", "10", "01", "rollout-2026-10-01T11-00-00-c.jsonl"), [meta("/other")])
+    d = write_jsonl(os.path.join(ch, "sessions", "2026", "10", "01", "rollout-2026-10-01T09-00-00-d.jsonl"), [meta(home)])
     now = time.time()
-    for i, p in enumerate((a, b, c)):
+    for i, p in enumerate((d, a, b, c)):
         os.utime(p, (now + i, now + i))
-    assert Tr.find_codex_rollout(ch, home) == b, "the latest rollout whose session_meta cwd is the manager's"
-    assert Tr.find_codex_rollout(ch, "/nowhere") == c, "no cwd match: the latest rollout"
-    assert Tr.find_codex_rollout(ch, home, hint=a) == a, "the file codex exec reported wins"
+    assert Tr.find_codex_rollout(ch, home) == b, "the latest rollout whose session_meta cwd is the engines' directory"
+    assert Tr.find_codex_rollout(ch, "/nowhere") is None, "no cwd match: nothing, even though newer rollouts exist"
+    assert Tr.find_codex_rollout(ch, "") is None
+    assert Tr.find_codex_rollout(ch, home, hint=a) == a, "the file the supervisor recorded from codex exec wins"
     assert Tr.find_codex_rollout(ch, home, hint="/gone.jsonl") == b
-    assert Tr.rollout_cwd(b) == os.path.abspath(home)
+    assert Tr.rollout_cwd(b) == os.path.abspath(home) and Tr.rollout_cwd(os.path.join(ch, "nope.jsonl")) is None

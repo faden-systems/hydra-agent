@@ -221,8 +221,8 @@ def test_missing_transcript_is_one_line_and_the_turn_proceeds(home, poster, tmp_
     queue_event(home, "q"); assert sup.run_once() is True
     stdin = calls(dcx)[-1]["stdin"]
     lines = transition_lines(stdin)
-    assert len(lines) == 1 and lines[0].startswith(f"[transition] engine family switched from claude to codex at {ts(1)}. ")
-    assert "could not be found" in lines[0] and "Transcript window:" not in stdin
+    assert len(lines) == 1 and lines[0].startswith(f"[transition] engine family switched from claude to codex at {ts(1)}: ")
+    assert f"no claude transcript found for {home}" in lines[0] and "Transcript window:" not in stdin
     assert stdin.index("[memory]") < stdin.index("[transition]") < stdin.index("Manager turn.")
     tr = S.read_ledger(sup.memory_dir)[-1]["transition"]
     assert tr["from"] == "claude" and tr["to"] == "codex" and tr["source_path"] is None and tr["entries_total"] == 0 and tr["est_tokens"] == 0
@@ -232,7 +232,28 @@ def test_missing_transcript_is_one_line_and_the_turn_proceeds(home, poster, tmp_
     set_engine(home, "claude-l")
     queue_event(home, "q2"); assert sup.run_once() is True
     lines = transition_lines(calls(dcl)[-1]["stdin"])
-    assert len(lines) == 1 and "from codex to claude" in lines[0] and "could not be found" in lines[0] and sup.codex_home in lines[0]
+    assert len(lines) == 1 and "from codex to claude" in lines[0] and f"no codex transcript found for {home}" in lines[0] and sup.codex_home in lines[0]
+
+
+def test_a_rollout_from_another_cwd_is_never_the_transition_read(home, poster, tmp_path):
+    clock = Clock()
+    sup, dcl, dcx = make_sup(home, poster, tmp_path, clock=clock)
+    write_ledger(sup.memory_dir, [{"turn": 1, "at": ts(1), "engine": "codex", "model": "m", "files_written": []}])
+    codex_rollout(sup.codex_home, "/somewhere/else", [(ts(5), "assistant", "UNRELATED-PROJECT-FACT")], name="rollout-2026-10-01T12-00-00-zzz.jsonl")
+    set_engine(home, "claude-l")
+    queue_event(home, "anything new?"); assert sup.run_once() is True
+    stdin = calls(dcl)[-1]["stdin"]
+    lines = transition_lines(stdin)
+    assert "UNRELATED-PROJECT-FACT" not in stdin and len(lines) == 1 and f"no codex transcript found for {home}" in lines[0]
+    tr = S.read_ledger(sup.memory_dir)[-1]["transition"]
+    assert tr["source_path"] is None and tr["entries_total"] == 0 and not os.path.isdir(os.path.join(sup.memory_dir, "transition"))
+    # the same rollout for this cwd is read; the other project's is still ignored
+    write_ledger(sup.memory_dir, [{"turn": 1, "at": ts(1), "engine": "codex", "model": "m", "files_written": []}])
+    codex_rollout(sup.codex_home, home, [(ts(6), "assistant", "THIS-PROJECT-FACT")], name="rollout-2026-10-01T11-00-00-abc.jsonl")
+    queue_event(home, "again?"); assert sup.run_once() is True
+    stdin = calls(dcl)[-1]["stdin"]
+    assert "THIS-PROJECT-FACT" in stdin and "UNRELATED-PROJECT-FACT" not in stdin
+    assert S.read_ledger(sup.memory_dir)[-1]["transition"]["source_path"].endswith("rollout-2026-10-01T11-00-00-abc.jsonl")
 
 
 def test_switch_after_a_failed_attempt_reads_for_the_engine_that_ran(home, poster, tmp_path):

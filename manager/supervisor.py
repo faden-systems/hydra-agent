@@ -941,7 +941,8 @@ class Supervisor:
         return None
 
     def transcript_source(self, family):
-        """(path or None, where the supervisor looked) of `family`'s transcript."""
+        """(path or None, where the supervisor looked) of `family`'s transcript for the directory the engines run in
+        (`$HYDRA_HOME`); another project's transcript is never used."""
         if family == "codex":
             hint = read_text(self.path("logs", "codex-rollout")).strip() or None
             return find_codex_rollout(self.codex_home, self.home, hint), os.path.join(self.codex_home, "sessions")
@@ -959,8 +960,8 @@ class Supervisor:
         record = {"from": from_family, "to": to_family, "source_path": path, "since": since,
                   "first_at": None, "last_at": None, "entries_kept": 0, "entries_total": 0, "est_tokens": 0}
         if path is None:
-            block = (f"[transition] engine family switched from {from_family} to {to_family} at {at}. The {from_family} "
-                     f"transcript could not be found (looked under {looked}); nothing to read, go on from the memory files.")
+            block = (f"[transition] engine family switched from {from_family} to {to_family} at {at}: no {from_family} "
+                     f"transcript found for {self.home} (looked under {looked}); nothing to read, go on from the memory files.")
             return block, record
         flatten = flatten_codex if from_family == "codex" else flatten_claude
         entries = flatten(path, since, cfg["tool_result_max_chars"])

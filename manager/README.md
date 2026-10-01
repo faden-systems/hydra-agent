@@ -234,17 +234,19 @@ HH:MMZ assistant: tool Bash({"command": "..."})
 HH:MMZ tool: ...
 ```
 
-- Sources (`manager/transcript.py`): Claude Code's session file `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<session-id>.jsonl`
-  (`session-id` names it; any project directory holding that id is accepted, else the newest file of the cwd's
-  project), and Codex's rollout under `$CODEX_HOME/sessions/` (the file `codex exec` reported if it printed one,
-  else the latest whose `session_meta` cwd is the manager's, else the latest at all).
+- Sources (`manager/transcript.py`), both keyed by the directory the engines run in (`$HYDRA_HOME`): Claude Code's
+  session file `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<session-id>.jsonl` (`session-id` names it), and Codex's
+  rollout under `$CODEX_HOME/sessions/` (the file the supervisor recorded from `codex exec`, else the latest whose
+  `session_meta.cwd` is that directory). Another project's transcript is never used: with no match the block is one
+  line, `[transition] ... no codex transcript found for <cwd> ...`, and the turn proceeds.
 - Flattening keeps every user/assistant text whole, renders tool calls as `tool <name>(<arguments>)` (both Codex
   shapes, `function_call`/`arguments` and `custom_tool_call`/`input`), keeps tool results whole up to
   `transition.tool_result_max_chars` (then `[... N more chars omitted]`), keeps compaction summaries as `summary:`
   entries, and drops thinking/reasoning and the harnesses' own records. Nothing is summarized or reordered.
 - `since` is the `at` of the last ledger turn run by the incoming family (the whole transcript when it never ran);
-  transcript timestamps are compared with the ledger's, both UTC. The window keeps the newest entries within
-  `transition.max_tokens` (chars / 3.5), cut at an entry boundary.
+  transcript timestamps are compared with the ledger's, both UTC. The window keeps the newest whole entries within
+  `transition.max_tokens` (chars / 3.5), never cutting inside an entry; only when the single newest entry alone
+  exceeds the budget is it kept cut from its beginning, behind a first line `[entry truncated: N chars omitted]`.
 - Same-family switches (`claude-r2d2` <-> `claude-l`) share one transcript and get no block. A transcript that
   cannot be found gives one `[transition]` line saying so, and the turn proceeds. `transition.enabled: false`
   turns the read off.

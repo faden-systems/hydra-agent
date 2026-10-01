@@ -8,8 +8,11 @@ every user/assistant text whole, tool calls as `tool <name>(<arguments>)`, tool 
 cut with `[... N more chars omitted]`, compaction summaries as `summary:` entries. Reasoning and thinking blocks are
 dropped, and so are the harnesses' own records (Claude's attachment/queue/cost lines, Codex's developer messages,
 events and token counts): they are not conversation. `render` writes `HH:MMZ role: text` per entry with a blank
-line between entries; `window` keeps the newest entries within a token budget (estimate: chars / 3.5), cutting at an
-entry boundary, and prefixes one `Transcript window:` line. The finders locate the files for the supervisor.
+line between entries; `window` keeps the newest whole entries within a token budget (estimate: chars / 3.5), never
+cutting inside an entry except when the single newest entry alone exceeds the budget (then it is kept cut from its
+beginning behind an `[entry truncated: N chars omitted]` line), and prefixes one `Transcript window:` line. The
+finders locate the files for the supervisor, keyed by the directory the engines run in; there is no fallback to
+another project's transcript.
 """
 import datetime as _dt
 import json
@@ -20,6 +23,7 @@ import re
 TOOL_RESULT_MAX_CHARS = 4000
 CHARS_PER_TOKEN = 3.5
 WINDOW_LINE_RESERVE = 160  # chars reserved for the `Transcript window:` line inside the budget
+ENTRY_TRUNCATED = "[entry truncated: {n} chars omitted]\n"
 UTC = _dt.timezone.utc
 TEXT_BLOCKS = ("text", "input_text", "output_text")
 HIDDEN_BLOCKS = ("thinking", "redacted_thinking", "reasoning")
@@ -263,9 +267,11 @@ def split_entries(text):
 
 
 def window(text, max_tokens):
-    """The newest entries of a rendered transcript within `max_tokens` (chars / 3.5), cut at an entry boundary,
-    behind one `Transcript window:` line. Returns (text, meta) with meta = {entries_total, entries_kept, first_at,
-    last_at, est_tokens, cut}. A single newest entry larger than the whole budget keeps its tail."""
+    """The newest whole entries of a rendered transcript within `max_tokens` (chars / 3.5, the `Transcript window:`
+    line included), behind that line. Returns (text, meta) with meta = {entries_total, entries_kept, first_at,
+    last_at, est_tokens, cut, cut_entry}. Entries are never cut inside, with one exception: when the single newest
+    entry alone exceeds the budget it is kept cut from its beginning, its first line being
+    `[entry truncated: N chars omitted]`, and `cut_entry` is true."""
     chunks = split_entries(text)
     total = len(chunks)
     budget = max(int(max_tokens * CHARS_PER_TOKEN) - WINDOW_LINE_RESERVE, 0)
@@ -276,15 +282,12 @@ def window(text, max_tokens):
             break
         kept.insert(0, c)
         used += need
-    head_cut = False
+    cut_entry = False
     if not kept and chunks:
-        c = chunks[-1]
-        kept = [c]
-        if len(c) > budget:
-            marker = "[... {n} earlier chars of this entry omitted]\n"
-            omitted = max(len(c) - budget + len(marker) + 8, 0)
-            kept = [marker.format(n=omitted) + c[omitted:]]
-            head_cut = True
+        newest = chunks[-1]
+        omitted = min(len(newest), max(len(newest) + len(ENTRY_TRUNCATED.format(n=len(newest))) - budget, 0))
+        kept = [ENTRY_TRUNCATED.format(n=omitted) + newest[omitted:]]
+        cut_entry = True
     first_at = _STAMP_RE.match(chunks[total - len(kept)]).group(1) if kept and _STAMP_RE.match(chunks[total - len(kept)]) else ""
     last_at = _STAMP_RE.match(chunks[-1]).group(1) if kept and _STAMP_RE.match(chunks[-1]) else ""
     earlier = total - len(kept)
@@ -292,7 +295,7 @@ def window(text, max_tokens):
             f"{earlier} earlier entries not included.")
     out = line + ("\n\n" + "\n\n".join(kept) if kept else "")
     meta = {"entries_total": total, "entries_kept": len(kept), "first_at": first_at, "last_at": last_at,
-            "est_tokens": estimate_tokens(out), "cut": bool(earlier or head_cut)}
+            "est_tokens": estimate_tokens(out), "cut": bool(earlier or cut_entry), "cut_entry": cut_entry}
     return out, meta
 
 
@@ -316,19 +319,12 @@ def _newest(paths):
 
 
 def find_claude_transcript(config_dir, cwd, session_id=None):
-    """The Claude Code session file: `projects/<encoded cwd>/<session-id>.jsonl`, else that session id under any
-    project directory, else the newest session file of the cwd's project; None when there is none."""
+    """The Claude Code session file of the engines' working directory: `projects/<encoded cwd>/<session-id>.jsonl`,
+    or without a session id the newest session file of that project. Another project's files are never used;
+    None when there is none."""
     dirs = claude_project_dirs(config_dir, cwd)
     if session_id:
-        for d in dirs:
-            p = os.path.join(d, f"{session_id}.jsonl")
-            if os.path.isfile(p):
-                return p
-        projects = os.path.join(config_dir, "projects")
-        if os.path.isdir(projects):
-            hit = _newest(os.path.join(projects, n, f"{session_id}.jsonl") for n in os.listdir(projects))
-            if hit:
-                return hit
+        return next((os.path.join(d, f"{session_id}.jsonl") for d in dirs if os.path.isfile(os.path.join(d, f"{session_id}.jsonl"))), None)
     return _newest(os.path.join(d, n) for d in dirs if os.path.isdir(d) for n in os.listdir(d) if n.endswith(".jsonl"))
 
 
@@ -353,17 +349,17 @@ def rollout_cwd(path):
 
 
 def find_codex_rollout(codex_home, cwd, hint=None):
-    """The Codex rollout to read: the file `codex exec` reported (`hint`) when it exists, else the latest
-    `sessions/**/rollout-*.jsonl` whose `session_meta` cwd is the manager's, else the latest rollout at all."""
+    """The Codex rollout to read: the file the supervisor recorded from `codex exec` (`hint`) when it exists, else
+    the latest `sessions/**/rollout-*.jsonl` whose `session_meta.cwd` equals `cwd`, the directory the engines run
+    in. Another project's rollout is never used: None when nothing matches."""
     if hint and os.path.isfile(hint):
         return hint
+    if not cwd:
+        return None
+    want = os.path.abspath(cwd)
     root = os.path.join(codex_home or "", "sessions")
     files = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         files.extend(os.path.join(dirpath, n) for n in filenames if n.startswith("rollout-") and n.endswith(".jsonl"))
-    if not files:
-        return None
-    want = os.path.abspath(cwd) if cwd else None
-    matched = [p for p in files if want and rollout_cwd(p) == want]
-    return _newest(matched or files)
+    return _newest(p for p in files if rollout_cwd(p) == want)
