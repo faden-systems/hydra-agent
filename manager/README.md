@@ -33,13 +33,15 @@ logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/pos
 engine                      JSON {"acc": claude-r2d2 | claude-l | codex, "model": <full id>}; a legacy one-word file is upgraded on the next turn
 session-id                  the manager's Claude session id (created on the first turn)
 codex-session               marker: a Codex session exists, later Codex turns `exec resume --last`
+logs/codex-rollout          the rollout file `codex exec` last reported (when it printed one); the transition read prefers it
 AGENTS.md                   symlink to app/manager/CLAUDE.md: Codex's mirror of the standing rules
 MANAGER-HANDOFF.md          symlink into factory/manager-memory/ (the five-line summary, stamped `updated_at:`/`engine:` on every rewrite)
 manager-memory/             the shared memory folder only when no faden clone is configured (normally it is <repo>/factory/manager-memory)
 state.json                  the working copy of factory/state.json (copied into the faden clone after every turn)
 budgets.json                {"turns_per_hour": n, "claude_turns_per_day": {"claude-r2d2": n, "claude-l": n}}
 allowlist.json              {slack user or bot id: {"instructs": true|false}}
-config.json                 optional: {"repo": <faden clone>, "dev_channel": "C…", "engines": {...}, "buildlog_webhook": url}
+config.json                 optional: {"repo": <faden clone>, "dev_channel": "C…", "engines": {...}, "buildlog_webhook": url,
+                            "codex_home": <Codex's $CODEX_HOME, default ~/.codex>, "transition": {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": true}}
 credentials/                claude-r2d2.env, claude-l.env (CLAUDE_CODE_OAUTH_TOKEN=…), slack.env (SLACK_BOT_TOKEN, SLACK_APP_TOKEN), buildlog.env (BUILDLOG_WEBHOOK)
 PAUSE                       present: no turn runs; content is who paused
 WRITER                      "<pid> <who>": the one writer; stale (dead pid) locks are reclaimed
@@ -164,14 +166,16 @@ memory, say it is unknown rather than inventing it.
    --dangerously-skip-permissions --output-format json` with `CLAUDE_CONFIG_DIR=$HYDRA_HOME/.claude`, `HYDRA_HOME`,
    `HYDRA_MEMORY_DIR` and only the chosen credential file's `CLAUDE_CODE_OAUTH_TOKEN` in that process's environment
    (all inherited `CLAUDE*` and `ANTHROPIC*` variables are dropped). Every attempt gets the three-line `[memory]`
-   preamble for its family in front of the batched message. A non-zero exit whose stderr mentions quota, usage
+   preamble for its family in front of the batched message, and the `[transition]` block after it when the attempt
+   changes the engine family (see "The transition read"). A non-zero exit whose stderr mentions quota, usage
    limit, rate, 401 or 403 moves to the next engine, persists the choice in `engine`, and adds `engine: <name>
    (<model>)` to the reply. Over budget: same, with a `budget:` note. Codex: `codex exec [resume --last]
    --skip-git-repo-check -m <id> -o <file> -` with `MANAGER-HANDOFF.md` and `state.json` prepended to the same message.
 4. stdout is the reply; the text after `---HANDOFF---` is written to `factory/manager-memory/MANAGER-HANDOFF.md`
    with the `updated_at:`/`engine:` header. After a Claude turn the Claude memory files are snapshotted into
-   `manager-memory/claude/`; the ledger line `{turn, at, engine, model, files_written, handoff_sha}` is appended,
-   `files_written` being the hash diff of the folder before and after the turn.
+   `manager-memory/claude/`; the ledger line `{turn, at, engine, model, files_written, handoff_sha, transition?}` is
+   appended, `files_written` being the hash diff of the folder before and after the turn (the supervisor's own
+   `transition/` records excluded).
 5. Delivery: one post per distinct Slack thread in the batch; console events get `inbox/replies/<id>.txt` and a
    mirror post in `#dev` ("from L via console"); replies over 40 lines go to a file (`factory/log/replies/turn-<n>.md`
    in the clone, linked). If the poster raises, the reply is saved to `pending-replies.jsonl` and the events stay
@@ -196,7 +200,8 @@ MEMORY.md            canonical notes, read and written by every engine; entries 
 claude/              snapshot of Claude Code's memory files ($CLAUDE_CONFIG_DIR/projects/<encoded cwd>/memory/*.md) after every Claude turn; read-only for engines
 codex/NOTES.md       what the manager writes when it runs on Codex; Claude reads it
 MANAGER-HANDOFF.md   the handoff, header `updated_at: <UTC ISO>` and `engine: <name>`; $HYDRA_HOME/MANAGER-HANDOFF.md is a symlink to it
-LEDGER.jsonl         one line per turn {turn, at, engine, model, files_written, handoff_sha}: the clock; engines never compare file dates
+LEDGER.jsonl         one line per turn {turn, at, engine, model, files_written, handoff_sha, transition?}: the clock; engines never compare file dates
+transition/          <from>-to-<to>-<at>.md: the transition read given to the incoming engine at each family switch, for the record
 ```
 
 Before every attempt the supervisor prepends exactly three lines:
@@ -211,6 +216,44 @@ Before every attempt the supervisor prepends exactly three lines:
 the `files_written` of ledger turns after M whose family differs, plus the handoff when its `engine:` header is from
 the other family. The engines' side of the contract (newer wins, conflicts, write to `MEMORY.md`) is in `CLAUDE.md`
 under "Shared memory across engines"; Codex reads the same text through `AGENTS.md`.
+
+### The transition read (a family switch, `loops/b3.md`)
+
+What is said in a Claude session and not written down does not reach Codex through the files, and vice versa. So
+when the family of the attempt about to run differs from the family of the last ledger turn, the supervisor reads
+the other family's transcript and puts it inline, after the three `[memory]` lines, under this header:
+
+```text
+[transition] engine family switched from <a> to <b> at <at>. Below is the other engine's transcript since the last switch, flattened, nothing summarized. Read it fully before acting. Then write to MEMORY.md anything in it that must survive the next switch.
+Transcript window: <first_at> to <last_at>, <kept> of <total> entries; <n> earlier entries not included.
+
+HH:MMZ user: ...
+
+HH:MMZ assistant: tool Bash({"command": "..."})
+
+HH:MMZ tool: ...
+```
+
+- Sources (`manager/transcript.py`), both keyed by the directory the engines run in (`$HYDRA_HOME`): Claude Code's
+  session file `$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<session-id>.jsonl` (`session-id` names it), and Codex's
+  rollout under `$CODEX_HOME/sessions/` (the file the supervisor recorded from `codex exec`, else the latest whose
+  `session_meta.cwd` is that directory). Another project's transcript is never used: with no match the block is one
+  line, `[transition] ... no codex transcript found for <cwd> ...`, and the turn proceeds.
+- Flattening keeps every user/assistant text whole, renders tool calls as `tool <name>(<arguments>)` (both Codex
+  shapes, `function_call`/`arguments` and `custom_tool_call`/`input`), keeps tool results whole up to
+  `transition.tool_result_max_chars` (then `[... N more chars omitted]`), keeps compaction summaries as `summary:`
+  entries, and drops thinking/reasoning and the harnesses' own records. Nothing is summarized or reordered.
+- `since` is the `at` of the last ledger turn run by the incoming family (the whole transcript when it never ran);
+  transcript timestamps are compared with the ledger's, both UTC. The window keeps the newest whole entries within
+  `transition.max_tokens` (chars / 3.5), never cutting inside an entry; only when the single newest entry alone
+  exceeds the budget is it kept cut from its beginning, behind a first line `[entry truncated: N chars omitted]`.
+- Same-family switches (`claude-r2d2` <-> `claude-l`) share one transcript and get no block. A transcript that
+  cannot be found gives one `[transition]` line saying so, and the turn proceeds. `transition.enabled: false`
+  turns the read off.
+- The ledger line gains `transition: {from, to, source_path, since, first_at, last_at, entries_kept, entries_total,
+  est_tokens}` and the same text is saved as `manager-memory/transition/<from>-to-<to>-<at>.md`.
+- The engine's side ("read it entirely, then write what must survive to `MEMORY.md`, dated and tagged with the
+  engine that said it") is in `CLAUDE.md` under "The transition read".
 
 ## The bridge
 

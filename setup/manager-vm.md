@@ -460,7 +460,16 @@ hydra-agent clone, re-copies `manager/` into `app/manager/`, refreshes `CLAUDE.m
 deployed rules and code stay at whatever the bootstrap copied.
 
 Shared memory lives in the faden clone at `factory/manager-memory/` (`MEMORY.md`, `claude/`,
-`codex/NOTES.md`, `MANAGER-HANDOFF.md`, `LEDGER.jsonl`); the supervisor commits it after every
-turn together with `state.json` and the logs. `$HYDRA_HOME/MANAGER-HANDOFF.md` becomes a
-symlink into that folder on the first turn after the update.
+`codex/NOTES.md`, `MANAGER-HANDOFF.md`, `LEDGER.jsonl`, `transition/`); the supervisor commits
+it after every turn together with `state.json` and the logs. `$HYDRA_HOME/MANAGER-HANDOFF.md`
+becomes a symlink into that folder on the first turn after the update.
+
+At a family switch (Claude to Codex or back, not between the two Claude accounts) the incoming
+engine's first turn carries the other engine's transcript since this family last ran, flattened
+and cut to `transition.max_tokens` (default 100000; `tool_result_max_chars` 4000; `enabled` true,
+all under `"transition"` in `config.json`), after the `[memory]` lines and under a
+`[transition]` header; the same text is saved as `factory/manager-memory/transition/<from>-to-<to>-<at>.md`
+and the ledger line records `transition`. Codex's rollouts are read from `$CODEX_HOME`
+(`~/.codex` of the hydra user; `"codex_home"` in `config.json` overrides and is exported to the
+engines).
 
