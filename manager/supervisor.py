@@ -21,6 +21,14 @@ limit is crossed by less than 25%, else immediately): a `[compaction]` turn on t
 through `claude -p --resume <id>`, verified by the next turn's input tokens and recorded as `compaction` in the
 ledger; a failure posts one buildlog line, backs off, and never discards the session. State: `logs/compaction.json`;
 `COMPACT` (hydra compact, @manager compact) forces it. Codex gets a `[flush]` line every `codex_every_turns` turns.
+Working indicator (loops/b5.md): when a turn starts, every Slack message in the batch gets an `eyes` reaction
+(`reactor.add(channel, ts, "eyes")`); it comes off when the reply for its thread is posted, stays while the reply is
+pending, and becomes `x` when every engine failed (cleared when a later turn handles the event). Timer and cli
+events have no message. Reactions are best-effort: a failure is logged once per hour and never blocks a turn.
+`Supervisor(..., reactor=)` takes anything with `add(channel, ts, name)` and `remove(channel, ts, name)`; the default
+is the bridge's `SdkReactor` (reactions.add/remove over `slack_sdk`) with a bot token, else `DryReactor`
+(`logs/reactions.jsonl`).
+The reactions standing on messages are kept in `logs/reactions.json`; `turns.jsonl` lines carry `reacted: [ts...]`.
 The engine file `$HYDRA_HOME/engine` is JSON `{"acc", "model"}`; `parse_engine_command` handles
 `engine acc=<account> [model=<alias>]` for the CLI and the bridge; model aliases live in `models.json`.
 
@@ -83,6 +91,10 @@ FLUSH_LINE = ("[flush] every {n} Codex turns: before handling the events below, 
 USAGE_LINE_RE = re.compile(r"^\[usage\][ \t]+(.*)\n?", re.MULTILINE)
 TIMER_TEXT = ("timer: read state.json, check open PRs and loop labels with `gh`, act only if something changed; "
               "reply `nothing changed` otherwise.")
+REACTION_WORKING = "eyes"
+REACTION_FAILED = "x"
+SLACK_TS_RE = re.compile(r"^\d+\.\d+$")
+REACTION_IDEMPOTENT = {"add": ("already_reacted",), "remove": ("no_reaction",)}  # Slack errors that mean "done"
 
 
 # ----------------------------------------------------------------------------------------------- paths and files
@@ -339,6 +351,69 @@ def post_webhook(url, text):
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         resp.read()
+
+
+# ----------------------------------------------------------------------------------------------- reactions
+
+class DryReactor:
+    """No Slack token: every reaction call is appended to logs/reactions.jsonl. Used in dry mode and tests."""
+
+    def __init__(self, home):
+        self.home = home
+
+    def _record(self, action, channel, ts, name):
+        append_jsonl(os.path.join(self.home, "logs", "reactions.jsonl"),
+                     {"at": time.time(), "action": action, "channel": channel, "ts": ts, "name": name})
+
+    def add(self, channel, ts, name):
+        self._record("add", channel, ts, name)
+
+    def remove(self, channel, ts, name):
+        self._record("remove", channel, ts, name)
+
+
+def default_reactor(home):
+    """With a bot token in credentials/slack.env: the bridge's `SdkReactor` over a slack_sdk WebClient (the bridge
+    module is imported here, not at the top, because it imports this one); without a token, or without slack_sdk
+    installed, the dry reactor."""
+    env = read_env_file(os.path.join(home, "credentials", "slack.env"))
+    token = env.get("SLACK_BOT_TOKEN")
+    if not token:
+        return DryReactor(home)
+    try:
+        import bridge
+        return bridge.sdk_reactor(token)
+    except ImportError as e:
+        log(f"slack_sdk unavailable, reactions go to logs/reactions.jsonl: {e}")
+        return DryReactor(home)
+
+
+def reactions_state_path(home):
+    return os.path.join(home, "logs", "reactions.json")
+
+
+def read_reactions_state(home):
+    """{event id: {channel, ts, thread_ts, name, at}}: the reactions the supervisor has standing on messages."""
+    try:
+        data = json.loads(read_text(reactions_state_path(home), "{}") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def reaction_target(ev):
+    """(channel, ts, thread_ts) of the Slack message an event stands for; None for timer and cli events, or when
+    the event has no message ts (the payload's `ts`, else an id shaped like a Slack ts, as the bridge queues them)."""
+    if ev.get("source") != "slack":
+        return None
+    p = _payload(ev)
+    channel = p.get("channel")
+    ts = p.get("ts")
+    if not ts and SLACK_TS_RE.match(str(ev.get("id") or "")):
+        ts = str(ev["id"])
+    if not channel or not ts:
+        return None
+    return channel, str(ts), p.get("thread_ts")
 
 
 # ----------------------------------------------------------------------------------------------- state and status
@@ -894,12 +969,14 @@ class AllEnginesFailed(Exception):
 
 class Supervisor:
     def __init__(self, home=None, engines=None, poster=None, repo=None, config=None, engine_timeout=ENGINE_TIMEOUT_S,
-                 codex_home=None, clock=None, buildlog_poster=None):
+                 codex_home=None, clock=None, buildlog_poster=None, reactor=None):
         """`codex_home` is where Codex keeps its rollouts (`$CODEX_HOME`, default `~/.codex`); when given here or in
         config.json it is also exported to the engines. `clock` is an optional callable returning an aware datetime
         (or a unix time) so tests control the ledger's, the transition's and the compaction's times.
         `buildlog_poster(channel, thread_ts, text)` receives the one-line notes for the buildlog (a failed
-        compaction); the default posts to the buildlog webhook when one is configured, else logs."""
+        compaction); the default posts to the buildlog webhook when one is configured, else logs. `reactor` has
+        `add(channel, ts, name)` and `remove(channel, ts, name)` (the working indicator, loops/b5.md); the default
+        is the bridge's slack_sdk reactor with a bot token, else `DryReactor` (`logs/reactions.jsonl`)."""
         self.home = home or home_dir()
         self.config = dict(load_config(self.home))
         if config:
@@ -910,6 +987,7 @@ class Supervisor:
         self.export_codex_home = bool(explicit_codex_home)
         self.engines = engines if engines is not None else default_engines(self.home, self.config)
         self.poster = poster if poster is not None else default_poster(self.home)
+        self.reactor = reactor if reactor is not None else default_reactor(self.home)
         self.buildlog_poster = buildlog_poster if buildlog_poster is not None else self._default_buildlog
         self.repo = repo if repo is not None else self.config.get("repo")
         self.dev_channel = self.config.get("dev_channel") or DEFAULT_DEV_CHANNEL
@@ -999,6 +1077,7 @@ class Supervisor:
         before = dir_hashes(self.memory_dir)
         message = build_message(events)
         notes = []
+        reacted = self.react_start(events)
         try:
             engine, model, stdout, usage, transition = self.run_engines(message, notes)
         except AllEnginesFailed as e:
@@ -1006,9 +1085,10 @@ class Supervisor:
             pair = read_engine(self.home, self.engines)
             append_jsonl(self.path("logs", "turns.jsonl"),
                          {"n": n, "at": started, "engine": pair["acc"], "model": pair["model"],
-                          "events": [ev["id"] for ev in events],
+                          "events": [ev["id"] for ev in events], "reacted": reacted,
                           "duration_s": round(time.time() - started, 3), "error": str(e)[:2000]})
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
+            self.react_failed(events)
             self.post_unavailable(events)
             return True
         with contextlib.suppress(FileNotFoundError):
@@ -1027,7 +1107,7 @@ class Supervisor:
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
         record = {"n": n, "at": started, "engine": engine, "model": model, "events": [ev["id"] for ev in events],
-                  "duration_s": round(time.time() - started, 3)}
+                  "reacted": reacted, "duration_s": round(time.time() - started, 3)}
         for k in ("tokens", "input_tokens"):
             if usage.get(k) is not None:
                 record[k] = usage[k]
@@ -1652,7 +1732,8 @@ class Supervisor:
         return {"slack": slack, "cli": cli}
 
     def deliver(self, deliveries, event_ids, n):
-        """Post every planned reply; on the first failure the remainder is kept pending and the events unhandled."""
+        """Post every planned reply; on the first failure the remainder is kept pending and the events unhandled.
+        The working indicator comes off a thread's messages as soon as that thread's reply is posted."""
         pending = {"turn": n, "events": event_ids, "slack": list(deliveries.get("slack") or []),
                    "cli": list(deliveries.get("cli") or [])}
         for item in list(pending["cli"]):
@@ -1662,6 +1743,7 @@ class Supervisor:
                 item = pending["slack"][0]
                 self.post_and_note(item["channel"], item["thread_ts"], item["text"], n)
                 pending["slack"].pop(0)
+                self.react_delivered(event_ids, item["channel"], item["thread_ts"])
             while pending["cli"]:
                 item = pending["cli"][0]
                 mirror = f"from {item.get('user') or 'L'} via console: {item['prompt']}\n\n{item['text']}"
@@ -1674,8 +1756,79 @@ class Supervisor:
             log(f"delivery failed, reply kept pending: {e}")
             append_jsonl(self.path("inbox", "pending-replies.jsonl"), pending)
             return False
+        self.react_delivered(event_ids)
         mark_handled(self.home, event_ids, turn=n)
         return True
+
+    # ---- the working indicator (loops/b5.md)
+    def react(self, action, channel, ts, name):
+        """One best-effort reactions call. A failure is logged once per hour and never raised."""
+        try:
+            getattr(self.reactor, action)(channel, ts, name)
+            return True
+        except Exception as e:
+            if self.note_once("reactions"):
+                log(f"reaction {action} failed ({name} on {channel}/{ts}): {e} (further failures muted for an hour)")
+            return False
+
+    def reactions_state(self):
+        return read_reactions_state(self.home)
+
+    def save_reactions_state(self, state):
+        write_text(reactions_state_path(self.home), json.dumps(state, indent=1, sort_keys=True) + "\n")
+
+    def react_start(self, events):
+        """The turn starts: `eyes` on every Slack message in the batch (an `x` left by a failed turn comes off
+        first). Returns the message ts reacted to, for the turn record."""
+        state = self.reactions_state()
+        reacted = []
+        for ev in events:
+            target = reaction_target(ev)
+            if target is None:
+                continue
+            channel, ts, thread_ts = target
+            old = state.get(ev["id"])
+            if old and old.get("name"):
+                self.react("remove", old.get("channel") or channel, old.get("ts") or ts, old["name"])
+            self.react("add", channel, ts, REACTION_WORKING)
+            state[ev["id"]] = {"channel": channel, "ts": ts, "thread_ts": thread_ts, "name": REACTION_WORKING,
+                               "at": self.now()}
+            reacted.append(ts)
+        if reacted:
+            self.save_reactions_state(state)
+        return reacted
+
+    def react_delivered(self, event_ids, channel=None, thread_ts=None):
+        """The reply for (channel, thread_ts) is posted: its messages lose their reaction. Without a thread, every
+        reaction standing on `event_ids` comes off (the delivery is complete)."""
+        state = self.reactions_state()
+        changed = False
+        for eid in event_ids:
+            rec = state.get(eid)
+            if not rec:
+                continue
+            if channel is not None and (rec.get("channel") != channel or rec.get("thread_ts") != thread_ts):
+                continue
+            self.react("remove", rec.get("channel"), rec.get("ts"), rec.get("name") or REACTION_WORKING)
+            del state[eid]
+            changed = True
+        if changed:
+            self.save_reactions_state(state)
+
+    def react_failed(self, events):
+        """Every engine failed: `eyes` becomes `x` on the batch's messages until a later turn handles them."""
+        state = self.reactions_state()
+        changed = False
+        for ev in events:
+            rec = state.get(ev["id"])
+            if not rec or rec.get("name") == REACTION_FAILED:
+                continue
+            self.react("remove", rec.get("channel"), rec.get("ts"), rec.get("name") or REACTION_WORKING)
+            self.react("add", rec.get("channel"), rec.get("ts"), REACTION_FAILED)
+            rec["name"] = REACTION_FAILED
+            changed = True
+        if changed:
+            self.save_reactions_state(state)
 
     def post_and_note(self, channel, thread_ts, text, n):
         """Post, mirror the post with the thread it went to, and record the thread as joined (a top-level post
