@@ -76,3 +76,12 @@ and so do you after a restart. Keep it current and short.
 
 After a `[transition]` block: read it entirely before acting. Anything in it that must survive the next switch goes
 into `MEMORY.md` this turn, dated and tagged with the engine that originally said it.
+
+## Compaction and flushes
+
+When a turn begins with `[compaction]`, do exactly that: move everything durable from this session into MEMORY.md
+with dates, refresh the handoff, reply `compacted`, nothing else. The supervisor then compacts the session itself;
+nothing you did not write down survives it.
+
+When a turn begins with `[flush]` (Codex, every few turns): before handling the events, write everything durable
+since your last flush to `MEMORY.md` and `codex/NOTES.md`, dated and tagged `codex`, then go on with the turn.

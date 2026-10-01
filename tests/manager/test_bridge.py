@@ -1,4 +1,5 @@
-"""The bridge with a fake client: allowlist, instructs tag, files, mirror, the five commands, threads, bots."""
+"""The bridge with a fake client: allowlist, instructs tag, files, mirror, the commands, threads, bots.
+Since loops/b4.md a message without a mention is queued only in a thread the manager has joined (see test_threads.py)."""
 import json
 import os
 
@@ -27,6 +28,7 @@ def bridge(home, poster):
 
 
 def test_founder_message_is_queued_with_instructs(bridge, home):
+    bridge.note_own_post("C_DEV", "1.0")  # a thread the manager is part of
     bridge.handle_message(msg("please launch b2", ts="10.1", thread="1.0"))
     q = read_queue(home)
     assert q[-1]["id"] == "10.1" and q[-1]["source"] == "slack"
@@ -36,13 +38,14 @@ def test_founder_message_is_queued_with_instructs(bridge, home):
 
 
 def test_operator_is_information(bridge, home):
-    bridge.handle_message(msg("done: loop y", user="U_OPERATOR", ts="10.2"))
+    bridge.note_own_post("C_DEV", "1.0")
+    bridge.handle_message(msg("done: loop y", user="U_OPERATOR", ts="10.2", thread="1.0"))
     p = read_queue(home)[-1]["payload"]
     assert p["instructs"] is False
 
 
 def test_top_level_message_starts_its_own_thread(bridge, home):
-    bridge.handle_message(msg("top level", ts="10.3"))
+    bridge.handle_message(msg("<@U_MANAGER> top level", ts="10.3"))
     assert read_queue(home)[-1]["payload"]["thread_ts"] == "10.3"
 
 
@@ -69,7 +72,8 @@ def test_own_messages_are_never_queued(bridge, home):
 
 
 def test_mention_of_another_bot_is_not_addressing_us(bridge, home, poster):
-    bridge.handle_message(msg("<@U_CODER> status", ts="10.9"))
+    bridge.note_own_post("C_DEV", "1.0")
+    bridge.handle_message(msg("<@U_CODER> status", ts="10.9", thread="1.0"))
     assert poster.posted == []
     assert read_queue(home)[-1]["payload"]["addressed"] is False
 
@@ -80,7 +84,7 @@ def test_edits_are_skipped(bridge, home):
 
 
 def test_files_are_downloaded_and_pathed(bridge, home):
-    bridge.handle_message(msg("see attached", ts="11.1", files=[{"id": "F1", "name": "shot.png", "url_private_download": "https://x/shot.png"}]))
+    bridge.handle_message(msg("<@U_MANAGER> see attached", ts="11.1", files=[{"id": "F1", "name": "shot.png", "url_private_download": "https://x/shot.png"}]))
     p = read_queue(home)[-1]["payload"]
     path = os.path.join(home, "inbox", "files", "11.1-shot.png")
     assert p["files"][0]["path"] == path and open(path).read() == "https://x/shot.png"
@@ -191,11 +195,11 @@ def test_allowlist_reload_from_file(home, poster):
     path = os.path.join(home, "allowlist.json")
     open(path, "w").write(json.dumps({"U_A": {"instructs": True}}))
     br = B.Bridge(home=home, allowlist=B.load_allowlist(home), poster=poster, token_env={}, allowlist_path=path)
-    br.handle_message(msg("hi", user="U_B", ts="18.0"))
+    br.handle_message(msg("<@BOT> hi", user="U_B", ts="18.0"))
     assert not any(e["id"] == "18.0" for e in read_queue(home))
     open(path, "w").write(json.dumps({"U_A": {"instructs": True}, "U_B": {"instructs": False}}))
     os.utime(path, (1, 1))
-    br.handle_message(msg("hi again", user="U_B", ts="18.1"))
+    br.handle_message(msg("<@BOT> hi again", user="U_B", ts="18.1"))
     assert any(e["id"] == "18.1" for e in read_queue(home))
 
 

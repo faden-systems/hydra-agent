@@ -3,8 +3,12 @@
 
 `Bridge(home, allowlist, poster, token_env)` is testable without a client: `handle_message(event)`,
 `handle_file(event)`, `handle_reaction(event)`. Every message in a channel the bot is in is mirrored to
-`$HYDRA_HOME/mirror/<channel>.jsonl`; messages from allowlisted senders are queued for the supervisor; five commands
-(`status`, `pause`, `resume`, `engine [acc=<account>] [model=<alias>]`, `digest now`) are answered without a turn.
+`$HYDRA_HOME/mirror/<channel>.jsonl` with its `thread_ts` (null only for a true top-level post). An allowlisted
+sender's message is queued for the supervisor when it mentions the manager, carries an `assignee:` line naming the
+manager, or is in a thread the manager has joined (loops/b4.md: `$HYDRA_HOME/threads.json`, joined by a mention, by
+the manager's own post, or by an assignee line; left by `@manager leave` (founder) or after 14 days of silence).
+Anything else is mirrored only. The commands (`status`, `pause`, `resume`, `engine [acc=<account>] [model=<alias>]`,
+`digest now`, `leave`, `compact`) are answered without a turn.
 
 Entry points: `bridge.py --check` validates `allowlist.json` and the presence of `credentials/slack.env` without
 connecting; no argument runs the Socket Mode service (systemd).
@@ -21,8 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import supervisor as S  # noqa: E402
 
 MENTION_RE = re.compile(r"<@([A-Za-z0-9_]+)(?:\|[^>]*)?>")
-COMMAND_RE = re.compile(r"^(status|pause|resume|digest now|engine(?:\s+(.+?))?)\s*$", re.IGNORECASE)
-INSTRUCT_COMMANDS = ("pause", "resume", "engine", "digest")
+COMMAND_RE = re.compile(r"^(status|pause|resume|digest now|leave|compact|engine(?:\s+(.+?))?)\s*$", re.IGNORECASE)
+INSTRUCT_COMMANDS = ("pause", "resume", "engine", "digest", "leave", "compact")
+ASSIGNEE_RE = re.compile(r"^[ \t]*assignee:[ \t]*([^|\n]*)", re.IGNORECASE | re.MULTILINE)
+MANAGER_NAMES = ("manager", "@manager")
+PRUNE_EVERY_S = 86400
 SKIPPED_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave", "channel_topic",
                     "channel_purpose", "channel_name", "group_join", "group_leave"}
 
@@ -74,10 +81,55 @@ class Bridge:
         self.repo = repo or S.load_config(home).get("repo")
         for d in ("inbox", "inbox/files", "mirror", "logs"):
             os.makedirs(os.path.join(home, d), exist_ok=True)
+        self._last_prune = 0.0
+        self.maybe_prune()  # the 14-day rule on bridge start
 
     # ---- helpers
     def path(self, *parts):
         return os.path.join(self.home, *parts)
+
+    @property
+    def bot_id(self):
+        """The bot's own Slack user id (`bot_user_id`); settable after construction."""
+        return self.bot_user_id
+
+    @bot_id.setter
+    def bot_id(self, value):
+        self.bot_user_id = value
+
+    # ---- threads (loops/b4.md)
+    def join(self, channel, thread_ts):
+        return S.note_thread(self.home, channel, thread_ts)
+
+    def note_own_post(self, channel, thread_ts):
+        """The manager posted in (channel, thread_ts): the thread is joined (the supervisor records its own
+        deliveries the same way; this is for posts made elsewhere)."""
+        return S.note_thread(self.home, channel, thread_ts)
+
+    def joined(self, channel, thread_ts):
+        return S.thread_joined(self.home, channel, thread_ts)
+
+    def prune(self, days=S.THREAD_PRUNE_DAYS):
+        """Drop threads without a message for `days` (default 14). Returns what was removed."""
+        self._last_prune = time.time()
+        removed = S.prune_threads(self.home, days)
+        if removed:
+            S.log(f"threads pruned: {', '.join(f'{c}/{t}' for c, t in removed)}")
+        return removed
+
+    def maybe_prune(self):
+        if time.time() - self._last_prune >= PRUNE_EVERY_S:
+            self.prune()
+
+    def assigned_to_manager(self, text):
+        """True when an `assignee:` line names the manager (`manager`, `@manager`, or the bot's mention)."""
+        names = []
+        for m in ASSIGNEE_RE.finditer(MENTION_RE.sub(lambda mm: " manager " if self._is_me(mm.group(1)) else " ", text or "")):
+            names += [n.strip().strip("@").lower() for n in re.split(r"[,\s]+", m.group(1)) if n.strip()]
+        return any(n in MANAGER_NAMES for n in names)
+
+    def _is_me(self, uid):
+        return self.bot_user_id is None or uid == self.bot_user_id
 
     def _maybe_reload_allowlist(self):
         if not self.allowlist_path or not os.path.exists(self.allowlist_path):
@@ -152,6 +204,7 @@ class Bridge:
     def handle_message(self, ev):
         """One Slack `message` event (dict). Mirrors it; queues it for allowlisted senders; answers commands."""
         self._maybe_reload_allowlist()
+        self.maybe_prune()  # the 14-day rule, daily
         channel = ev.get("channel")
         subtype = ev.get("subtype")
         if subtype in SKIPPED_SUBTYPES:
@@ -171,11 +224,19 @@ class Bridge:
         addressed, rest = self.parse_mention(text)
         if is_bot and not addressed:
             return None  # another bot talking to the channel, not to us
-        thread_ts = ev.get("thread_ts") or ts
+        thread_ts = ev.get("thread_ts") or ts  # a thread root the manager answers starts its own thread
         if addressed:
             m = COMMAND_RE.match(rest)
             if m:
+                if m.group(1).split()[0].lower() != "leave":
+                    self.join(channel, thread_ts)  # a mention joins the thread, except the one that leaves it
                 return self.command(m, sender, entry, channel, thread_ts)
+        if addressed or self.assigned_to_manager(text):
+            self.join(channel, thread_ts)
+        elif self.joined(channel, thread_ts):
+            self.join(channel, thread_ts)  # touches last_seen
+        else:
+            return None  # an unjoined thread, or a top-level post without a mention: mirrored only
         event = S.append_event(self.home, S.new_event(
             "slack", {"channel": channel, "thread_ts": thread_ts, "user": sender, "text": text,
                       "instructs": bool(entry.get("instructs")), "addressed": addressed, "files": files},
@@ -210,7 +271,7 @@ class Bridge:
                                           "reaction": ev.get("reaction"), "event_ts": ev.get("event_ts")})
         return None
 
-    # ---- the five commands
+    # ---- the commands
     def command(self, m, sender, entry, channel, thread_ts):
         word = m.group(1).lower()
         name = word.split()[0]
@@ -251,6 +312,15 @@ class Bridge:
                                   "decision) for this cycle.", "digest": True, "channel": channel,
                           "thread_ts": thread_ts, "user": sender, "instructs": True}))
             self.reply(channel, thread_ts, "digest queued")
+        elif name == "leave":
+            if S.forget_thread(self.home, channel, thread_ts):
+                self.reply(channel, thread_ts, "left this thread; mention me, or assign me, to bring me back")
+            else:
+                self.reply(channel, thread_ts, "not in this thread")
+                return {"command": word, "ok": False}
+        elif name == "compact":
+            S.write_text(self.path("COMPACT"), f"{sender}\n")
+            self.reply(channel, thread_ts, "compaction scheduled; it runs before the manager's next turn")
         return {"command": word, "ok": True}
 
 

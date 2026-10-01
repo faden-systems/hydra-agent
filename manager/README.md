@@ -9,15 +9,16 @@ up in a thread; operators use Slack only; tokens never leave `credentials/`.
 
 | File | What it is |
 |---|---|
-| `supervisor.py` | the turn loop: queue, wake, engine choice and rotation, reply delivery, handoff, bookkeeping, persistence, PAUSE, budgets, the WRITER lock, the dead-man |
-| `bridge.py` | the Slack bridge (`slack_bolt` Socket Mode): allowlist, mirror, file download, the five commands, thread routing |
-| `hydra` | the console CLI: `status`, `say`, `logs`, `tail`, `engine`, `pause`, `resume`, `attach`, `update` |
+| `supervisor.py` | the turn loop: queue, wake, engine choice and rotation, reply delivery, handoff, bookkeeping, persistence, PAUSE, budgets, the WRITER lock, the dead-man, the compaction policy, thread participation records |
+| `bridge.py` | the Slack bridge (`slack_bolt` Socket Mode): allowlist, mirror, file download, the commands, thread participation and routing |
+| `hydra` | the console CLI: `status`, `say`, `logs`, `tail`, `engine`, `pause`, `resume`, `attach`, `compact`, `update` |
 | `models.json` | model aliases per family (`claude`, `codex`) with the family default; extendable by `$HYDRA_HOME/models.json` |
 | `CLAUDE.md` | the manager's standing rules, read by Claude Code on every turn (installed at `$HYDRA_HOME/CLAUDE.md`) |
 | `systemd/` | `hydra-manager.service` (supervisor loop) and `hydra-bridge.service` (bridge) |
 
 Tests: `tests/manager/` (no network; fake engines, fake poster). Exit: `loops/b1.exit.sh` with the exit-owned
-`loops/b1.acceptance.py`.
+`loops/b1.acceptance.py`; later loops (`b2` shared memory, `b3` the transition read, `b4` threads and compaction)
+add their own exit scripts and acceptance harnesses under `loops/`.
 
 ## `$HYDRA_HOME` (default `/srv/hydra/manager`)
 
@@ -28,8 +29,11 @@ inbox/pending-replies.jsonl replies whose delivery failed; delivered first on th
 inbox/replies/<id>.txt      replies to console (`hydra say`) events
 inbox/files/<ts>-<name>     attachments downloaded by the bridge
 mirror/<channel>.jsonl      every message in a channel the bot is in (copied to factory/log/ and committed)
-logs/turns.jsonl            {n, at, engine, model, events, duration_s, tokens?, error?} per turn
+logs/turns.jsonl            {n, at, engine, model, events, duration_s, tokens?, input_tokens?, kind?, error?} per turn (kind: compaction for the compaction turn)
+logs/compaction.json        the compaction policy's state: pending, verify, last, failed_at, fail_posted, baseline_bytes
 logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/posts.jsonl (dry mode)
+threads.json                {channel: {thread_ts: {joined_at, last_seen}}}: the threads the manager is part of (bridge and supervisor both write it, under threads.json.lock)
+COMPACT                     present: a compaction runs before the next turn (hydra compact, @manager compact); content is who asked
 engine                      JSON {"acc": claude-r2d2 | claude-l | codex, "model": <full id>}; a legacy one-word file is upgraded on the next turn
 session-id                  the manager's Claude session id (created on the first turn)
 codex-session               marker: a Codex session exists, later Codex turns `exec resume --last`
@@ -41,7 +45,8 @@ state.json                  the working copy of factory/state.json (copied into 
 budgets.json                {"turns_per_hour": n, "claude_turns_per_day": {"claude-r2d2": n, "claude-l": n}}
 allowlist.json              {slack user or bot id: {"instructs": true|false}}
 config.json                 optional: {"repo": <faden clone>, "dev_channel": "C…", "engines": {...}, "buildlog_webhook": url,
-                            "codex_home": <Codex's $CODEX_HOME, default ~/.codex>, "transition": {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": true}}
+                            "codex_home": <Codex's $CODEX_HOME, default ~/.codex>, "transition": {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": true},
+                            "compaction": {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "local"}}
 credentials/                claude-r2d2.env, claude-l.env (CLAUDE_CODE_OAUTH_TOKEN=…), slack.env (SLACK_BOT_TOKEN, SLACK_APP_TOKEN), buildlog.env (BUILDLOG_WEBHOOK)
 PAUSE                       present: no turn runs; content is who paused
 WRITER                      "<pid> <who>": the one writer; stale (dead pid) locks are reclaimed
@@ -176,10 +181,11 @@ memory, say it is unknown rather than inventing it.
    `manager-memory/claude/`; the ledger line `{turn, at, engine, model, files_written, handoff_sha, transition?}` is
    appended, `files_written` being the hash diff of the folder before and after the turn (the supervisor's own
    `transition/` records excluded).
-5. Delivery: one post per distinct Slack thread in the batch; console events get `inbox/replies/<id>.txt` and a
-   mirror post in `#dev` ("from L via console"); replies over 40 lines go to a file (`factory/log/replies/turn-<n>.md`
-   in the clone, linked). If the poster raises, the reply is saved to `pending-replies.jsonl` and the events stay
-   unhandled; the next tick delivers it without a new engine turn.
+5. Delivery: one post per distinct Slack thread in the batch, into the thread the event came from (a top-level
+   event's reply starts the thread on it); every thread posted to is recorded in `threads.json` as joined. Console
+   events get `inbox/replies/<id>.txt` and a mirror post in `#dev` ("from L via console"); replies over 40 lines go
+   to a file (`factory/log/replies/turn-<n>.md` in the clone, linked). If the poster raises, the reply is saved to
+   `pending-replies.jsonl` and the events stay unhandled; the next tick delivers it without a new engine turn.
 6. Bookkeeping: `logs/turns.jsonl`, `handled.jsonl`, the manager's own reply appended to `mirror/<channel>.jsonl`
    (`user: manager`), then `mirror/*.jsonl` to `<repo>/factory/log/`, `state.json` to `<repo>/factory/state.json`
    and `factory/manager-memory/`, commit `manager: turn <n>`, push.
@@ -189,6 +195,41 @@ memory, say it is unknown rather than inventing it.
 The service loop adds a timer event every 15 minutes (`timer-<slot>`), and a watchdog thread trips the dead-man
 (events queued, no turn and no heartbeat for 30 minutes): a post to the buildlog webhook and exit 3, so systemd
 restarts the service.
+
+## The compaction policy (`loops/b4.md`)
+
+The resumed Claude session grows without bound, and a long one costs hundreds of thousands of input tokens per turn.
+The supervisor keeps it within `compaction.threshold_tokens` (default 300000):
+
+- Every Claude turn records `input_tokens` in `turns.jsonl` (input + cache creation + cache read from the JSON
+  usage; a plain-text `[usage] input_tokens=N` line is read the same way). A turn over the threshold, or a session
+  file (`$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<session-id>.jsonl`) that grew by more than `compaction.max_bytes`
+  (default 50 MB) since the last compaction (the file never shrinks, so growth is what counts), schedules a compaction
+  before the next turn (`logs/compaction.json: pending`; `hydra status` says `compaction: pending (...)`).
+- When the limit is crossed by less than 25% the compaction waits for `compaction.quiet_hours` (default `[2, 5]`,
+  02:00 to 05:00) evaluated in `compaction.quiet_hours_tz` (`local`, the VM's zone, by default; `UTC` or any IANA
+  name); 25% or more over, it runs immediately before the next turn. The timer events keep turns coming, so a
+  deferred compaction runs in the first quiet-hours turn.
+- The compaction itself, under the WRITER lock and before the batched turn: a dedicated turn on the same session,
+  `[compaction] Compact: write everything from this session that must survive into MEMORY.md (facts, decisions,
+  open questions, with dates), update MANAGER-HANDOFF.md, then reply only \`compacted\`.` (its handoff and memory
+  writes are kept; its own ledger line has `kind: compaction`), then `claude -p --resume <session-id> --model <id>
+  --dangerously-skip-permissions "/compact"`. The session id is never touched.
+- The next Claude turn verifies: its `input_tokens` must be below the threshold. That turn's ledger line records
+  `compaction: {before_tokens, after_tokens, at, ok, reason}`; `hydra status` shows `last compaction: <at>
+  (<before> -> <after>)`.
+- A failure (the `[compaction]` turn fails, `/compact` exits non-zero, or the tokens did not drop) is recorded with
+  `ok: false` and `error` (on the compaction's own ledger line when known at once, else on the verifying turn's),
+  posted once per streak to the buildlog (the webhook, or `buildlog_poster` in tests), and the policy backs off for
+  `compaction.retry_after_s` (default 6 hours) before trying again. The session is kept as it is.
+- `hydra compact` and `@manager compact` (founder only) write `COMPACT`: the compaction runs on the next tick, with or
+  without queued events, regardless of quiet hours and the back-off. With a live loop `hydra compact` waits for it
+  (`HYDRA_COMPACT_TIMEOUT`, default 900 s) and prints the outcome.
+- Codex is not compacted (its continuity is `resume --last` plus the handoff and the memory files). Every
+  `compaction.codex_every_turns` Codex turns (default 25; 0 turns it off) the turn starts with a `[flush]` line asking
+  it to write everything durable since its last flush to `MEMORY.md` and `codex/NOTES.md` before the events.
+- The engine's side (`[compaction]`: memory, handoff, reply `compacted`, nothing else; `[flush]`) is in `CLAUDE.md`
+  under "Compaction and flushes".
 
 ## Shared memory across engines (`factory/manager-memory/`)
 
@@ -257,11 +298,22 @@ HH:MMZ tool: ...
 
 ## The bridge
 
-- Every message in a channel the bot is in is mirrored. Only allowlisted senders are queued; `instructs` comes from
-  the allowlist (founder: true, operators: false). Strangers and bots not addressing the manager are never queued.
-- A mention whose remaining text is exactly `status`, `pause`, `resume`, `engine [acc=…] [model=…]` or `digest now`
-  is a command, answered without a turn. `status` for any allowlisted sender; the rest only for `instructs: true`;
-  anyone else gets "not authorized" and nothing changes.
+- Every message in a channel the bot is in is mirrored, with its `thread_ts` (null only for a true top-level post).
+  Only allowlisted senders are queued; `instructs` comes from the allowlist (founder: true, operators: false).
+  Strangers and bots not addressing the manager are never queued.
+- Threads (`loops/b4.md`): an event's thread is its `thread_ts`, or its own `ts` for a top-level message the manager
+  answers (the reply then starts the thread on it). The manager is part of a thread (`threads.json`) once it is
+  mentioned in it, once it posts in it (the supervisor records its deliveries; `Bridge.note_own_post` records
+  others), or once a message in it carries an `assignee:` line naming the manager (`manager`, `@manager`, or its
+  mention). In a joined thread every later message from an allowlisted sender is queued, mention or not, with the
+  allowlist's `instructs`. Messages in threads it has not joined, and top-level messages without a mention or an
+  assignee line, are mirrored only. `@manager leave` (founder) leaves the thread; a thread without a message for
+  14 days is pruned (on bridge start and daily, `Bridge.prune()`).
+- A mention whose remaining text is exactly `status`, `pause`, `resume`, `engine [acc=…] [model=…]`, `digest now`,
+  `leave` or `compact` is a command, answered without a turn (a command mention still joins the thread, except
+  `leave`). `status` for any allowlisted sender; the rest only for `instructs: true`; anyone else gets "not
+  authorized" and nothing changes. `status` includes `threads: <n> joined` and `last compaction: …`; `compact`
+  writes the `COMPACT` flag.
 - Replies go to the originating thread (a top-level message starts its own). While paused the bridge answers
   "paused (by …)" to mentions and queues them; while `hydra attach` holds `WRITER` it answers "manager in console
   session".
@@ -270,9 +322,10 @@ HH:MMZ tool: ...
 ## The console
 
 `hydra status | say "<text>" | logs [n] | tail <channel> [n] | engine [acc=<a>] [model=<m>] | pause [reason] | resume |
-attach | update`. `say` queues a `cli` event and, when the service loop is alive, waits for the reply. `attach` takes
-`WRITER`, runs `claude --resume <session-id> --model <current model>` interactively with the same config dir and token,
-releases the lock on exit and posts a two-line summary to `#dev`.
+attach | compact | update`. `say` queues a `cli` event and, when the service loop is alive, waits for the reply. `attach`
+takes `WRITER`, runs `claude --resume <session-id> --model <current model>` interactively with the same config dir and
+token, releases the lock on exit and posts a two-line summary to `#dev`. `compact` forces a compaction (see "The
+compaction policy"); with a live loop it waits for it and exits 1 when it failed.
 
 `hydra update` (as root, after every merge to `manager/`): fast-forwards `main` in the hydra-agent clone (`HYDRA_REPO`,
 default `/srv/hydra/repos/hydra-agent`), re-copies `manager/` into the deploy dir (`HYDRA_APP`, default
