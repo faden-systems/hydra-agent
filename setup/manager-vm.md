@@ -460,10 +460,20 @@ in the thread and in `hydra status`; `hydra engine acc=claude-r2d2 model=fable5.
 short form `hydra engine claude-r2d2`) moves back. `engine` is JSON `{"acc", "model"}`; a
 legacy one-word file is upgraded on the next turn.
 
-After every merge to `manager/` on `main`, as root: `hydra update`. It fast-forwards the
-hydra-agent clone, re-copies `manager/` into `app/manager/`, refreshes `CLAUDE.md` and the
-`AGENTS.md` link, restarts both services and prints `updated to <commit>`. Without it the
-deployed rules and code stay at whatever the bootstrap copied.
+After every merge to `manager/` on `main`, from the admin account: `sudo -n hydra update`. It
+fast-forwards the hydra-agent clone with every git step run as `hydra` (`sudo -n -u hydra -H git
+-C /srv/hydra/repos/hydra-agent ...`, the clone's owner, so git's ownership check passes), then as
+root re-copies `manager/` into `app/manager/`, refreshes `CLAUDE.md` and the `AGENTS.md` link,
+restarts both services and prints `updated to <commit>`. Run as `hydra` (no sudo), `hydra update`
+does the git steps, leaves `app/manager/` and the services alone, and prints the root command
+for the rest (`sudo -n hydra update`), exit 0. Without it the deployed rules and code stay at
+whatever the bootstrap copied.
+
+The manager posts from inside a turn with `hydra post <channel> <thread_ts|-> <text>`; the line
+waits in `inbox/outbox.jsonl` until the bridge posts it, so a stopped bridge delays direct posts
+but loses none. `hydra status` shows `direct posts: <n> posted, <k> queued`. The working
+indicator alternates `eyes` and `hourglass_flowing_sand` every `reactions.heartbeat_seconds`
+(`config.json`, default 20; `0` turns the swap off) while a turn runs.
 
 Shared memory lives in the faden clone at `factory/manager-memory/` (`MEMORY.md`, `claude/`,
 `codex/NOTES.md`, `MANAGER-HANDOFF.md`, `LEDGER.jsonl`, `transition/`); the supervisor commits

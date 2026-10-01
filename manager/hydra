@@ -12,11 +12,20 @@
   hydra attach                 take WRITER and run the manager session interactively; releases on exit
   hydra compact                force a compaction of the manager's Claude session (the COMPACT flag; it runs
                                before the next turn; with a live loop, waits for it and prints the outcome)
-  hydra update                 pull main in the hydra-agent clone, re-copy manager/ into the deploy dir, refresh
-                               the AGENTS.md link, restart hydra-bridge and hydra-manager, print the new commit
+  hydra post <channel> <thread_ts|-> <text>
+                               post to Slack from inside a turn (loops/b6.md): the line goes to inbox/outbox.jsonl
+                               and the bridge posts it through the manager's one posting path, so the thread is
+                               joined and the post mirrored; `-` posts top level. Text may come on stdin. With a
+                               live bridge, waits for the post and prints `posted`.
+  hydra update                 fast-forward main in the hydra-agent clone, re-copy manager/ into the deploy dir,
+                               refresh the AGENTS.md link, restart hydra-bridge and hydra-manager, print the new
+                               commit. The git steps run as hydra (`sudo -n -u hydra -H git` when root); the copy,
+                               the link and the restarts need root: run as anyone else, it stops after the git
+                               steps and prints `sudo -n hydra update` for the rest.
 
 Honours HYDRA_HOME (default /srv/hydra/manager); `update` also honours HYDRA_REPO (default
-/srv/hydra/repos/hydra-agent) and HYDRA_APP (default /srv/hydra/manager/app/manager).
+/srv/hydra/repos/hydra-agent) and HYDRA_APP (default /srv/hydra/manager/app/manager), and HYDRA_FAKE_UID (an
+integer that stands in for the effective uid, the acceptance harness's injection).
 """
 import getpass
 import json
@@ -201,41 +210,103 @@ def cmd_compact(home, args):
     return 1
 
 
+def cmd_post(home, args):
+    """`hydra post <channel> <thread_ts|-> <text...>`: queue one line in inbox/outbox.jsonl for the bridge. The text
+    is the remaining arguments, or stdin when there are none. With a live bridge (logs/bridge.pid) waits up to
+    HYDRA_POST_TIMEOUT (default 30 s) for the post to go out: 0 and `posted`, 1 when it failed or is still queued."""
+    if len(args) < 2:
+        print("usage: hydra post <channel> <thread_ts|-> <text...>  (text may come on stdin)", file=sys.stderr)
+        return 2
+    channel, thread_ts = args[0], args[1]
+    text = " ".join(args[2:]) if len(args) > 2 else ("" if sys.stdin.isatty() else sys.stdin.read())
+    text = text.strip("\n")
+    if not text.strip():
+        print("usage: hydra post <channel> <thread_ts|-> <text...>: no text given", file=sys.stderr)
+        return 2
+    import bridge as B  # noqa: E402  (imports supervisor, which is already loaded)
+    rec = S.queue_post(home, channel, thread_ts, text, user=who())
+    if not B.bridge_alive(home):
+        print(f"queued {rec['id']} in inbox/outbox.jsonl; the bridge posts it when it runs")
+        return 0
+    timeout = float(os.environ.get("HYDRA_POST_TIMEOUT", "30"))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(it.get("id") == rec["id"] for it in S.read_outbox(home)):
+            failed = next((it for it in S.read_jsonl(S.outbox_failed_path(home)) if it.get("id") == rec["id"]), None)
+            if failed:
+                print(f"post failed after {failed.get('attempts')} attempts: {failed.get('error')}", file=sys.stderr)
+                return 1
+            print(f"posted to {channel}/{thread_ts or '-'}")
+            return 0
+        time.sleep(0.2)
+    print(f"post {rec['id']} still queued after {timeout:.0f}s; the bridge posts it when it catches up", file=sys.stderr)
+    return 1
+
+
 DEFAULT_REPO = "/srv/hydra/repos/hydra-agent"
 DEFAULT_APP = "/srv/hydra/manager/app/manager"
 SERVICES = ("hydra-bridge", "hydra-manager")
+SERVICE_USER = "hydra"  # owns the hydra-agent clone; git runs as it (loops/b6.md)
+ROOT_COMMAND = "sudo -n hydra update"
 
 
-def _git(repo, *args):
-    return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=300)
+def effective_uid():
+    """The uid `update` decides by: HYDRA_FAKE_UID when set (the acceptance harness's injection), else the real
+    effective uid. Raises ValueError on a malformed HYDRA_FAKE_UID."""
+    fake = os.environ.get("HYDRA_FAKE_UID")
+    if fake is None or fake == "":
+        return os.geteuid()
+    return int(fake)
+
+
+def _git(repo, *args, as_user=None):
+    argv = ["git", "-C", repo, *args]
+    if as_user:
+        argv = ["sudo", "-n", "-u", as_user, "-H", *argv]
+    return subprocess.run(argv, capture_output=True, text=True, timeout=300)
 
 
 def cmd_update(home, args):
-    """Pull main, redeploy manager/ into $HYDRA_APP, refresh $HYDRA_HOME/AGENTS.md, restart both services."""
+    """The git steps as hydra, the deploy as root (loops/b6.md): fast-forward main in the clone (as root: every git
+    call through `sudo -n -u hydra -H`, so git's ownership check on the hydra-owned clone passes; otherwise directly,
+    as the caller), then, as root, redeploy manager/ into $HYDRA_APP, refresh $HYDRA_HOME/CLAUDE.md and the AGENTS.md
+    link, restart both services. Any other caller stops after the git steps and prints the root command for the
+    rest instead of failing on the root-owned deploy dir."""
     repo = os.environ.get("HYDRA_REPO") or DEFAULT_REPO
     app = os.path.abspath(os.environ.get("HYDRA_APP") or DEFAULT_APP)
+    try:
+        uid = effective_uid()
+    except ValueError:
+        print(f"update: HYDRA_FAKE_UID must be an integer, not {os.environ.get('HYDRA_FAKE_UID')!r}", file=sys.stderr)
+        return 2
+    as_root = uid == 0
+    git_user = SERVICE_USER if as_root else None
     if not os.path.isdir(os.path.join(repo, ".git")):
         print(f"update: {repo} is not a git clone (set HYDRA_REPO)", file=sys.stderr)
         return 1
-    fetch = _git(repo, "fetch", "-q", "origin", "main")
+    fetch = _git(repo, "fetch", "-q", "origin", "main", as_user=git_user)
     if fetch.returncode != 0:
         print(f"update: fetch failed: {fetch.stderr.strip()}", file=sys.stderr)
         return 1
-    branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD", as_user=git_user).stdout.strip()
     if branch != "main":
-        co = _git(repo, "checkout", "-q", "main")
+        co = _git(repo, "checkout", "-q", "main", as_user=git_user)
         if co.returncode != 0:
             print(f"update: cannot check out main in {repo}: {co.stderr.strip()}", file=sys.stderr)
             return 1
-    merge = _git(repo, "merge", "-q", "--ff-only", "origin/main")
+    merge = _git(repo, "merge", "-q", "--ff-only", "origin/main", as_user=git_user)
     if merge.returncode != 0:
         print(f"update: main in {repo} does not fast-forward: {merge.stderr.strip()}", file=sys.stderr)
         return 1
-    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    head = _git(repo, "rev-parse", "HEAD", as_user=git_user).stdout.strip()
     source = os.path.join(repo, "manager")
     if not os.path.isfile(os.path.join(source, "supervisor.py")):
         print(f"update: {source} has no supervisor.py", file=sys.stderr)
         return 1
+    if not as_root:
+        print(f"main in {repo} is at {head[:12]}; the copy into {app}, the AGENTS.md link and the restart of "
+              f"{' '.join(SERVICES)} need root: run `{ROOT_COMMAND}`")
+        return 0
     # Stage the new copy next to the deploy dir, then swap, so a failed copy never leaves a half-deployed app.
     staging, old = app + ".new", app + ".old"
     for d in (staging, old):
@@ -270,7 +341,8 @@ def cmd_update(home, args):
 
 
 COMMANDS = {"status": cmd_status, "say": cmd_say, "logs": cmd_logs, "tail": cmd_tail, "engine": cmd_engine,
-            "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach, "compact": cmd_compact, "update": cmd_update}
+            "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach, "compact": cmd_compact, "post": cmd_post,
+            "update": cmd_update}
 
 
 def main(argv):

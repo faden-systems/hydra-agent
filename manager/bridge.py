@@ -15,12 +15,19 @@ connecting; with a bot token it also probes the `reactions:write` scope (loops/b
 so a dry `reactions.add` goes on the bot's own last mirrored message, when there is one) and warns, never fails, when
 the scope is missing or unverified. `SdkReactor(client)` is the working indicator's reactor over `slack_sdk`, the same
 `add/remove(channel, ts, name)` interface the supervisor takes. No argument runs the Socket Mode service (systemd).
+
+Direct posts (loops/b6.md): `Bridge.post(channel, thread_ts, text)` is the one path every post of the manager takes
+(`supervisor.post_and_record`: post, record the join, mirror with `thread_ts`); `drain_outbox()` posts what `hydra post`
+queued in `inbox/outbox.jsonl` through it, and the service runs `pump_outbox` in a thread that drains every second.
+The service's poster returns Slack's answer, so a top-level post (`-`) joins the thread its `ts` starts. The service
+writes `logs/bridge.pid` so `hydra post` knows whether a bridge is there to drain.
 """
 import argparse
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.request
 
@@ -33,6 +40,7 @@ INSTRUCT_COMMANDS = ("pause", "resume", "engine", "digest", "leave", "compact")
 ASSIGNEE_RE = re.compile(r"^[ \t]*assignee:[ \t]*([^|\n]*)", re.IGNORECASE | re.MULTILINE)
 MANAGER_NAMES = ("manager", "@manager")
 PRUNE_EVERY_S = 86400
+OUTBOX_POLL_S = 1.0
 SKIPPED_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave", "channel_topic",
                     "channel_purpose", "channel_name", "group_join", "group_leave"}
 
@@ -156,6 +164,27 @@ class Bridge:
             self.poster(channel, thread_ts, text)
         except Exception as e:  # a bridge answer is best effort; the event is still queued or mirrored
             S.log(f"bridge reply failed: {e}")
+
+    # ---- direct posts (loops/b6.md)
+    def post(self, channel, thread_ts, text, user=None):
+        """A post the manager makes outside a delivery (from inside a turn, through `hydra post`): the one posting
+        path, so the thread is joined and the line mirrored with its `thread_ts`. `thread_ts` None posts top level
+        and the ts the poster returns names the thread. Raises what the poster raises."""
+        return S.post_and_record(self.home, self.poster, channel, thread_ts, text, subtype="manager_post", user=user)
+
+    def drain_outbox(self):
+        """Post every line `hydra post` queued, oldest first, through `post`. Returns the number posted."""
+        return S.drain_outbox(self.home, lambda channel, thread_ts, text: self.post(channel, thread_ts, text))
+
+    def pump_outbox(self, stop, every=OUTBOX_POLL_S):
+        """Drain the outbox every `every` seconds until `stop` (a threading.Event) is set; a failing drain is logged
+        and tried again on the next tick."""
+        while not stop.is_set():
+            try:
+                self.drain_outbox()
+            except Exception as e:
+                S.log(f"outbox drain failed: {e}")
+            stop.wait(every)
 
     def parse_mention(self, text):
         """(addressed, rest): addressed when the bot is mentioned (any mention counts if the bot id is unknown)."""
@@ -369,8 +398,12 @@ def sdk_reactor(token):
     return SdkReactor(WebClient(token=token))
 
 
+OWN_SUBTYPES = ("manager_reply", "manager_post")
+
+
 def own_last_message(home):
-    """(channel, ts) of the latest post the supervisor mirrored with a Slack ts, or None (dry posts carry none)."""
+    """(channel, ts) of the latest post the manager mirrored with a Slack ts (a delivery or a direct post), or None
+    (dry posts carry none)."""
     best = None
     mirror = os.path.join(home, "mirror")
     for name in sorted(os.listdir(mirror)) if os.path.isdir(mirror) else []:
@@ -378,7 +411,7 @@ def own_last_message(home):
             continue
         channel = name[:-len(".jsonl")]
         for rec in S.read_jsonl(os.path.join(mirror, name)):
-            if rec.get("subtype") != "manager_reply" or not rec.get("ts"):
+            if rec.get("subtype") not in OWN_SUBTYPES or not rec.get("ts"):
                 continue
             at = rec.get("mirrored_at") or 0
             if best is None or at > best[0]:
@@ -427,6 +460,35 @@ def check_reactions_scope(home, token, probe=None):
         print(f"reactions:write: unverified ({error})")
 
 
+# ----------------------------------------------------------------------------------------------- the service's poster and pid
+
+def sdk_poster(client):
+    """`chat.postMessage` over a slack_sdk WebClient (bolt's `App.client`), returning Slack's answer as a dict so
+    the posting path learns the `ts` of a top-level post. Raises on failure (slack_sdk's SlackApiError)."""
+    def post(channel, thread_ts, text):
+        kw = {"channel": channel, "text": text}
+        if thread_ts:
+            kw["thread_ts"] = thread_ts
+        res = client.chat_postMessage(**kw)
+        data = getattr(res, "data", res)
+        return data if isinstance(data, dict) else {}
+    return post
+
+
+def bridge_pid_path(home):
+    return os.path.join(home, "logs", "bridge.pid")
+
+
+def write_bridge_pid(home):
+    S.write_text(bridge_pid_path(home), f"{os.getpid()}\n")
+
+
+def bridge_alive(home):
+    """True when a bridge service is running: its pid file names a live process."""
+    pid = S.read_text(bridge_pid_path(home)).strip()
+    return pid.isdigit() and S.pid_alive(int(pid))
+
+
 # ----------------------------------------------------------------------------------------------- entry points
 
 def check(home, probe=None):
@@ -462,9 +524,7 @@ def serve(home):
         raise SystemExit("credentials/slack.env needs SLACK_BOT_TOKEN and SLACK_APP_TOKEN")
     app = App(token=bot_token)
     bot_user_id = app.client.auth_test()["user_id"]
-
-    def poster(channel, thread_ts, text):
-        app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+    poster = sdk_poster(app.client)
 
     def file_info(file_id):
         return app.client.files_info(file=file_id)["file"]
@@ -488,8 +548,14 @@ def serve(home):
     def _file(event):
         bridge.handle_file(event, file_info=file_info)
 
+    write_bridge_pid(home)
+    stop = threading.Event()
+    threading.Thread(target=bridge.pump_outbox, args=(stop,), daemon=True, name="outbox").start()
     S.log(f"bridge up as {bot_user_id}, home={home}")
-    SocketModeHandler(app, app_token).start()
+    try:
+        SocketModeHandler(app, app_token).start()
+    finally:
+        stop.set()
 
 
 def main(argv=None):

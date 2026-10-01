@@ -11,14 +11,15 @@ up in a thread; operators use Slack only; tokens never leave `credentials/`.
 |---|---|
 | `supervisor.py` | the turn loop: queue, wake, engine choice and rotation, reply delivery, handoff, bookkeeping, persistence, PAUSE, budgets, the WRITER lock, the dead-man, the compaction policy, thread participation records |
 | `bridge.py` | the Slack bridge (`slack_bolt` Socket Mode): allowlist, mirror, file download, the commands, thread participation and routing |
-| `hydra` | the console CLI: `status`, `say`, `logs`, `tail`, `engine`, `pause`, `resume`, `attach`, `compact`, `update` |
+| `hydra` | the console CLI: `status`, `say`, `logs`, `tail`, `engine`, `pause`, `resume`, `attach`, `compact`, `post`, `update` |
 | `models.json` | model aliases per family (`claude`, `codex`) with the family default; extendable by `$HYDRA_HOME/models.json` |
 | `CLAUDE.md` | the manager's standing rules, read by Claude Code on every turn (installed at `$HYDRA_HOME/CLAUDE.md`) |
 | `systemd/` | `hydra-manager.service` (supervisor loop) and `hydra-bridge.service` (bridge) |
 
 Tests: `tests/manager/` (no network; fake engines, fake poster). Exit: `loops/b1.exit.sh` with the exit-owned
-`loops/b1.acceptance.py`; later loops (`b2` shared memory, `b3` the transition read, `b4` threads and compaction)
-add their own exit scripts and acceptance harnesses under `loops/`.
+`loops/b1.acceptance.py`; later loops (`b2` shared memory, `b3` the transition read, `b4` threads and compaction,
+`b5` the working indicator, `b6` the heartbeat, direct posts and the `hydra update` privilege split) add their own
+exit scripts and acceptance harnesses under `loops/`.
 
 ## `$HYDRA_HOME` (default `/srv/hydra/manager`)
 
@@ -27,11 +28,15 @@ inbox/events.jsonl          append-only queue: {id, source, at, payload}; id is 
 inbox/handled.jsonl         ids already processed (appended only after the reply was delivered)
 inbox/pending-replies.jsonl replies whose delivery failed; delivered first on the next tick, without a new turn
 inbox/replies/<id>.txt      replies to console (`hydra say`) events
+inbox/outbox.jsonl          posts queued by `hydra post` {id, at, channel, thread_ts, text, user}; the bridge drains it (see "Direct posts")
+inbox/outbox-failed.jsonl   outbox lines set aside after 5 failed posts (with attempts, error, failed_at)
 inbox/files/<ts>-<name>     attachments downloaded by the bridge
 mirror/<channel>.jsonl      every message in a channel the bot is in (copied to factory/log/ and committed)
 logs/turns.jsonl            {n, at, engine, model, events, reacted, duration_s, tokens?, input_tokens?, kind?, error?} per turn (kind: compaction for the compaction turn; reacted: the Slack message ts the working indicator went on)
 logs/compaction.json        the compaction policy's state: pending, verify, last, failed_at, fail_posted, baseline_bytes
-logs/reactions.json         {event id: {channel, ts, thread_ts, name, at}}: the reactions the working indicator has standing on messages
+logs/reactions.json         {event id: {channel, ts, thread_ts, name, at}}: the reactions the working indicator has standing on messages (name: eyes, hourglass_flowing_sand or x)
+logs/outbox.json            {posted, failed, last_at}: what the bridge has posted from the outbox (`hydra status` shows it)
+logs/bridge.pid             the bridge service's pid: `hydra post` waits for the post when a bridge is alive
 logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/posts.jsonl and logs/reactions.jsonl (dry mode)
 threads.json                {channel: {thread_ts: {joined_at, last_seen}}}: the threads the manager is part of (bridge and supervisor both write it, under threads.json.lock)
 COMPACT                     present: a compaction runs before the next turn (hydra compact, @manager compact); content is who asked
@@ -47,7 +52,8 @@ budgets.json                {"turns_per_hour": n, "claude_turns_per_day": {"clau
 allowlist.json              {slack user or bot id: {"instructs": true|false}}
 config.json                 optional: {"repo": <faden clone>, "dev_channel": "C…", "engines": {...}, "buildlog_webhook": url,
                             "codex_home": <Codex's $CODEX_HOME, default ~/.codex>, "transition": {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": true},
-                            "compaction": {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "local"}}
+                            "compaction": {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "local"},
+                            "reactions": {"heartbeat_seconds": 20}}
 credentials/                claude-r2d2.env, claude-l.env (CLAUDE_CODE_OAUTH_TOKEN=…), slack.env (SLACK_BOT_TOKEN, SLACK_APP_TOKEN), buildlog.env (BUILDLOG_WEBHOOK)
 PAUSE                       present: no turn runs; content is who paused
 WRITER                      "<pid> <who>": the one writer; stale (dead pid) locks are reclaimed
@@ -188,7 +194,8 @@ memory, say it is unknown rather than inventing it.
    events get `inbox/replies/<id>.txt` and a mirror post in `#dev` ("from L via console"); replies over 40 lines go
    to a file (`factory/log/replies/turn-<n>.md` in the clone, linked). If the poster raises, the reply is saved to
    `pending-replies.jsonl` and the events stay unhandled; the next tick delivers it without a new engine turn.
-   As each thread's reply lands, the `eyes` reaction comes off that thread's messages; a pending reply keeps it.
+   As each thread's reply lands, the working indicator comes off that thread's messages; a pending reply keeps it.
+   Every post goes through `post_and_record` (see "Direct posts"): post, record the join, mirror.
 6. Bookkeeping: `logs/turns.jsonl`, `handled.jsonl`, the manager's own reply appended to `mirror/<channel>.jsonl`
    (`user: manager`), then `mirror/*.jsonl` to `<repo>/factory/log/`, `state.json` to `<repo>/factory/state.json`
    and `factory/manager-memory/`, commit `manager: turn <n>`, push.
@@ -211,6 +218,14 @@ A turn can run minutes with nothing visible in Slack, so the supervisor reacts t
   that picks it up puts `eyes` back on first).
 - Reactions are best effort: a failing `add` or `remove` (missing scope, rate limit, deleted message) is logged
   once per hour (`logs/notes.json`, key `reactions`) and never blocks the turn or the reply.
+- The heartbeat (`loops/b6.md`): while the engine runs, every `reactions.heartbeat_seconds` (`config.json`, default
+  20, fractional allowed, `0` disables) a ticker thread swaps the reaction on each of the batch's messages between
+  `eyes` and `hourglass_flowing_sand` (`remove` the standing one, `add` the other: two calls per message per
+  interval). The ticker starts after the `eyes` go on and is stopped, and waited for, before delivery, so the final
+  `remove` targets whatever stands and nothing is added after the reply. A failed `remove` does not stop the `add`
+  that follows; `logs/reactions.json` records the name of the last `add` attempted, which is what delivery, a
+  pending reply, or the `x` of a failed turn removes. The failure log shares the hourly `reactions` key. The ticker
+  waits with `Supervisor(..., sleep=)` when one is given, else on its own stop flag.
 
 `Supervisor(..., reactor=)` takes anything with `add(channel, ts, name)` and `remove(channel, ts, name)`; the default
 is the bridge's `SdkReactor` (reactions.add / reactions.remove over a `slack_sdk` WebClient, the bot token from
@@ -222,6 +237,24 @@ The bot needs the `reactions:write` scope (`setup/slack-manifest.json` has it). 
 bot token is present: `auth.test` cannot list scopes, so it does a dry `reactions.add` (then `remove`) on the bot's
 own last mirrored message and prints `reactions:write: ok`, a `WARNING` when Slack answers `missing_scope`, or
 `unverified` when there is no own message yet, no token, or no network. The check never fails on this.
+
+## Direct posts (`loops/b6.md`)
+
+Every post the manager makes takes one path, `supervisor.post_and_record(home, poster, channel, thread_ts, text)`:
+post through the poster, record the thread as joined in `threads.json`, mirror the line with its `thread_ts`
+(`user: manager`; `subtype` `manager_reply` for a delivery, `manager_post` for a direct post). The supervisor's
+deliveries use it; so does `Bridge.post(channel, thread_ts, text)`. A post with `thread_ts` None goes top level and
+the `ts` the poster returns (`SlackPoster` and the bridge's `sdk_poster` return Slack's answer) names the thread it
+starts, in `threads.json` and in the mirror line; a poster that returns nothing (dry mode) records no join.
+
+The engine posts from inside a turn with `hydra post <channel> <thread_ts|-> <text>` (the rule is in `CLAUDE.md`;
+no Slack tool is configured for the engine). The command appends to `inbox/outbox.jsonl`; the bridge service drains
+it every second (`Bridge.drain_outbox`, oldest first) through `Bridge.post`, so replies to a direct post reach the
+manager like replies to any of its posts. A line whose post raises stays with `attempts` and `error` and the drain
+stops there (order is kept); after 5 attempts it is moved to `inbox/outbox-failed.jsonl` and the next line goes out.
+With a live bridge (`logs/bridge.pid`) `hydra post` waits up to `HYDRA_POST_TIMEOUT` (30 s) and prints `posted`, or
+exits 1 with the error when the line was set aside or is still queued; without one it prints `queued` and exits 0.
+`hydra status` shows `direct posts: <n> posted, <k> queued`.
 
 ## The compaction policy (`loops/b4.md`)
 
@@ -349,16 +382,22 @@ HH:MMZ tool: ...
 ## The console
 
 `hydra status | say "<text>" | logs [n] | tail <channel> [n] | engine [acc=<a>] [model=<m>] | pause [reason] | resume |
-attach | compact | update`. `say` queues a `cli` event and, when the service loop is alive, waits for the reply. `attach`
+attach | compact | post <channel> <thread_ts|-> <text> | update`. `say` queues a `cli` event and, when the service loop is alive, waits for the reply. `attach`
 takes `WRITER`, runs `claude --resume <session-id> --model <current model>` interactively with the same config dir and
 token, releases the lock on exit and posts a two-line summary to `#dev`. `compact` forces a compaction (see "The
 compaction policy"); with a live loop it waits for it and exits 1 when it failed.
 
-`hydra update` (as root, after every merge to `manager/`): fast-forwards `main` in the hydra-agent clone (`HYDRA_REPO`,
-default `/srv/hydra/repos/hydra-agent`), re-copies `manager/` into the deploy dir (`HYDRA_APP`, default
-`/srv/hydra/manager/app/manager`, staged and swapped), refreshes `$HYDRA_HOME/CLAUDE.md` and the `AGENTS.md` link,
-runs `systemctl restart hydra-bridge hydra-manager` (`systemctl` from `PATH`) and prints `updated to <commit>`. A clone
-that does not fast-forward, or a failed restart, exits 1 and says so.
+`hydra update` (after every merge to `manager/`; `sudo -n hydra update` from an admin account): fast-forwards `main`
+in the hydra-agent clone (`HYDRA_REPO`, default `/srv/hydra/repos/hydra-agent`), re-copies `manager/` into the deploy
+dir (`HYDRA_APP`, default `/srv/hydra/manager/app/manager`, staged and swapped), refreshes `$HYDRA_HOME/CLAUDE.md` and
+the `AGENTS.md` link, runs `systemctl restart hydra-bridge hydra-manager` (`systemctl` from `PATH`) and prints
+`updated to <commit>`. The privilege split (`loops/b6.md`): the clone is `hydra`'s, so as root every git step runs
+through `sudo -n -u hydra -H git -C <clone> ...` (git's ownership check passes without any `safe.directory`); as any
+other user git runs directly. The copy into the root-owned deploy dir, the link and the restarts are root's: any
+other caller, `hydra` itself on the VM for instance, gets the git steps done and the line `... need root: run
+\`sudo -n hydra update\`` with exit 0, nothing copied or restarted. A clone that does not fast-forward, a failed git
+step, or a failed restart exits 1 and says so. `HYDRA_FAKE_UID=<int>` stands in for the effective uid (the acceptance
+harness's injection).
 
 ## Dry mode
 
