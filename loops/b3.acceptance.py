@@ -177,9 +177,11 @@ def main():
     assert wmeta.get("cut_entry") is True and "[entry truncated:" in wtxt and "chars omitted]" in wtxt, (wmeta, wtxt[:200])
     assert "small older entry" not in wtxt and wtxt.rstrip().endswith("z"), "the newest entry is kept (its end), older ones dropped"
     text2 = Tr.render([{"at": ts(1), "role": "user", "kind": "text", "text": "A" * 1200}, {"at": ts(2), "role": "assistant", "kind": "text", "text": "B" * 1200}])
-    w2, m2 = Tr.window(text2, 500)
+    # two 1,200-char entries ~ 343 tokens each at chars/3.5: a 200-token budget forces truncation of the newest alone,
+    # a 400-token budget keeps the newest whole and drops the older one
+    w2, m2 = Tr.window(text2, 200)
     assert m2.get("cut_entry") is True and "A" * 50 not in w2, "when even one entry exceeds the budget, only the newest is kept, truncated with the marker"
-    w3, m3 = Tr.window(text2, 2000)
+    w3, m3 = Tr.window(text2, 400)
     assert m3["entries_kept"] == 1 and not m3.get("cut_entry") and "B" * 1200 in w3 and "A" * 1200 not in w3, "whole-entry boundary: the older entry is dropped, the newest kept whole"
     print("4b ok: entry-boundary rule, explicit truncation marker for an oversized entry")
 
