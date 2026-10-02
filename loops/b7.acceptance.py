@@ -2,6 +2,8 @@
 """Exit-owned offline b7 contracts. No real Slack, credentials, or model calls."""
 import importlib.machinery
 import json
+import io
+import contextlib
 import os
 from pathlib import Path
 import subprocess
@@ -29,7 +31,7 @@ def write(p, value):
     Path(p).write_text(json.dumps(value))
 
 def event(ts, **kw):
-    return {'id': ts, 'source': 'slack', 'payload': {'channel': 'C', 'thread_ts': ts,
+    return {'id': ts, 'source': 'slack', 'payload': {'channel': 'C', 'thread_ts': ts, 'ts': ts,
             'text': 'report', 'instructs': False, 'addressed': False, **kw}}
 
 def liveness():
@@ -176,7 +178,8 @@ def serve_child():
 def context():
     first = {'type': 'assistant', 'message': {'id': 'msg1', 'usage': {'input_tokens': 100,
         'cache_creation_input_tokens': 20, 'cache_read_input_tokens': 1000,
-        'cache_creation': {'ephemeral_5m_input_tokens': 20}, 'output_tokens': 8}}}
+        'cache_creation': {'ephemeral_5m_input_tokens': 20}, 'output_tokens': 8},
+        'content':[{'type':'tool_use','id':'tool1','name':'read','input':{}}]}}
     later = {'type': 'assistant', 'message': {'id': 'msg2', 'usage': {'input_tokens': 900000,
         'cache_read_input_tokens': 900000, 'output_tokens': 30}}}
     result = {'type': 'result', 'result': 'done', 'session_id': 's', 'usage': {
@@ -193,6 +196,17 @@ def context():
     first['message']['usage'] = {'input_tokens': -1}
     _, bad, _, _ = S.Supervisor._parse_claude_output('\n'.join(map(json.dumps,[first,later,result])))
     assert bad.get('context_tokens') is None, 'later valid request must not replace invalid first request'
+    for invalid in (True, float('inf'), float('nan')):
+        first['message']['usage']={'input_tokens':invalid}
+        _,bad,_,_=S.Supervisor._parse_claude_output('\n'.join(map(json.dumps,[first,later,result])))
+        assert bad.get('context_tokens') is None, invalid
+    del first['message']['usage']
+    _,missing,_,_=S.Supervisor._parse_claude_output('\n'.join(map(json.dumps,[first,later,result])))
+    assert missing.get('context_tokens') is None, 'missing first usage must remain unknown'
+    first['message']['usage']={'input_tokens':7}
+    error_result={**result,'is_error':True}
+    _,valid,error,sid=S.Supervisor._parse_claude_output('broken line\n'+json.dumps(first)+'\n'+json.dumps(error_result))
+    assert valid.get('context_tokens')==7 and error and sid=='s'
     # Exercise actual invocation + schedule/verification through run_once, not only parser.
     h = home(); exe = Path(h)/'fake-claude'
     first['message']['usage'] = {'input_tokens': 100, 'cache_read_input_tokens': 1000}
@@ -233,6 +247,15 @@ def context():
         assert ms.compaction_state()['last']['ok'] is expected
         assert ms.compaction_pending() is (not expected), 'high context must schedule; low context must not'
     assert '--verbose' in args and args[args.index('--output-format')+1] == 'stream-json'
+    lh=home(); ls=S.Supervisor(home=lh)
+    S.append_jsonl(str(Path(lh)/'logs/turns.jsonl'),{'engine':'claude-r2d2','input_tokens':9000000})
+    assert ls.last_claude_context_tokens() is None
+    usage_run=subprocess.run([sys.executable,str(ROOT/'manager/hydra'),'usage'],env={**os.environ,'HYDRA_HOME':lh},capture_output=True,text=True)
+    assert usage_run.returncode==0 and 'context_tokens=unknown' in usage_run.stdout
+    S.append_jsonl(str(Path(lh)/'logs/turns.jsonl'),{'engine':'claude-r2d2','input_tokens':8000000,'context_tokens':1234})
+    assert ls.last_claude_context_tokens()==1234
+    usage_run=subprocess.run([sys.executable,str(ROOT/'manager/hydra'),'usage'],env={**os.environ,'HYDRA_HOME':lh},capture_output=True,text=True)
+    assert usage_run.returncode==0 and 'context_tokens=1234' in usage_run.stdout
 
 def tracks():
     assert hasattr(S, 'migrate_track_history'), 'track migration missing'
@@ -265,7 +288,11 @@ def tracks():
     text = S.status_text(h, str(repo))
     assert all(line in text.splitlines() for line in summary), 'status needs separate track lines'
     assert 'old: waiting' not in text
-    write(Path(h)/'state.json', {'tracks':{'b':{'now':'running','stage':'old\nhistory'}}})
+    newer=json.loads((Path(h)/'state.json').read_text()); newer['tracks'][0]['stage']='new-unseen-history'
+    write(Path(h)/'state.json',newer); S.migrate_track_history(h,str(repo))
+    appended=archive.read_text(); assert history in appended and appended.count('new-unseen-history')==1
+    S.migrate_track_history(h,str(repo)); assert archive.read_text()==appended
+    write(Path(h)/'state.json', {'tracks':{'b' :{'now':'running','stage':'old\nhistory'}}})
     assert S.tracks_summary(json.loads((Path(h)/'state.json').read_text())) == ['b: running']
     write(Path(h)/'state.json', {'tracks':[{'id':'valid','stage':'must not archive yet'},{'id':'../escape','stage':'secret history'}]})
     old = (Path(h)/'state.json').read_bytes()
@@ -275,6 +302,35 @@ def tracks():
     else: raise AssertionError('unsafe id accepted')
     assert (Path(h)/'state.json').read_bytes() == old
     assert archives=={str(p):p.read_bytes() for p in repo.rglob('*') if p.is_file()}
+
+def fake_engine(h,reply,extra=''):
+    exe=Path(h)/'fake-claude'
+    exe.write_text('#!/usr/bin/env python3\nimport sys,json,pathlib\nprompt=sys.stdin.read()\n'+
+        f'pathlib.Path({str(Path(h)/"prompt")!r}).write_text(prompt)\n'+extra+
+        'print('+repr(reply)+')\n')
+    exe.chmod(0o755); write(Path(h)/'engine',{'acc':'claude-r2d2','model':'claude-fable-5-1'})
+    return {'claude-r2d2':{'bin':str(exe),'cred':None}}
+
+HANDOFF='---HANDOFF---\ntracks: b7\nwaiting on: none\nlast decision: fixture\nnext action: none\nopen question: none'
+
+def migration_integration():
+    h=home(); repo=Path(tempfile.mkdtemp(prefix='b7-git-'))
+    remote=Path(tempfile.mkdtemp(prefix='b7-bare-'))
+    def git(*args): subprocess.run(['git',*args],cwd=repo,check=True,capture_output=True)
+    git('init','--bare',str(remote)); git('init'); git('config','user.name','Fixture'); git('config','user.email','fixture@example.test')
+    git('commit','--allow-empty','-m','base'); git('remote','add','origin',str(remote)); git('push','-u','origin','HEAD')
+    write(Path(h)/'state.json',{'tracks':[{'id':'b7','stage':'BEFORE-PROMPT-HISTORY\nlatest'}]})
+    extra=f"p=pathlib.Path({str(Path(h)/'state.json')!r}); data=json.loads(p.read_text()); data['tracks'][0]['stage']='AFTER-ENGINE-HISTORY'; p.write_text(json.dumps(data))\n"
+    engines=fake_engine(h,'done\n'+HANDOFF,extra)
+    sup=S.Supervisor(home=h,repo=str(repo),engines=engines,poster=lambda *a:None)
+    S.append_event(h,event('integration')); assert sup.run_once()
+    prompt=(Path(h)/'prompt').read_text()
+    assert 'BEFORE-PROMPT-HISTORY' not in prompt and 'latest' in prompt and 'history_file' in prompt, 'prompt saw verbose state'
+    state=json.loads((Path(h)/'state.json').read_text())
+    assert state==json.loads((repo/'factory/state.json').read_text())
+    assert state['tracks'][0]['stage']==state['tracks'][0]['now']
+    archive=(repo/'factory/log/tracks/b7.md').read_text()
+    assert 'BEFORE-PROMPT-HISTORY' in archive and 'AFTER-ENGINE-HISTORY' in archive
 
 def empty():
     h = home(); posted=[]
@@ -289,6 +345,20 @@ def empty():
     assert len(grouped)==1 and grouped[0]['thread_ts']=='share'
     assert sup.deliver({'slack':[{'channel':'C','thread_ts':'legacy','text':' \n'}], 'cli':[]}, ['old'],99)
     assert not posted, 'legacy pending blank reached poster'
+    eh=home(); outputs=[]; removed=[]; logs=[]
+    reactor=SimpleNamespace(add=lambda *a:None,remove=lambda *a:removed.append(a))
+    es=S.Supervisor(home=eh,engines=fake_engine(eh,HANDOFF),poster=lambda *a:outputs.append(a),reactor=reactor)
+    mixed=[event('indirect'),event('direct',instructs=True),
+           S.new_event('cli',{'text':'console prompt','channel':'C'},event_id='console')]
+    for ev in mixed: S.append_event(eh,ev)
+    with patch.object(S,'log',side_effect=lambda msg:logs.append(str(msg))): assert es.run_once()
+    assert set(S.handled_ids(eh))=={'indirect','direct','console'} and not S.pending_events(eh)
+    assert any('delivery skipped' in line for line in logs) and any('placeholder sent' in line for line in logs)
+    assert {args[1] for args in removed} >= {'indirect','direct'}
+    assert 'tracks: b7' in Path(es.handoff_path()).read_text()
+    assert (Path(eh)/'inbox/replies/console.txt').read_text()=='\n'
+    assert len([p for p in outputs if p[1]=='direct' and p[2]=='(turn produced no reply text)'])==1
+    assert not any(p[1]=='indirect' for p in outputs) and all(p[2].strip() for p in outputs)
 
 def blocks():
     h=home(); b=B.Bridge(h, {'BOT': {'instructs':False}}, lambda *a:None, {}, bot_user_id='MANAGER')
@@ -358,14 +428,24 @@ def outbox():
         try: S.drain_outbox(h,lambda *a:(calls.append(a) or {'ts':'456'}))
         except InterruptedError: pass
         else: raise AssertionError('interruption seam not reached')
-    code='import sys,json;sys.path.insert(0,sys.argv[1]);import supervisor as S;print(json.dumps(S.post_receipt(sys.argv[2],sys.argv[3])))'
-    fresh=subprocess.check_output([sys.executable,'-c',code,str(ROOT/'manager'),h,item['id']],text=True)
+    receipt_probe='import sys,json;sys.path.insert(0,sys.argv[1]);import supervisor as S;print(json.dumps(S.post_receipt(sys.argv[2],sys.argv[3])))'
+    fresh=subprocess.check_output([sys.executable,'-c',receipt_probe,str(ROOT/'manager'),h,item['id']],text=True)
     assert json.loads(fresh)['status']=='posted', 'receipt was not durable before removal'
     S.drain_outbox(h,lambda *a:calls.append(a))
     assert len(calls)==1 and not S.read_outbox(h), 'receipt retry reposted accepted Slack message'
     for receipt,code in (({'status':'posted','ts':'done'},0),({'status':'failed','error':'fixture'},1)):
         with patch.object(B,'bridge_alive',return_value=True), patch.object(S,'post_receipt',return_value=receipt):
             assert H.cmd_post(h,['C','1','receipt'])==code
+    fh=home(); failed=S.queue_post(fh,'C','3','cannot post')
+    def fail_post(*args): raise RuntimeError('terminal failure fixture')
+    for _ in range(S.OUTBOX_MAX_ATTEMPTS): S.drain_outbox(fh,fail_post)
+    fresh=subprocess.check_output([sys.executable,'-c',receipt_probe,
+        str(ROOT/'manager'),fh,failed['id']],text=True)
+    failure=json.loads(fresh); assert failure['status']=='failed' and 'terminal failure fixture' in failure.get('error','')
+    captured=io.StringIO()
+    with patch.object(B,'bridge_alive',return_value=True),patch.object(S,'queue_post',return_value=failed),contextlib.redirect_stderr(captured),contextlib.redirect_stdout(captured):
+        assert H.cmd_post(fh,['C','3','cannot post'])==1
+    assert 'terminal failure fixture' in captured.getvalue()
     # No queue record and no receipt is not success; emulate a CLI verification race.
     with patch.object(B,'bridge_alive',return_value=True), patch.object(S,'read_outbox',return_value=[]), \
          patch.object(S,'post_receipt',return_value=None), patch.dict(os.environ,{'HYDRA_POST_TIMEOUT':'.01'}):
@@ -374,7 +454,7 @@ def outbox():
 if __name__=='__main__':
     if '--serve-child' in sys.argv: serve_child()
     failures=[]
-    for fn in (liveness,context,tracks,empty,blocks,outbox):
+    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox):
         try: fn()
         except (AssertionError, Exception) as exc:
             failures.append(fn.__name__); print(f'[b7] FAIL {fn.__name__}: {type(exc).__name__}: {exc}',flush=True)
