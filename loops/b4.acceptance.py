@@ -110,7 +110,7 @@ def main():
     ev2 = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h2, "inbox", "events.jsonl"), "a").write(json.dumps(ev2) + "\n")
     assert sup2.run_once() is True
     argvs = [c["argv"] for c in calls(c2_dir)]
-    assert not any("/compact" in a for a in argvs), "within 25% over threshold and outside quiet hours: deferred"
+    assert not any("[compaction]" in c["stdin"] for c in calls(c2_dir)), "within 25% over threshold and outside quiet hours: deferred"
     NOW[0] = dt.datetime(2026, 10, 3, 3, 0, 0, tzinfo=dt.timezone.utc)  # quiet hours (02:00 to 05:00)
     ev3 = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h2, "inbox", "events.jsonl"), "a").write(json.dumps(ev3) + "\n")
     assert sup2.run_once() is True

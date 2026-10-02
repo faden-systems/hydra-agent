@@ -275,6 +275,13 @@ def tracks():
     assert tr['history_file'] == 'factory/log/tracks/flow.md'
     archive = repo/tr['history_file']; assert history in archive.read_text()
     assert updated['other'] == state['other'] and tr['owner'] == 'manager'
+    for item in updated['tracks']:
+        assert len(item['now'])<=240 and '\n' not in item['now'] and item['stage']==item['now']
+    assert updated['tracks'][1]['now'].endswith(('…','...'))
+    cli_home=home();write(Path(cli_home)/'state.json',state);write(Path(cli_home)/'config.json',{'repo':str(repo)})
+    cli=subprocess.run([sys.executable,str(ROOT/'manager/hydra'),'migrate-tracks'],env={**os.environ,'HYDRA_HOME':cli_home},capture_output=True,text=True)
+    assert cli.returncode==0 and '2' in cli.stdout,(cli.stdout,cli.stderr)
+    assert json.loads(Path(cli_home,'state.json').read_text())==updated
     before = {str(p):p.read_bytes() for p in repo.rglob('*.md')}
     S.migrate_track_history(h, str(repo))
     assert before == {str(p):p.read_bytes() for p in repo.rglob('*.md')}, 'migration duplicated history'
@@ -472,7 +479,7 @@ def engine_errors():
 
 def engine_fallback():
     h=home(); write(Path(h)/'engine',{'acc':'claude-r2d2','model':'claude-fable-5-1'})
-    cfg={'engine_fallback':{'claude_models':['claude-sonnet-5']}}
+    cfg={'dev_channel':'C_FIXTURE_DEV','engine_fallback':{'claude_models':['claude-sonnet-5']}}
     engines={'claude-r2d2':{'bin':'fixture'},'claude-l':{'bin':'fixture'},'codex':{'bin':'fixture','kind':'codex'}}
     sup=S.Supervisor(home=h,engines=engines,config=cfg,poster=lambda *a:None)
     calls=[]; credit="You're out of usage credits. Switch to another model to continue."
@@ -492,6 +499,8 @@ def engine_fallback():
     assert runtime.get('since') and credit in runtime.get('reason','')
     notices=S.read_outbox(h); assert len(notices)==1, notices
     assert not notices[0].get('thread_ts'), 'fallback notice must be top-level'
+    assert notices[0]['channel']=='C_FIXTURE_DEV' and 'fallback started' in notices[0]['text'].lower()
+    episode=runtime.get('episode_id'); assert episode and episode in notices[0]['text']
     sup2=S.Supervisor(home=h,engines=engines,config=cfg,poster=lambda *a:None)
     with patch.object(sup2,'invoke',side_effect=invoke): sup2.run_engines('next',[])
     assert len(S.read_outbox(h))==1, 'restart duplicated fallback alert'
@@ -501,6 +510,9 @@ def engine_fallback():
     with patch.object(sup2,'invoke',return_value=(0,'recovered','',None)):
         sup2.run_engines('recovered',[]); sup2.run_engines('again',[])
     assert len(S.read_outbox(h))==2, 'missing or repeated recovery alert'
+    end=S.read_outbox(h)[1]
+    assert end['channel']=='C_FIXTURE_DEV' and not end.get('thread_ts')
+    assert 'fallback ended' in end['text'].lower() and episode in end['text']
     # All Claude models fail: successful Codex fallback persists, then no Claude retry next turn.
     h2=home();write(Path(h2)/'engine',{'acc':'claude-r2d2','model':'claude-fable-5-1'})
     sx=S.Supervisor(home=h2,engines=engines,config=cfg,poster=lambda *a:None); seen=[]
@@ -533,37 +545,58 @@ def ledger_failures():
 
 def rollover():
     # Real invoke/argv on temp homes only; never inspect the manager's real transcript.
-    for mode in ('success','failure','held'):
+    for mode in ('success','failure','held','default','empty-config','no-handoff','bad-handoff','no-memory','memory-error','id-error'):
         h=home();exe=Path(h)/'rollover-claude';old='old-fixture-session'
         Path(h,'session-id').write_text(old+'\n')
         transcript=Path(h)/'.claude/projects'/h.replace('/','-')/(old+'.jsonl')
         transcript.parent.mkdir(parents=True);transcript.write_bytes(b'OLD TRANSCRIPT SENTINEL\n')
         write(Path(h)/'engine',{'acc':'claude-r2d2','model':'claude-sonnet-5'})
-        write(Path(h)/'config.json',{'compaction':{'rollover_enabled':mode!='held'}})
+        if mode=='empty-config':write(Path(h)/'config.json',{'compaction':{}})
+        elif mode!='default':write(Path(h)/'config.json',{'compaction':{'rollover_enabled':mode!='held'}})
+        handoff=HANDOFF if mode not in ('no-handoff','bad-handoff') else ('---HANDOFF---\ntracks: incomplete' if mode=='bad-handoff' else '')
+        memory_code=" m=pathlib.Path(os.environ['HYDRA_MEMORY_DIR'])/'MEMORY.md';m.write_text(m.read_text()+'\\nrollover memory marker\\n')\n"
+        if mode=='no-memory':memory_code=' pass\n'
+        if mode=='memory-error':memory_code=" raise OSError('fixture memory write failed')\n"
+        if mode=='failure':memory_code=' sys.exit(1)\n'
         exe.write_text('#!/usr/bin/env python3\nimport sys,json,os,pathlib\nprompt=sys.stdin.read()\n'
             +f'p=pathlib.Path({h!r})\n'
             +"with (p/'calls').open('a') as f:f.write(json.dumps({'argv':sys.argv,'prompt':prompt})+'\\n')\n"
-            +"if '[compaction]' in prompt:\n"
-            +(" sys.exit(1)\n" if mode=='failure' else " m=pathlib.Path(os.environ['HYDRA_MEMORY_DIR'])/'MEMORY.md';m.write_text(m.read_text()+'\\nrollover memory marker\\n')\n")
-            +"print("+repr('compacted\n'+HANDOFF)+")\n")
+            +"if (p/'fail-start').exists():sys.exit(1)\n"
+            +"if '[compaction]' in prompt:\n"+memory_code
+            +"print("+repr('compacted\n'+handoff)+")\n")
         exe.chmod(0o755);engines={'claude-r2d2':{'bin':str(exe),'cred':None}}
         sup=S.Supervisor(home=h,engines=engines,poster=lambda *a:None,buildlog_poster=lambda *a:None)
-        sup.ensure_memory_layout();sup.run_compaction('force')
+        sup.ensure_memory_layout()
+        if mode=='id-error':
+            assert hasattr(sup,'replace_session_id'), 'atomic session replacement seam missing'
+            with patch.object(sup,'replace_session_id',side_effect=OSError('fixture atomic replace failure')):sup.run_compaction('force')
+        else:sup.run_compaction('force')
         assert transcript.read_bytes()==b'OLD TRANSCRIPT SENTINEL\n'
         sid=Path(h,'session-id').read_text().strip()
         if mode!='success':
-            assert sid==old
-            if mode=='held':assert not Path(h,'calls').exists()
-            if mode=='failure':assert sup.family_last_at('claude') is None
+            assert sid==old,mode
+            cs=sup.compaction_state()
+            if mode in ('held','default','empty-config'):
+                assert not Path(h,'calls').exists()
+                assert 'held' in cs.get('last',{}).get('error','').lower(),cs
+            else:
+                assert cs.get('failed_at') and cs.get('last',{}).get('ok') is False,(mode,cs)
+                if mode in ('failure','memory-error'):assert sup.family_last_at('claude') is None
             continue
         import uuid
         uuid.UUID(sid);assert sid!=old
-        # Restart between memory flush and first fresh invocation.
-        restarted=S.Supervisor(home=h,engines=engines,poster=lambda *a:None)
-        restarted.invoke('claude-r2d2',engines['claude-r2d2'],'next','claude-sonnet-5',preamble=restarted.preamble_for('claude-r2d2'))
+        # Fail first startup, restart again, retry fresh, then resume after success.
+        Path(h,'fail-start').touch()
+        for fail in (True,False,False):
+            restarted=S.Supervisor(home=h,engines=engines,poster=lambda *a:None)
+            rc,*_=restarted.invoke('claude-r2d2',engines['claude-r2d2'],'next','claude-sonnet-5',preamble=restarted.preamble_for('claude-r2d2'))
+            assert (rc!=0)==fail
+            if fail:Path(h,'fail-start').unlink()
         calls=[json.loads(x) for x in Path(h,'calls').read_text().splitlines()]
         assert all('/compact' not in c['argv'] for c in calls)
-        argv=calls[-1]['argv'];assert '--session-id' in argv and '--resume' not in argv and sid in argv
+        for call in calls[-3:-1]:
+            argv=call['argv'];assert '--session-id' in argv and '--resume' not in argv and sid in argv
+        assert '--resume' in calls[-1]['argv'] and sid in calls[-1]['argv']
         assert 'MEMORY.md' in calls[-1]['prompt'] and 'tracks: b7' in calls[-1]['prompt']
 
 
@@ -577,16 +610,63 @@ def attribution():
     before=Path(h,'engine').read_bytes()
     for n,text,user in [('op','<@MANAGER> engine acc=claude-l model=sonnet5\n*Sent using* <@APP>','OP'),
             ('bad','<@MANAGER> engine acc=claude-l\ninvalid extra\n*Sent using* <@APP>','U'),
-            ('inside','<@MANAGER> engine acc=claude-l *Sent using* <@APP> trailing','U')]:
+            ('inside','<@MANAGER> engine acc=claude-l *Sent using* <@APP> trailing','U'),
+            ('quote','<@MANAGER> engine acc=claude-l\n> *Sent using* <@APP>','U'),
+            ('fence','<@MANAGER> engine acc=claude-l\n```\n*Sent using* <@APP>','U')]:
         result=b.handle_message({'channel':'C','ts':n,'user':user,'text':text})
         assert result and result.get('ok') is False
         assert Path(h,'engine').read_bytes()==before
 
 
+def fallback_matrix():
+    engines={'claude-r2d2':{'bin':'fixture'},'claude-l':{'bin':'fixture'},'codex':{'bin':'fixture','kind':'codex'}}
+    for kind,error,models in [
+            ('usage_limit','Usage limit. Switch to another model to continue.',['claude-sonnet-5']),
+            ('credits',"Out of usage credits. Switch to another model to continue.",[]),
+            ('duplicates',"Out of usage credits. Switch to another model to continue.",['claude-fable-5-1','claude-sonnet-5','claude-sonnet-5']),
+            ('auth','HTTP 401 Unauthorized',['claude-sonnet-5']),
+            ('prompt','Prompt is too long',['claude-sonnet-5']),
+            ('rate','Rate limit 429',['claude-sonnet-5']),
+            ('other','generate a separate report failed',['claude-sonnet-5'])]:
+        h=home();S.set_engine(h,'claude-r2d2','claude-fable-5-1',engines);seen=[]
+        sup=S.Supervisor(home=h,engines=engines,config={'engine_fallback':{'claude_models':models}},poster=lambda *a:None)
+        def inv(name,spec,message,model=None,preamble=''):
+            seen.append((name,model))
+            return (0,'done','',None) if name=='codex' else (1,'',error,None)
+        with patch.object(sup,'invoke',side_effect=inv):sup.run_engines('matrix',[])
+        first=('claude-r2d2','claude-fable-5-1');other=('claude-l','claude-fable-5-1');codex=('codex','gpt-6-astra')
+        expected=[first,other,codex]
+        if kind in ('usage_limit','duplicates'):
+            expected=[first,('claude-r2d2','claude-sonnet-5'),other,('claude-l','claude-sonnet-5'),codex]
+        if kind=='prompt':expected=[first,codex]
+        assert seen==expected,(kind,seen)
+        expected_acc='codex' if kind in ('credits','usage_limit','duplicates','auth') else 'claude-r2d2'
+        assert S.read_engine(h,engines)['acc']==expected_acc,kind
+    h=home();S.set_engine(h,'codex','gpt-6-astra',engines)
+    sup=S.Supervisor(home=h,engines=engines,poster=lambda *a:None)
+    with patch.object(sup,'invoke',return_value=(0,'deliberately selected','',None)):sup.run_engines('codex',[])
+    assert not S.read_outbox(h),'explicit Codex selection must not announce fallback'
+
+
+def failure_diagnostics():
+    for stream in (False,True):
+        h=home();exe=Path(h)/'diagnostics';Path(h,'session-id').write_text('old\n')
+        sup=S.Supervisor(home=h,poster=lambda *a:None)
+        for body,stderr,needle in [
+                ({'type':'result','result':'looks successful','is_error':False},'process failed','process failed'),
+                ({'type':'result','error':{'message':'usage limit reached'},'is_error':True},'stderr-marker','usage limit reached')]:
+            out=json.dumps(body)
+            if stream:out=json.dumps({'type':'system','subtype':'init'})+'\n'+out
+            exe.write_text('#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\nprint('+repr(out)+')\nprint('+repr(stderr)+',file=sys.stderr)\nsys.exit(1)\n');exe.chmod(0o755)
+            rc,_,err,_=sup.invoke('claude-r2d2',{'bin':str(exe),'cred':None},'fixture','claude-sonnet-5')
+            assert rc!=0 and needle in err and stderr in err and len(err)<=4000,err
+            assert Path(h,'session-id').read_text()=='old\n'
+
+
 if __name__=='__main__':
     if '--serve-child' in sys.argv: serve_child()
     failures=[]
-    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution):
+    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution,fallback_matrix,failure_diagnostics):
         try: fn()
         except (AssertionError, Exception) as exc:
             failures.append(fn.__name__); print(f'[b7] FAIL {fn.__name__}: {type(exc).__name__}: {exc}',flush=True)
