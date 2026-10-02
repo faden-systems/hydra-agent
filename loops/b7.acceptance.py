@@ -246,6 +246,7 @@ def context():
         assert ms.run_once()
         assert ms.compaction_state()['last']['ok'] is expected
         assert ms.compaction_pending() is (not expected), 'high context must schedule; low context must not'
+    assert '--include-partial-messages' not in args
     assert '--verbose' in args and args[args.index('--output-format')+1] == 'stream-json'
     lh=home(); ls=S.Supervisor(home=lh)
     S.append_jsonl(str(Path(lh)/'logs/turns.jsonl'),{'engine':'claude-r2d2','input_tokens':9000000})
@@ -613,12 +614,15 @@ def rollover():
                 try:sup.run_compaction('force')
                 except SystemExit:pass
             assert interrupted==[mode]
+            intent=json.loads(Path(h,'rollover-intent.json').read_text());intended=intent['new_id']
+            assert intent['old_id']==old
             recovered=S.Supervisor(home=h,engines=engines,poster=lambda *a:None)
             rc,*_=recovered.invoke('claude-r2d2',engines['claude-r2d2'],'recover','claude-sonnet-5',preamble=recovered.preamble_for('claude-r2d2'))
             assert rc==0
             calls=[json.loads(x) for x in Path(h,'calls').read_text().splitlines()]
             assert len(calls)==2 and '--session-id' in calls[-1]['argv'] and '--resume' not in calls[-1]['argv']
-            new=Path(h,'session-id').read_text().strip();assert new!=old and new in calls[-1]['argv']
+            new=Path(h,'session-id').read_text().strip();assert new==intended and new!=old and new in calls[-1]['argv']
+            assert recovered.compaction_state()['last']['new_id']==intended
             assert transcript.read_bytes()==b'OLD TRANSCRIPT SENTINEL\n'
             continue
         if mode=='id-error':
@@ -629,6 +633,12 @@ def rollover():
         sid=Path(h,'session-id').read_text().strip()
         if mode!='success':
             assert sid==old,mode
+            if mode=='id-error':
+                restarted=S.Supervisor(home=h,engines=engines,poster=lambda *a:None)
+                rc,*_=restarted.invoke('claude-r2d2',engines['claude-r2d2'],'after caught failure','claude-sonnet-5')
+                assert rc==0 and Path(h,'session-id').read_text().strip()==old
+                call=json.loads(Path(h,'calls').read_text().splitlines()[-1])
+                assert '--resume' in call['argv'] and old in call['argv']
             cs=sup.compaction_state()
             if mode in ('held','default','empty-config'):
                 assert not Path(h,'calls').exists()
@@ -789,10 +799,21 @@ def notice_crashes():
             except SystemExit:pass
         assert hits==[checkpoint],hits
         runtime=json.loads(Path(h,'engine-runtime.json').read_text())
+        delivered=[]
+        if checkpoint.endswith('_queued'):
+            queued=S.read_outbox(h);assert queued
+            S.drain_outbox(h,lambda *a:(delivered.append(a) or {'ok':True,'ts':str(len(delivered))}))
+            assert not S.read_outbox(h)
+            assert all(S.post_receipt(h,n['id'])['status']=='posted' for n in queued)
         for _ in range(2):
             sup=make()
             with patch.object(sup,'invoke',side_effect=invoke):sup.run_engines('recover',[])
         notices=S.read_outbox(h)
+        if checkpoint.endswith('_queued'):
+            assert not notices,'recovery requeued an already delivered notice'
+            S.drain_outbox(h,lambda *a:(delivered.append(a) or {'ok':True,'ts':'duplicate'}))
+            assert len(delivered)==(2 if ending else 1),'recovery reposted delivered transition'
+            notices=queued
         assert len(notices)==(2 if ending else 1),(checkpoint,notices)
         assert sum('fallback started' in n['text'].lower() for n in notices)==1
         if ending:assert sum('fallback ended' in n['text'].lower() for n in notices)==1

@@ -7,6 +7,8 @@ git rev-parse --verify "$BASE" >/dev/null || fail "missing base $BASE"
 git merge-base --is-ancestor "$BASE" HEAD || fail 'candidate does not descend from launch base'
 fence() {
   local changed bad
+  test -z "$(git diff --name-only "$BASE" -- tests/manager/fixtures/)" || fail 'recorded fixtures changed'
+  test -z "$(git ls-files --others --exclude-standard -- tests/manager/fixtures/)" || fail 'recorded fixtures added'
   changed=$( (git diff --name-only "$BASE"...HEAD; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
   bad=$(printf '%s\n' "$changed" | grep -Ev '^$|^manager/(bridge\.py|supervisor\.py|hydra|README\.md|CLAUDE\.md)$|^tests/manager/|^docs/notes/b7\.md$' || true)
   test -z "$bad" || fail "outside fence: $bad"
