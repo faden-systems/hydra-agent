@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exit-owned acceptance for b4: threads reach the manager once joined and replies stay in-thread; compaction is
-scheduled by recorded tokens, runs a [compaction] turn then /compact on the same session, is logged, and never
+scheduled by recorded tokens, runs a [compaction] memory turn then starts a new session, is logged, and never
 discards the session. Interfaces: Bridge(home, allowlist, poster, token_env) with handle_message(event) and
 bot_id attribute; Supervisor(home, engines, poster, repo, clock=, buildlog_poster=); config.json compaction keys."""
 import datetime as dt, json, os, subprocess, sys, tempfile, time, uuid
@@ -27,7 +27,7 @@ def home():
     open(os.path.join(h, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-fable-5-1"}))
     open(os.path.join(h, "session-id"), "w").write("sess-b4\n")
     open(os.path.join(h, "budgets.json"), "w").write(json.dumps({"turns_per_hour": 100, "claude_turns_per_day": {"claude-r2d2": 100, "claude-l": 100}}))
-    open(os.path.join(h, "config.json"), "w").write(json.dumps({"compaction": {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "UTC"}}))
+    open(os.path.join(h, "config.json"), "w").write(json.dumps({"compaction": {"rollover_enabled": True, "threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "UTC"}}))
     return h
 
 
@@ -37,16 +37,15 @@ def queued(h):
 
 
 def fake_claude(dir_, tokens=None, fail_compact=False, after_tokens=40000, name="claude", flush_marker=None):
-    """Recording fake engine: logs argv and stdin; reports `tokens` input tokens per turn until a successful
-    '/compact', after which it reports `after_tokens` (state kept in <dir>/compacted); '/compact' exits 1 when
-    fail_compact; a '[compaction]' turn replies 'compacted'; if flush_marker is given and the stdin contains it,
-    appends a line to <dir>/flushes."""
+    """Recording engine. b7 amendment: flush writes memory and handoff; fresh session reduces context.
+    fail_compact now fails the memory-writing turn, preserving old session/backoff coverage."""
     p = os.path.join(dir_, name)
     open(p, "w").write("#!/usr/bin/env python3\nimport sys, os, json\nmsg=sys.stdin.read() if not sys.stdin.isatty() else ''\n"
                        f"D={dir_!r}\n"
                        "open(D+'/calls.jsonl','a').write(json.dumps({'argv': sys.argv[1:], 'stdin': msg})+'\\n')\n"
-                       f"if any(a=='/compact' for a in sys.argv[1:]):\n    sys.exit({1 if fail_compact else 0}) if {fail_compact!r} else (open(D+'/compacted','w').write('1'), sys.exit(0))\n"
-                       "if '[compaction]' in msg:\n    print('compacted')\n    sys.exit(0)\n"
+                       "assert '/compact' not in sys.argv, 'obsolete compaction invocation'\n"
+                       f"if '[compaction]' in msg:\n    if {fail_compact!r}: sys.exit(1)\n    from pathlib import Path\n    m=Path(os.environ['HYDRA_MEMORY_DIR'])/'MEMORY.md'; m.write_text(m.read_text()+'\\nfixture memory flushed\\n')\n    print('compacted\\n---HANDOFF---\\ntracks: t1\\nwaiting on: none\\nlast decision: flush\\nnext action: resume\\nopen question: none')\n    sys.exit(0)\n"
+                       "if '--session-id' in sys.argv and sys.argv[sys.argv.index('--session-id')+1]!='sess-b4': open(D+'/compacted','w').write('1')\n"
                        + (f"if {flush_marker!r} and {flush_marker!r} in msg:\n    open(D+'/flushes','a').write('1\\n')\n" if flush_marker else "")
                        + "print('REPLY: ok')\n"
                        + (f"print('[usage] input_tokens=' + str({after_tokens} if os.path.exists(D+'/compacted') else {tokens}))\n" if tokens else "")
@@ -111,7 +110,7 @@ def main():
     ev2 = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h2, "inbox", "events.jsonl"), "a").write(json.dumps(ev2) + "\n")
     assert sup2.run_once() is True
     argvs = [c["argv"] for c in calls(c2_dir)]
-    assert not any("/compact" in a for a in argvs), "within 25% over threshold and outside quiet hours: deferred"
+    assert not any("[compaction]" in c["stdin"] for c in calls(c2_dir)), "within 25% over threshold and outside quiet hours: deferred"
     NOW[0] = dt.datetime(2026, 10, 3, 3, 0, 0, tzinfo=dt.timezone.utc)  # quiet hours (02:00 to 05:00)
     ev3 = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h2, "inbox", "events.jsonl"), "a").write(json.dumps(ev3) + "\n")
     assert sup2.run_once() is True
@@ -119,9 +118,9 @@ def main():
     stdins = [c["stdin"] for c in cs]
     i_comp = next((i for i, s_ in enumerate(stdins) if "[compaction]" in s_), None)
     assert i_comp is not None, "a [compaction] turn must run in quiet hours"
-    assert any("/compact" in c["argv"] for c in cs[i_comp + 1:]), "then /compact on the session"
-    comp_call = next(c for c in cs[i_comp + 1:] if "/compact" in c["argv"])
-    assert "--resume" in comp_call["argv"] and comp_call["argv"][comp_call["argv"].index("--resume") + 1] == "sess-b4", "same session id"
+    assert not any('/compact' in c['argv'] for c in cs)
+    new_sid=open(os.path.join(h2,'session-id')).read().strip()
+    assert new_sid != 'sess-b4', 'rollover must select a new session'
     ev4 = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h2, "inbox", "events.jsonl"), "a").write(json.dumps(ev4) + "\n")
     assert sup2.run_once() is True  # the turn after compaction reports the reduced count
     ledger_p = os.path.join(h2, "manager-memory", "LEDGER.jsonl")
@@ -137,8 +136,8 @@ def main():
     sup3 = S.Supervisor(home=h3, engines=engines3, poster=Poster(), clock=clock, buildlog_poster=blog)
     for _ in range(2):
         e = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h3, "inbox", "events.jsonl"), "a").write(json.dumps(e) + "\n"); assert sup3.run_once() is True
-    assert any("/compact" in c["argv"] for c in calls(c3_dir)), "more than 25% over threshold: compaction runs immediately before the next turn"
-    # failure path: /compact fails -> one buildlog post, session id unchanged, turns continue
+    assert any("[compaction]" in c["stdin"] for c in calls(c3_dir)), "more than 25% over threshold: compaction runs immediately before the next turn"
+    # failure path: memory flush fails -> one buildlog post, session id unchanged, turns continue
     h4 = home(); c4_dir = tempfile.mkdtemp(); c4 = fake_claude(c4_dir, tokens=740000, fail_compact=True)
     engines4 = {"claude-r2d2": {"bin": c4, "cred": "claude-r2d2.env"}, "claude-l": {"bin": c4, "cred": "claude-l.env"}}
     blog4 = Poster(); sup4 = S.Supervisor(home=h4, engines=engines4, poster=Poster(), clock=clock, buildlog_poster=blog4)
@@ -146,7 +145,8 @@ def main():
         e = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h4, "inbox", "events.jsonl"), "a").write(json.dumps(e) + "\n"); assert sup4.run_once() is True
     assert open(os.path.join(h4, "session-id")).read().strip() == "sess-b4", "a failed compaction must never discard the session"
     assert len(blog4.posted) == 1 and "compaction" in blog4.posted[0][2].lower(), ("exactly one buildlog post across repeated failures", blog4.posted)
-    assert sum(1 for c in calls(c4_dir) if "/compact" in c["argv"]) >= 1
+    assert sum(1 for c in calls(c4_dir) if "[compaction]" in c["stdin"]) >= 1
+    assert not any("/compact" in c["argv"] for c in calls(c4_dir))
     # hydra compact forces it (CLI), founder-only in Slack
     r = subprocess.run([sys.executable, os.path.join(ROOT, "manager", "hydra"), "compact"], env={**os.environ, "HYDRA_HOME": h}, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and os.path.exists(os.path.join(h, "COMPACT")), "hydra compact must schedule a compaction (flag file)"
@@ -166,14 +166,14 @@ def main():
     json.dump(th, open(os.path.join(h5, "threads.json"), "w")); br5.prune()
     th = json.load(open(os.path.join(h5, "threads.json"))); assert "400.1" not in th.get("C_DEV", {}) and "500.1" in th.get("C_DEV", {}), "14-day prune drops stale threads only"
     # bytes trigger
-    h6 = home(); open(os.path.join(h6, "config.json"), "w").write(json.dumps({"compaction": {"threshold_tokens": 300000, "max_bytes": 1000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "UTC"}}))
+    h6 = home(); open(os.path.join(h6, "config.json"), "w").write(json.dumps({"compaction": {"rollover_enabled": True, "threshold_tokens": 300000, "max_bytes": 1000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "UTC"}}))
     sd = os.path.join(h6, ".claude", "projects", h6.replace("/", "-")); os.makedirs(sd); open(os.path.join(sd, "sess-b4.jsonl"), "w").write("x" * 5000)
     c6_dir = tempfile.mkdtemp(); c6 = fake_claude(c6_dir, tokens=1000)
     sup6 = S.Supervisor(home=h6, engines={"claude-r2d2": {"bin": c6, "cred": "claude-r2d2.env"}, "claude-l": {"bin": c6, "cred": "claude-l.env"}}, poster=Poster(), clock=clock, buildlog_poster=Poster())
     e = dict(ev, id=str(uuid.uuid4())); open(os.path.join(h6, "inbox", "events.jsonl"), "a").write(json.dumps(e) + "\n"); assert sup6.run_once() is True
     assert sup6.compaction_pending() is True, "a session file over max_bytes schedules a compaction"
     # codex periodic flush
-    h7 = home(); open(os.path.join(h7, "config.json"), "w").write(json.dumps({"compaction": {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 2, "quiet_hours": [2, 5], "quiet_hours_tz": "UTC"}}))
+    h7 = home(); open(os.path.join(h7, "config.json"), "w").write(json.dumps({"compaction": {"rollover_enabled": True, "threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 2, "quiet_hours": [2, 5], "quiet_hours_tz": "UTC"}}))
     open(os.path.join(h7, "engine"), "w").write(json.dumps({"acc": "codex", "model": "gpt-6-astra"}))
     cx_dir = tempfile.mkdtemp(); cx = fake_claude(cx_dir, name="codex", flush_marker="MEMORY.md")
     sup7 = S.Supervisor(home=h7, engines={"claude-r2d2": {"bin": c6, "cred": "claude-r2d2.env"}, "claude-l": {"bin": c6, "cred": "claude-l.env"}, "codex": {"bin": cx, "cred": None}}, poster=Poster(), clock=clock, buildlog_poster=Poster())
