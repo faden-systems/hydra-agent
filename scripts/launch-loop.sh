@@ -6,6 +6,7 @@
 # Retry policy: attempt 1 fresh; attempt 2 CONTINUES the same session with the exit failure fed in (no reset);
 #               attempt 3+ fresh with the previous failure tail + PROGRESS notes as a hint.
 # A closed usage window is not a failed attempt: limit_hit event, wait, retry.
+# On PASS the launcher opens the PR and stops; the manager verifies on a fresh clone and merges (am1, founder 2026-10-02).
 # Claude Code honours ANTHROPIC_API_KEY over the subscription login, so the key from ~/.faden.env (needed by the
 # app and the simulator) is stripped from every `claude` invocation: loops bill the Max plan, sessions bill the API.
 set -uo pipefail
@@ -80,9 +81,8 @@ $LAST_NOTES" --model "$MODEL" --dangerously-skip-permissions 2>&1 | tee "$CLOG" 
   if [ "$RC" -eq 0 ]; then
     git push -u origin "$BR"
     gh pr create --fill --label "loop:$LOOP" || gh pr create --fill
-    gh pr merge --auto --squash || true
     URL=$(gh pr view --json url -q .url 2>/dev/null || echo "no-pr-url")
-    notify "PASS on attempt $attempt/$MAX ($mode) -> $URL"
+    notify "PASS on attempt $attempt/$MAX ($mode) -> $URL (PR open, awaiting the manager's verification and merge)"
     exit 0
   fi
   LAST_FAIL=$(tail -25 "$EXITLOG")

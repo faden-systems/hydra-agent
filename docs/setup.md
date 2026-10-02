@@ -5,7 +5,7 @@ paths and names are that deployment's defaults and are safe to keep.
 
 ## 1. The repository (once)
 
-`scripts/setup-github.sh` configures: loop labels, auto-merge with delete-branch-on-merge, branch protection on
+`scripts/setup-github.sh` configures: loop labels, auto-merge off with delete-branch-on-merge on, branch protection on
 `main` (pull request required, the `run-exit` status check required, no force pushes), and the three secrets the CI
 workflows use (`ANTHROPIC_API_KEY` for CI tools, `OPENAI_API_KEY` for the review bot, `SLACK_PR_WEBHOOK` for the PR
 notifier). Needs the `gh` CLI logged in. Set `REPO=<org>/<repo>` before running.
@@ -35,14 +35,15 @@ What `scripts/launch-loop.sh` and `scripts/account.sh` expect:
 | Environment file | `~/.faden.env` | sourced by the launcher and the watchers; keys: `ANTHROPIC_API_KEY` (the app and the simulator), `SLACK_BUILDLOG_WEBHOOK` (launch/exit lines), `OPENAI_API_KEY` only where an API transport is intended |
 | Claude Code | on PATH, logged in per account (`claude auth login` under each `CLAUDE_CONFIG_DIR`, or a `claude setup-token` for headless use) | the launcher strips `ANTHROPIC_API_KEY` from every `claude` invocation so loops bill the plan, not the API |
 | Codex CLI | `codex login --device-auth` on the machine that runs the spec reviewer and real-model runs | subscription login persists in `~/.codex/auth.json` |
-| `gh` | logged in, with push rights to the repo | used to open PRs and enable auto-merge |
+| `gh` | logged in, with push rights to the repo | used to open PRs |
 | Python 3.12, Node LTS | on PATH; `~/.local/bin` on PATH | exit scripts `pip install` and `playwright install chromium` on first run; pin both in an image |
 | Playwright | installed by the exit scripts; on Linux add `--with-deps` and fonts (Inter, Noto, an emoji font) | screenshots must match across machines |
 
 Launch: `scripts/launch-loop.sh <loop-id> [model] [max-attempts]`, detached (see the header comment). Attempt 1 is a
 fresh session with the spec as the prompt; attempt 2 continues the same session with the exit failure fed in; attempt 3
 starts fresh with the failure tail as a hint. A closed usage window is a wait, not a failed attempt. On PASS the
-launcher pushes `loop/<id>`, opens the PR and enables auto-merge; on the third FAIL it leaves the diff and tails under
+launcher pushes `loop/<id>`, opens the PR and stops (the manager verifies on a fresh clone and merges; am1,
+2026-10-02); on the third FAIL it leaves the diff and tails under
 `~/factory/failed/`.
 
 ## 3. The spec reviewer (one machine with the Codex login)

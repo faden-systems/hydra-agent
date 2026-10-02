@@ -21,9 +21,9 @@ the worked example throughout the documentation.
 
 - `docs/setup.md`: what a repository and a machine need before loops run (repo configuration, the machine layout the
   launcher expects, the spec reviewer, Slack channels).
-- `scripts/`: `launch-loop.sh` (the coding-loop launcher: worktree, attempts, exit script, PR with auto-merge),
+- `scripts/`: `launch-loop.sh` (the coding-loop launcher: worktree, attempts, exit script, opens the PR),
   `account.sh` (per-account Claude Code config dirs), `spec-watch.sh` (starts the spec reviewer), `setup-github.sh`
-  (labels, auto-merge, branch protection, secrets).
+  (labels, auto-merge off, branch protection, secrets).
 - `tools/factory/`: the spec reviewer (`spec_review.py`, its brief `spec_review_prompt.md`) and the watcher
   (`spec_watch.py`).
 - `docs/factory/`: the standing rules the reviewer and the watchers enforce.

@@ -9,9 +9,9 @@ for L in loop:a1 loop:a2 loop:a3 loop:a4 loop:a5 loop:a6 loop:b1 loop:b2 loop:b3
   gh label create "$L" --repo "$REPO" --force --color "0e8a16" || true
 done
 
-echo "== Allow auto-merge on the repo =="
-gh api -X PATCH "repos/$REPO" -f allow_auto_merge=true -f delete_branch_on_merge=true >/dev/null
-echo "auto-merge: on, delete-branch-on-merge: on"
+echo "== Auto-merge off on the repo =="
+gh api -X PATCH "repos/$REPO" -f allow_auto_merge=false -f delete_branch_on_merge=true >/dev/null
+echo "auto-merge: off (the manager merges after verification), delete-branch-on-merge: on"
 
 echo "== Branch protection on main =="
 gh api -X PUT "repos/$REPO/branches/main/protection" \
