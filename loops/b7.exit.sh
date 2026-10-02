@@ -13,9 +13,21 @@ fence() {
   done
 }
 fence
+git merge-base --is-ancestor 7ed929a "$BASE" || fail 'base predates merged b6'
+for loop in b1 b2 b3 b4 b5 b6 b7; do
+  git cat-file -e "$BASE:loops/$loop.acceptance.py" || fail "missing base harness $loop"
+done
 test -f docs/notes/b7.md || fail 'notes missing'
 PYTHON="${PYTHON:-python3}"
 "$PYTHON" -c 'import pytest, slack_bolt' || fail 'install pytest and slack_bolt in selected Python environment'
+"$PYTHON" - <<'PYNOTES'
+from pathlib import Path
+import re
+text=Path('docs/notes/b7.md').read_text()
+for section in ('Problem','Implementation','Validation','Changed assertions','SDK evidence','Deployment','Rollback'):
+    match=re.search(r'^## '+re.escape(section)+r'\s*\n(.*?)(?=^## |\Z)',text,re.M|re.S)
+    assert match and match.group(1).strip(), f'notes missing nonempty section: {section}'
+PYNOTES
 TMP=$(mktemp -d)
 trap 'git worktree remove --force "$TMP/base" >/dev/null 2>&1 || true; rm -rf "$TMP"' EXIT
 git worktree add --detach "$TMP/base" "$BASE" >/dev/null

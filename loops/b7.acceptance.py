@@ -103,8 +103,74 @@ def liveness():
         assert handler.client.reconnects == 1, 'recovery loop repeats without monitoring'
         assert not handler.client.auto_reconnect_enabled
         assert not handler.client.default_auto_reconnect_enabled
-    import inspect
-    assert 'run_socket_mode' in inspect.getsource(B.serve), 'production serve must use tested lifecycle'
+    # Actual serve/main subprocess, actual Bolt handler dispatch/ACK, fake network only.
+    child = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--serve-child'],
+                           capture_output=True, text=True, timeout=10)
+    assert child.returncode != 0, 'production bridge main must fail recovery'
+    for marker in ('DISPATCHED', 'ACKED', 'CLOSED', 'PUMP_STOPPED', 'MAIN_FAILED', 'RECOVERY_ATTEMPT'):
+        assert marker in child.stdout, (marker, child.stdout, child.stderr)
+    # Old timestamps on replacement sessions cannot buy endless freshness.
+    client.is_connected = lambda: True
+    now[0] = 1201
+    client.current_session = SimpleNamespace(last_ping_pong_time=1234567)
+    assert health.check() is False
+    now[0] = 1502
+    client.current_session = SimpleNamespace(last_ping_pong_time=1234567)
+    assert health.check() is False
+    client.current_session.last_ping_pong_time = 1234568
+    assert health.check() is True
+
+def serve_child():
+    import logging
+    import slack_bolt
+    import slack_bolt.adapter.socket_mode.builtin as adapter
+    from slack_bolt.response import BoltResponse
+    from slack_sdk.socket_mode.request import SocketModeRequest
+    h=home(); write(Path(h)/'allowlist.json', {'U':{'instructs':True}})
+    (Path(h)/'credentials').mkdir()
+    (Path(h)/'credentials/slack.env').write_text('SLACK_BOT_TOKEN=fake\nSLACK_APP_TOKEN=fake\n')
+    class App:
+        def __init__(self, **kw):
+            self.logger=logging.getLogger('b7'); self.events={}
+            self.client=SimpleNamespace(proxy=None, auth_test=lambda:{'user_id':'M'})
+        def event(self,name):
+            def register(fn): self.events[name]=fn; return fn
+            return register
+        def dispatch(self,req):
+            self.events['message'](req.body['event'])
+            print('DISPATCHED', flush=True)
+            return BoltResponse(status=200,body='')
+    class Client:
+        def __init__(self,**kw):
+            self.logger=logging.getLogger('b7-client')
+            self.socket_mode_request_listeners=[]
+            self.current_session=SimpleNamespace(last_ping_pong_time=None)
+            self.auto_reconnect_enabled=self.default_auto_reconnect_enabled=True
+        def connect(self):
+            req=SocketModeRequest(type='events_api', envelope_id='env', payload={'event':{
+                'type':'message','user':'U','channel':'C','ts':'child','text':'<@M> report'}})
+            for listener in list(self.socket_mode_request_listeners): listener(self,req)
+        def is_connected(self): return False
+        def connect_to_new_endpoint(self):
+            print('RECOVERY_ATTEMPT',flush=True)
+            raise RuntimeError('fixture recovery failure')
+        def send_socket_mode_response(self,response): print('ACKED',flush=True)
+        def close(self): print('CLOSED',flush=True)
+        def disconnect(self): self.close()
+    def pump(self,stop):
+        stop.wait(5)
+        assert stop.is_set(), 'pump not stopped'
+        print('PUMP_STOPPED',flush=True)
+    with patch.object(slack_bolt,'App',App), patch.object(adapter,'SocketModeClient',Client), \
+         patch.object(B.Bridge,'pump_outbox',pump):
+        rc=B.main(['--home',h])
+        for thread in threading.enumerate():
+            if thread.name=='outbox': thread.join(.5); assert not thread.is_alive()
+        queued=S.read_jsonl(str(Path(h)/'inbox/events.jsonl'))
+        assert queued and queued[0]['payload']['addressed'], 'dispatch did not reach production bridge'
+        assert rc != 0
+        print('MAIN_FAILED',flush=True)
+        raise SystemExit(rc)
 
 def context():
     first = {'type': 'assistant', 'message': {'id': 'msg1', 'usage': {'input_tokens': 100,
@@ -152,6 +218,19 @@ def context():
     assert sup.compaction_state()['last']['ok'] is None, 'aggregate falsely verified compaction'
     assert not sup.compaction_pending(), 'aggregate scheduled another compaction'
     args = json.loads((Path(h)/'argv.json').read_text())
+    for measured, expected in ((1000, True), (400000, False)):
+        mh=home(); mexe=Path(mh)/'engine-fixture'
+        first['message']['usage']={'input_tokens':measured}
+        result['usage']={'input_tokens':9000000}
+        mexe.write_text('#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\nprint(' +
+            repr('\n'.join(map(json.dumps,[first,result]))) + ')\n'); mexe.chmod(0o755)
+        write(Path(mh)/'engine',{'acc':'claude-r2d2','model':'claude-fable-5-1'})
+        ms=S.Supervisor(home=mh,engines={'claude-r2d2':{'bin':str(mexe),'cred':None}},poster=lambda *a:None)
+        cs=ms.compaction_state(); cs['verify']={'before_tokens':500000,'at':'fixture','reason':'tokens'}
+        ms.save_compaction_state(cs); S.append_event(mh,event('measured'))
+        assert ms.run_once()
+        assert ms.compaction_state()['last']['ok'] is expected
+        assert ms.compaction_pending() is (not expected), 'high context must schedule; low context must not'
     assert '--verbose' in args and args[args.index('--output-format')+1] == 'stream-json'
 
 def tracks():
@@ -162,6 +241,9 @@ def tracks():
         {'id':'flow', 'stage':history, 'now':'deployed; evidence pending', 'owner':'manager'},
         {'id':'R1', 'stage':'old\n' + 'last ' * 100}]}
     write(Path(h)/'state.json', state)
+    original=(Path(h)/'state.json').read_bytes()
+    S.migrate_track_history(h, None)
+    assert (Path(h)/'state.json').read_bytes()==original, 'no-repo migration must retain state untouched'
     S.migrate_track_history(h, str(repo))
     updated = json.loads((Path(h)/'state.json').read_text())
     tr = updated['tracks'][0]
@@ -184,12 +266,14 @@ def tracks():
     assert 'old: waiting' not in text
     write(Path(h)/'state.json', {'tracks':{'b':{'now':'running','stage':'old\nhistory'}}})
     assert S.tracks_summary(json.loads((Path(h)/'state.json').read_text())) == ['b: running']
-    write(Path(h)/'state.json', {'tracks':[{'id':'../escape','stage':'secret history'}]})
+    write(Path(h)/'state.json', {'tracks':[{'id':'valid','stage':'must not archive yet'},{'id':'../escape','stage':'secret history'}]})
     old = (Path(h)/'state.json').read_bytes()
+    archives={str(p):p.read_bytes() for p in repo.rglob('*') if p.is_file()}
     try: S.migrate_track_history(h,str(repo))
     except ValueError: pass
     else: raise AssertionError('unsafe id accepted')
     assert (Path(h)/'state.json').read_bytes() == old
+    assert archives=={str(p):p.read_bytes() for p in repo.rglob('*') if p.is_file()}
 
 def empty():
     h = home(); posted=[]
@@ -199,6 +283,9 @@ def empty():
     assert len(plan['slack']) == 2, plan
     assert {i['thread_ts'] for i in plan['slack']} == {'2','3'}
     assert all(i['text']=='(turn produced no reply text)' for i in plan['slack'])
+    shared=[event('share'),event('share',addressed=True),event('other')]
+    grouped=sup.plan_deliveries(shared,'',100)['slack']
+    assert len(grouped)==1 and grouped[0]['thread_ts']=='share'
     assert sup.deliver({'slack':[{'channel':'C','thread_ts':'legacy','text':' \n'}], 'cli':[]}, ['old'],99)
     assert not posted, 'legacy pending blank reached poster'
 
@@ -212,6 +299,29 @@ def blocks():
     assert queued and queued['payload']['addressed'] and queued['payload']['instructs'] is False, queued
     text=queued['payload']['text']; assert '<@MANAGER>' in text and 'iOS build ready' in text and 'report' in text
     assert S.read_jsonl(str(Path(h)/'mirror/C.jsonl'))[-1]['text']==text
+    assert b.joined('C','10')
+    ev['ts']='families'
+    ev['blocks']=[{'type':'rich_text','elements':[
+        {'type':'rich_text_list','elements':[{'type':'rich_text_section','elements':[
+            {'type':'user','user_id':'MANAGER'},{'type':'text','text':' list-marker '}, {'type':'emoji','name':'tada'}]}]},
+        {'type':'rich_text_quote','elements':[{'type':'text','text':' quote-marker '}]},
+        {'type':'rich_text_preformatted','elements':[{'type':'text','text':' code-marker '}]}]},
+        {'type':'section','text':{'type':'mrkdwn','text':'section-marker'}},
+        {'type':'context','elements':[{'type':'plain_text','text':'context-marker'}]}]
+    rich=b.handle_message(ev); assert rich and rich['payload']['addressed']
+    for marker in ('list-marker','tada','quote-marker','code-marker','section-marker','context-marker'):
+        assert marker in rich['payload']['text'], marker
+    assert S.read_jsonl(str(Path(h)/'mirror/C.jsonl'))[-1]['text']==rich['payload']['text']
+    # Human assignment and bot command routing consume the normalized blocks too.
+    posted=[]; human=B.Bridge(h,{'U':{'instructs':True}},lambda *a:posted.append(a),{},bot_user_id='MANAGER')
+    assigned={'channel':'C','ts':'assigned','user':'U','text':'','blocks':[
+        {'type':'section','text':{'type':'plain_text','text':'assignee: manager | track: ios'}}]}
+    routed=human.handle_message(assigned)
+    assert routed and routed['payload']['instructs'] and human.joined('C','assigned')
+    assigned['ts']='command'; assigned['blocks']=[{'type':'section','text':{
+        'type':'mrkdwn','text':'<@MANAGER> status'}}]
+    command=human.handle_message(assigned)
+    assert command and command.get('command')=='status' and posted
     ev['ts']='11'; ev['text']='authoritative plain text'
     assert b.handle_message(ev) is None, 'blocks must not override nonblank text to wake a bot'
     ev['ts']='12'; ev['text']=''; ev['bot_id']='STRANGER'
@@ -235,12 +345,33 @@ def outbox():
     ack=S.post_receipt(h,rec['id'])
     assert ack and ack['status']=='posted' and ack.get('ts')=='123', ack
     assert not S.read_outbox(h)
+    # Receipt survives process reopening and interruption before queue removal.
+    item=S.queue_post(h,'C','2','interrupted'); calls=[]
+    def interrupted(home,items):
+        # Queue removal must remain protected by the existing lock.
+        lock_code="import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)"
+        held=subprocess.run([sys.executable,'-c',lock_code,S.outbox_path(home)+'.lock'],capture_output=True)
+        assert held.returncode != 0, 'queue removal outside outbox lock'
+        raise InterruptedError('after durable receipt, before removal')
+    with patch.object(S,'_write_outbox',interrupted):
+        try: S.drain_outbox(h,lambda *a:(calls.append(a) or {'ts':'456'}))
+        except InterruptedError: pass
+        else: raise AssertionError('interruption seam not reached')
+    code='import sys,json;sys.path.insert(0,sys.argv[1]);import supervisor as S;print(json.dumps(S.post_receipt(sys.argv[2],sys.argv[3])))'
+    fresh=subprocess.check_output([sys.executable,'-c',code,str(ROOT/'manager'),h,item['id']],text=True)
+    assert json.loads(fresh)['status']=='posted', 'receipt was not durable before removal'
+    S.drain_outbox(h,lambda *a:calls.append(a))
+    assert len(calls)==1 and not S.read_outbox(h), 'receipt retry reposted accepted Slack message'
+    for receipt,code in (({'status':'posted','ts':'done'},0),({'status':'failed','error':'fixture'},1)):
+        with patch.object(B,'bridge_alive',return_value=True), patch.object(S,'post_receipt',return_value=receipt):
+            assert H.cmd_post(h,['C','1','receipt'])==code
     # No queue record and no receipt is not success; emulate a CLI verification race.
     with patch.object(B,'bridge_alive',return_value=True), patch.object(S,'read_outbox',return_value=[]), \
          patch.object(S,'post_receipt',return_value=None), patch.dict(os.environ,{'HYDRA_POST_TIMEOUT':'.01'}):
         assert H.cmd_post(h,['C','1','raced']) == 1, 'CLI falsely inferred delivery from absence'
 
 if __name__=='__main__':
+    if '--serve-child' in sys.argv: serve_child()
     failures=[]
     for fn in (liveness,context,tracks,empty,blocks,outbox):
         try: fn()
