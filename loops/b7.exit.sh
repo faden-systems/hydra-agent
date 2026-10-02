@@ -8,7 +8,7 @@ fence() {
   changed=$( (git diff --name-only "$BASE"...HEAD; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
   bad=$(printf '%s\n' "$changed" | grep -Ev '^$|^manager/(bridge\.py|supervisor\.py|hydra|README\.md|CLAUDE\.md)$|^tests/manager/|^docs/notes/b7\.md$' || true)
   test -z "$bad" || fail "outside fence: $bad"
-  for f in loops/b7.md loops/b7.exit.sh loops/b7.acceptance.py; do
+  for f in loops/b7.md loops/b7.exit.sh loops/b7.acceptance.py loops/b4.acceptance.py; do
     git show "$BASE:$f" | cmp -s - "$f" || fail "exit-owned file changed: $f"
   done
 }
@@ -24,7 +24,7 @@ PYTHON="${PYTHON:-python3}"
 from pathlib import Path
 import re
 text=Path('docs/notes/b7.md').read_text()
-for section in ('Problem','Implementation','Validation','Changed assertions','SDK evidence','Deployment','Rollback'):
+for section in ('Problem','Implementation','Validation','Changed assertions','SDK evidence','Deployment','Rollback','Engine failures','Rollover'):
     match=re.search(r'^## '+re.escape(section)+r'\s*\n(.*?)(?=^## |\Z)',text,re.M|re.S)
     assert match and match.group(1).strip(), f'notes missing nonempty section: {section}'
 PYNOTES
