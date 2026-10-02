@@ -285,11 +285,26 @@ def tracks():
     before = {str(p):p.read_bytes() for p in repo.rglob('*.md')}
     S.migrate_track_history(h, str(repo))
     assert before == {str(p):p.read_bytes() for p in repo.rglob('*.md')}, 'migration duplicated history'
-    # Simulate death after archives were committed but before compact state replace.
-    write(Path(h)/'state.json', state)
-    S.migrate_track_history(h, str(repo))
-    assert before == {str(p):p.read_bytes() for p in repo.rglob('*.md')}, 'crash retry duplicated archive'
-    assert json.loads((Path(h)/'state.json').read_text()) == updated
+    # Interrupt the actual atomic state replacement and observe archive-before-state ordering.
+    crash_home=home(); crash_repo=Path(tempfile.mkdtemp(prefix='b7-crash-repo-'))
+    write(Path(crash_home)/'state.json',state);old_bytes=Path(crash_home,'state.json').read_bytes()
+    replace=os.replace; interrupted=[]
+    def crash_replace(src,dst,*args,**kwargs):
+        if Path(dst)==Path(crash_home)/'state.json':
+            interrupted.append(True)
+            assert history in (crash_repo/'factory/log/tracks/flow.md').read_text()
+            assert state['tracks'][1]['stage'] in (crash_repo/'factory/log/tracks/R1.md').read_text()
+            assert Path(crash_home,'state.json').read_bytes()==old_bytes
+            raise OSError('injected state replace failure')
+        return replace(src,dst,*args,**kwargs)
+    with patch.object(S.os,'replace',side_effect=crash_replace):
+        try:S.migrate_track_history(crash_home,str(crash_repo))
+        except OSError:pass
+    assert interrupted and Path(crash_home,'state.json').read_bytes()==old_bytes
+    saved={str(p.relative_to(crash_repo)):p.read_bytes() for p in crash_repo.rglob('*.md')}
+    S.migrate_track_history(crash_home,str(crash_repo))
+    assert saved=={str(p.relative_to(crash_repo)):p.read_bytes() for p in crash_repo.rglob('*.md')}
+    assert json.loads(Path(crash_home,'state.json').read_text())==updated
     summary = S.tracks_summary(updated)
     assert len(summary) == 2 and all('\n' not in s and len(s) <= 250 for s in summary), summary
     text = S.status_text(h, str(repo))
@@ -540,12 +555,17 @@ def ledger_failures():
     assert sup.switch_for('codex') is None
     preamble=sup.preamble_for('codex')
     assert rows[1]['at'] in preamble and rows[-1]['at'] not in preamble, preamble
+    with patch.object(sup,'transcript_source',return_value=('fixture-transcript','fixture')), \
+         patch.object(S,'flatten_codex',return_value=[]) as flatten:
+        _,record=sup.transition_read('codex','claude','2026-10-02T13:00:00Z')
+    assert record['since']==rows[0]['at']
+    assert flatten.call_args.args[1]==rows[0]['at'], 'transition window advanced by failed attempt'
     assert p.read_bytes()==original
 
 
 def rollover():
     # Real invoke/argv on temp homes only; never inspect the manager's real transcript.
-    for mode in ('success','failure','held','default','empty-config','no-handoff','bad-handoff','no-memory','memory-error','id-error'):
+    for mode in ('success','failure','held','default','empty-config','no-handoff','bad-handoff','no-memory','identical-memory','memory-error','id-error'):
         h=home();exe=Path(h)/'rollover-claude';old='old-fixture-session'
         Path(h,'session-id').write_text(old+'\n')
         transcript=Path(h)/'.claude/projects'/h.replace('/','-')/(old+'.jsonl')
@@ -556,6 +576,7 @@ def rollover():
         handoff=HANDOFF if mode not in ('no-handoff','bad-handoff') else ('---HANDOFF---\ntracks: incomplete' if mode=='bad-handoff' else '')
         memory_code=" m=pathlib.Path(os.environ['HYDRA_MEMORY_DIR'])/'MEMORY.md';m.write_text(m.read_text()+'\\nrollover memory marker\\n')\n"
         if mode=='no-memory':memory_code=' pass\n'
+        if mode=='identical-memory':memory_code=" m=pathlib.Path(os.environ['HYDRA_MEMORY_DIR'])/'MEMORY.md';m.write_bytes(m.read_bytes())\n"
         if mode=='memory-error':memory_code=" raise OSError('fixture memory write failed')\n"
         if mode=='failure':memory_code=' sys.exit(1)\n'
         exe.write_text('#!/usr/bin/env python3\nimport sys,json,os,pathlib\nprompt=sys.stdin.read()\n'
@@ -663,10 +684,54 @@ def failure_diagnostics():
             assert Path(h,'session-id').read_text()=='old\n'
 
 
+def atomic_session_replace():
+    h=home();sup=S.Supervisor(home=h,poster=lambda *a:None)
+    assert hasattr(sup,'replace_session_id'), 'atomic session replacement seam missing'
+    path=Path(h,'session-id');path.write_bytes(b'ORIGINAL-ID\n');called=[];replace=os.replace
+    def fail(src,dst,*args,**kwargs):
+        if Path(dst)==path:
+            called.append(True);assert path.read_bytes()==b'ORIGINAL-ID\n'
+            raise OSError('injected session replace failure')
+        return replace(src,dst,*args,**kwargs)
+    with patch.object(S.os,'replace',side_effect=fail):
+        try:sup.replace_session_id('new-fixture-id')
+        except OSError:pass
+        else:raise AssertionError('session replacement swallowed write failure')
+    assert called and path.read_bytes()==b'ORIGINAL-ID\n'
+
+
+def explicit_fallback_selection():
+    h=home();engines={'claude-r2d2':{'bin':'fixture'},'codex':{'bin':'fixture','kind':'codex'}}
+    S.set_engine(h,'claude-r2d2','claude-sonnet-5',engines)
+    cfg={'dev_channel':'C_EPISODE','engine_fallback':{'claude_models':[]}}
+    def supervisor():return S.Supervisor(home=h,engines=engines,config=cfg,poster=lambda *a:None)
+    def invoke(name,spec,message,model=None,preamble=''):
+        return (0,'ok','',None) if name=='codex' else (1,'','Out of usage credits',None)
+    sup=supervisor()
+    with patch.object(sup,'invoke',side_effect=invoke):sup.run_engines('first',[])
+    episode=json.loads(Path(h,'engine-runtime.json').read_text())['episode_id']
+    assert len(S.read_outbox(h))==1
+    S.set_engine(h,'claude-r2d2','claude-sonnet-5',engines)
+    def auth(name,spec,message,model=None,preamble=''):
+        return (0,'ok','',None) if name=='codex' else (1,'','HTTP 401 Unauthorized after explicit selection',None)
+    sup=supervisor()
+    with patch.object(sup,'invoke',side_effect=auth):sup.run_engines('failed explicit',[])
+    runtime=json.loads(Path(h,'engine-runtime.json').read_text())
+    assert runtime['episode_id']==episode and '401' in runtime['reason']
+    assert len(S.read_outbox(h))==1, 'failed explicit selection falsely closed/reopened episode'
+    S.set_engine(h,'codex','gpt-6-astra',engines)
+    sup=supervisor()
+    with patch.object(sup,'invoke',return_value=(0,'chosen effective','',None)):
+        sup.run_engines('close',[]);sup.run_engines('again',[])
+    notices=S.read_outbox(h);assert len(notices)==2
+    assert episode in notices[-1]['text'] and 'fallback ended' in notices[-1]['text'].lower()
+    assert notices[-1]['channel']=='C_EPISODE' and not notices[-1].get('thread_ts')
+
+
 if __name__=='__main__':
     if '--serve-child' in sys.argv: serve_child()
     failures=[]
-    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution,fallback_matrix,failure_diagnostics):
+    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution,fallback_matrix,failure_diagnostics,atomic_session_replace,explicit_fallback_selection):
         try: fn()
         except (AssertionError, Exception) as exc:
             failures.append(fn.__name__); print(f'[b7] FAIL {fn.__name__}: {type(exc).__name__}: {exc}',flush=True)

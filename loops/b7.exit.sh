@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="${BASE_REF:-origin/main}"
+BASE="${BASE_REF:?set BASE_REF to the recorded full launch commit SHA}"
 fail() { echo "[b7] FAIL: $*"; exit 1; }
 git rev-parse --verify "$BASE" >/dev/null || fail "missing base $BASE"
+[[ "$BASE" =~ ^[0-9a-f]{40}$ ]] || fail 'BASE_REF must be a full immutable commit SHA'
 fence() {
   local changed bad
   changed=$( (git diff --name-only "$BASE"...HEAD; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
