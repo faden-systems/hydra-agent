@@ -166,7 +166,7 @@ flowchart LR
   LA --> WT[Worktree]
   WT --> A1[Attempt 1, fresh: implement, run exit until PASS]
   A1 --> EX{Exit script: fence, frozen files, tests, acceptance}
-  EX -->|PASS| PU[Push loop/id, PR, auto-merge]
+  EX -->|PASS| PU[Push loop/id, open PR]
   PU --> CI[CI: run-exit check, review bot] --> MN[main + notes]
   MN --> MS[Measurement] --> EV
   EX -->|FAIL| A2[Attempt 2, continue with the exit tail]
@@ -209,8 +209,8 @@ How the coding loop works, node by node:
 6. **Asking mid-task.** With the conversation edge, an attempt can post a question to the track thread and continue
    when answered (the "return or assume" limit of scaffolded agents, removed). The answer is logged and, if it
    changes the spec, becomes a spec amendment.
-7. **Merge and after.** PASS pushes `loop/<id>`, opens the PR with auto-merge; CI runs the required `run-exit` check
-   and the review bot; merge lands `docs/notes/<id>.md` with the code. The next measurement runs on `main`, its
+7. **Merge and after.** PASS pushes `loop/<id>` and opens the PR; CI runs the required `run-exit` check
+   and the review bot; the manager verifies on a fresh clone and merges (never auto-merge, founder 2026-10-02); the merge lands `docs/notes/<id>.md` with the code. The next measurement runs on `main`, its
    evidence is committed, and the manager writes the next spec from it. That is the outer loop.
 
 What the loop deliberately does not do: talk to other coding loops (fences make them independent), touch `loops/`,
