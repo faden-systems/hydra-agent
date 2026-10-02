@@ -316,6 +316,22 @@ def tracks():
     S.migrate_track_history(h,str(repo)); assert archive.read_text()==appended
     write(Path(h)/'state.json', {'tracks':{'b' :{'now':'running','stage':'old\nhistory'}}})
     assert S.tracks_summary(json.loads((Path(h)/'state.json').read_text())) == ['b: running']
+    dh=home(); dr=Path(tempfile.mkdtemp(prefix='b7-dict-'))
+    ds={'other':{'keep':1},'tracks':{'b':{'now':'running','stage':'dict old\nhistory','owner':'manager'}}}
+    write(Path(dh)/'state.json',ds);write(Path(dh)/'config.json',{'repo':str(dr)})
+    cli_args=[sys.executable,str(ROOT/'manager/hydra'),'migrate-tracks']
+    env={**os.environ,'HYDRA_HOME':dh}
+    result=subprocess.run(cli_args,env=env,capture_output=True,text=True)
+    assert result.returncode==0,(result.stdout,result.stderr)
+    du=json.loads(Path(dh,'state.json').read_text());dt=du['tracks']['b']
+    assert du['other']==ds['other'] and dt['owner']=='manager'
+    assert dt['now']==dt['stage']=='running'
+    da=dr/dt['history_file'];assert 'dict old\nhistory' in da.read_text()
+    saved=da.read_bytes();state_saved=Path(dh,'state.json').read_bytes()
+    S.migrate_track_history(dh,str(dr))
+    result=subprocess.run(cli_args,env=env,capture_output=True,text=True)
+    assert result.returncode==0 and da.read_bytes()==saved
+    assert Path(dh,'state.json').read_bytes()==state_saved
     write(Path(h)/'state.json', {'tracks':[{'id':'valid','stage':'must not archive yet'},{'id':'../escape','stage':'secret history'}]})
     old = (Path(h)/'state.json').read_bytes()
     archives={str(p):p.read_bytes() for p in repo.rglob('*') if p.is_file()}
@@ -565,7 +581,7 @@ def ledger_failures():
 
 def rollover():
     # Real invoke/argv on temp homes only; never inspect the manager's real transcript.
-    for mode in ('success','failure','held','default','empty-config','no-handoff','bad-handoff','no-memory','identical-memory','memory-error','id-error'):
+    for mode in ('success','failure','held','default','empty-config','no-handoff','bad-handoff','no-memory','identical-memory','memory-error','id-error','rollover_intent_saved','rollover_id_replaced','rollover_state_saved'):
         h=home();exe=Path(h)/'rollover-claude';old='old-fixture-session'
         Path(h,'session-id').write_text(old+'\n')
         transcript=Path(h)/'.claude/projects'/h.replace('/','-')/(old+'.jsonl')
@@ -588,6 +604,23 @@ def rollover():
         exe.chmod(0o755);engines={'claude-r2d2':{'bin':str(exe),'cred':None}}
         sup=S.Supervisor(home=h,engines=engines,poster=lambda *a:None,buildlog_poster=lambda *a:None)
         sup.ensure_memory_layout()
+        interrupted=[]
+        if mode.startswith('rollover_'):
+            assert hasattr(sup,'persistence_checkpoint'), 'rollover crash checkpoint missing'
+            def stop(name):
+                if name==mode:interrupted.append(name);raise SystemExit('fixture process death')
+            with patch.object(sup,'persistence_checkpoint',side_effect=stop):
+                try:sup.run_compaction('force')
+                except SystemExit:pass
+            assert interrupted==[mode]
+            recovered=S.Supervisor(home=h,engines=engines,poster=lambda *a:None)
+            rc,*_=recovered.invoke('claude-r2d2',engines['claude-r2d2'],'recover','claude-sonnet-5',preamble=recovered.preamble_for('claude-r2d2'))
+            assert rc==0
+            calls=[json.loads(x) for x in Path(h,'calls').read_text().splitlines()]
+            assert len(calls)==2 and '--session-id' in calls[-1]['argv'] and '--resume' not in calls[-1]['argv']
+            new=Path(h,'session-id').read_text().strip();assert new!=old and new in calls[-1]['argv']
+            assert transcript.read_bytes()==b'OLD TRANSCRIPT SENTINEL\n'
+            continue
         if mode=='id-error':
             assert hasattr(sup,'replace_session_id'), 'atomic session replacement seam missing'
             with patch.object(sup,'replace_session_id',side_effect=OSError('fixture atomic replace failure')):sup.run_compaction('force')
@@ -606,6 +639,13 @@ def rollover():
             continue
         import uuid
         uuid.UUID(sid);assert sid!=old
+        record=sup.compaction_state()['last']
+        assert record['old_id']==old and record['new_id']==sid and record['ok'] is None,record
+        sup.verify_compaction(None)
+        assert sup.compaction_state()['last']['ok'] is None
+        sup.verify_compaction(10)
+        record=sup.compaction_state()['last']
+        assert record['ok'] is True and record['old_id']==old and record['new_id']==sid,record
         # Fail first startup, restart again, retry fresh, then resume after success.
         Path(h,'fail-start').touch()
         for fail in (True,False,False):
@@ -728,10 +768,44 @@ def explicit_fallback_selection():
     assert notices[-1]['channel']=='C_EPISODE' and not notices[-1].get('thread_ts')
 
 
+def notice_crashes():
+    for checkpoint in ('fallback_start_saved','fallback_start_queued','fallback_end_saved','fallback_end_queued'):
+        h=home(); engines={'claude-r2d2':{'bin':'fixture'},'codex':{'bin':'fixture','kind':'codex'}}
+        cfg={'dev_channel':'C_CRASH','engine_fallback':{'claude_models':[]}}
+        S.set_engine(h,'claude-r2d2','claude-fable-5-1',engines)
+        def make():return S.Supervisor(home=h,engines=engines,config=cfg,poster=lambda *a:None)
+        def invoke(name,*a,**kw):return (0,'ok','',None) if name=='codex' else (1,'','Out of usage credits',None)
+        sup=make();assert hasattr(sup,'persistence_checkpoint'),'notice checkpoint missing'
+        ending='_end_' in checkpoint
+        if ending:
+            with patch.object(sup,'invoke',side_effect=invoke):sup.run_engines('start',[])
+            S.set_engine(h,'codex','gpt-6-astra',engines)
+            sup=make()
+        hits=[]
+        def stop(name):
+            if name==checkpoint:hits.append(name);raise SystemExit('fixture process death')
+        with patch.object(sup,'invoke',side_effect=invoke),patch.object(sup,'persistence_checkpoint',side_effect=stop):
+            try:sup.run_engines('crash',[])
+            except SystemExit:pass
+        assert hits==[checkpoint],hits
+        runtime=json.loads(Path(h,'engine-runtime.json').read_text())
+        for _ in range(2):
+            sup=make()
+            with patch.object(sup,'invoke',side_effect=invoke):sup.run_engines('recover',[])
+        notices=S.read_outbox(h)
+        assert len(notices)==(2 if ending else 1),(checkpoint,notices)
+        assert sum('fallback started' in n['text'].lower() for n in notices)==1
+        if ending:assert sum('fallback ended' in n['text'].lower() for n in notices)==1
+        assert all(n['channel']=='C_CRASH' and not n.get('thread_ts') for n in notices)
+        # Start and end must carry the same stable episode id.
+        ids=[n['text'] for n in notices]
+        if not ending:assert runtime['episode_id'] in ids[0]
+
+
 if __name__=='__main__':
     if '--serve-child' in sys.argv: serve_child()
     failures=[]
-    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution,fallback_matrix,failure_diagnostics,atomic_session_replace,explicit_fallback_selection):
+    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution,fallback_matrix,failure_diagnostics,atomic_session_replace,explicit_fallback_selection,notice_crashes):
         try: fn()
         except (AssertionError, Exception) as exc:
             failures.append(fn.__name__); print(f'[b7] FAIL {fn.__name__}: {type(exc).__name__}: {exc}',flush=True)
