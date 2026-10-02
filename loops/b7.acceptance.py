@@ -163,7 +163,8 @@ def serve_child():
         print('PUMP_STOPPED',flush=True)
     with patch.object(slack_bolt,'App',App), patch.object(adapter,'SocketModeClient',Client), \
          patch.object(B.Bridge,'pump_outbox',pump):
-        rc=B.main(['--home',h])
+        try: rc=B.main(['--home',h])
+        except SystemExit as exc: rc=exc.code or 0
         for thread in threading.enumerate():
             if thread.name=='outbox': thread.join(.5); assert not thread.is_alive()
         queued=S.read_jsonl(str(Path(h)/'inbox/events.jsonl'))
