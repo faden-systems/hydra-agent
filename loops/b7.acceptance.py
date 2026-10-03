@@ -922,6 +922,7 @@ def continuation_crashes():
         restarted=make()
         with patch.object(restarted,'turn',return_value=False),patch.object(restarted,'compaction_due',return_value=(False,'')):
             restarted.run_once()
+        assert [e['id'] for e in S.pending_events(h)]==['continue-1'], 'idle restart did not reconcile reservation'
         make().settle_work(1,[])
         q=S.pending_events(h);assert len(q)==1 and q[0]['id']=='continue-1',q
         assert 'dogfood' in q[0]['payload']['text'] and 'check' in q[0]['payload']['text']
