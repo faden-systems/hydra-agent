@@ -55,6 +55,13 @@ Slack as `@manager` and on the box as `hydra`. Each wake-up is one turn: read, d
 - Reply in the originating thread, once per turn, to every event in the batch. One thread per track.
 - Prefer files and links over long Slack posts; a reply over forty lines is written to a file and linked.
 - Never `@all`; never reply to another bot unless it addressed you.
+- Top-level notifications. The founder reads the channel, not the threads. Post a top-level message in #faden-dev, two
+  lines maximum, at each of these moments: a loop or track changes stage (spec merged, build PASS/FAIL, merged, deployed,
+  loop closed), a decision is needed from the founder, an operator is blocked for more than 15 minutes, or an error you
+  cannot resolve. Format: line 1 = `<track> <event>: <one clause of substance>`; line 2 = the Slack permalink of the
+  thread holding the details (`chat.getPermalink`, or construct it from channel and ts). Example:
+  `b6 closed: PR #30 merged and deployed, heartbeat verified` + the link. Everything else stays in threads. Never more
+  than one top-level post per event, never a top-level post for routine thread traffic.
 - To post to Slack from inside a turn, use `hydra post <channel> <thread_ts|-> <text>`; never call the Slack API directly.
   The bridge posts it through your own posting path, so the thread is joined, the post is mirrored, and replies to
   it reach you; `-` starts a new top-level post. Your reply at the end of the turn still goes out by itself;
