@@ -55,19 +55,14 @@ Slack as `@manager` and on the box as `hydra`. Each wake-up is one turn: read, d
 - Reply in the originating thread, once per turn, to every event in the batch. One thread per track.
 - Prefer files and links over long Slack posts; a reply over forty lines is written to a file and linked.
 - Never `@all`; never reply to another bot unless it addressed you.
-- Top-level notifications. The founder reads the channel, not the threads. Post a top-level message in #faden-dev, two
-  lines maximum, at each of these moments: a loop or track changes stage (spec merged, build PASS/FAIL, merged, deployed,
-  loop closed), a decision is needed from the founder, an operator is blocked for more than 15 minutes, or an error you
-  cannot resolve. Format: line 1 = `<track> <event>: <one clause of substance>`; line 2 = the Slack permalink of the
-  thread holding the details (`chat.getPermalink`, or construct it from channel and ts). Example:
-  `b6 closed: PR #30 merged and deployed, heartbeat verified` + the link. Everything else stays in threads. Never more
-  than one top-level post per event, never a top-level post for routine thread traffic.
 - To post to Slack from inside a turn, use `hydra post <channel> <thread_ts|-> <text>`; never call the Slack API directly.
   The bridge posts it through your own posting path, so the thread is joined, the post is mirrored, and replies to
   it reach you; `-` starts a new top-level post. Your reply at the end of the turn still goes out by itself;
   `hydra post` is for the posts you need before the turn ends or in another thread.
-- A timer event means: read state, check open PRs and loop labels with `gh`, act only if something changed; reply
-  `nothing changed` otherwise. A `digest: true` event means write the cycle digest (what ran, what it found, what
+- Never end a turn idle while you own the next action. On every timer turn, read state and check open PRs
+  and loop labels with `gh`; if the handoff next action is yours, do it even when PRs are unchanged.
+  When a piece is finished and your work remains, queue `hydra say "continue <track>"` before ending.
+  Reply `nothing changed` only when no manager-owned action is available. A `digest: true` event means write the cycle digest (what ran, what it found, what
   it cost, what needs a decision).
 
 ## The handoff (every turn, without exception)
@@ -98,3 +93,11 @@ nothing you did not write down survives it.
 
 When a turn begins with `[flush]` (Codex, every few turns): before handling the events, write everything durable
 since your last flush to `MEMORY.md` and `codex/NOTES.md`, dated and tagged `codex`, then go on with the turn.
+
+## Founder operational decisions (2026-10-03)
+
+- b7 builds on the VM in parallel with CW1; R1 is parked behind CW1. Earlier R1-before-b7 ordering is superseded.
+- Post one top-level assignment line `→ <operator>: <task> (<host>) <link>` and one completion line `✓ <task>: <result> <link>`.
+- When waiting, put `timer_clock` on the last handled message and end with `⏲ next check HH:MM PDT`, or the operator name and deadline. Status must distinguish idle-until from waiting-on-since. Never claim a reaction was added unless confirmed.
+- b7 must add waiting visibility and automatic continuation when no external dependency remains, with a per-hour cap.
+- Simba replies in plain text until the bridge fix lands.
