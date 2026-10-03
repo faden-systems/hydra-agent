@@ -823,10 +823,174 @@ def notice_crashes():
         if not ending:assert runtime['episode_id'] in ids[0]
 
 
+
+def continuation_waiting():
+    assert hasattr(S.Supervisor, 'settle_work'), 'b7 settle_work missing'
+    h=home(); now=[1791070200.0]; added=[]; removed=[]
+    reactor=SimpleNamespace(add=lambda *a:added.append(a),remove=lambda *a:removed.append(a))
+    cfg={'continuation':{'max_per_hour':2}}
+    def make(): return S.Supervisor(home=h,config=cfg,clock=lambda:now[0],poster=lambda *a:None,reactor=reactor)
+    sup=make()
+    def work(n,mode='continue',**extra):
+        v={'turn':n,'mode':mode,'track':'dogfood','channel':'C','thread_ts':'t','message_ts':'m',
+           'next_action':'finish frozen acceptance'};v.update(extra);write(Path(h)/'work-status.json',v)
+    work(1);sup.settle_work(1,[])
+    q=S.pending_events(h);assert len(q)==1 and q[0]['id']=='continue-1',q
+    assert q[0]['payload']['instructs'] is False
+    sup.settle_work(1,[]);assert len(S.pending_events(h))==1
+    # A restarted supervisor must neither requeue nor lose the reservation.
+    make().settle_work(1,[]);assert len(S.pending_events(h))==1
+    # Use the actual public handled-file path exposed by the existing helper below.
+    def clear_pending():
+        for ev in S.pending_events(h):
+            sup.deliver({'slack':[],'cli':[]},[ev['id']],99)
+    clear_pending();now[0]+=1;work(2);make().settle_work(2,[])
+    assert [x['id'] for x in S.pending_events(h)]==['continue-2']
+    clear_pending();work(3);make().settle_work(3,[]);assert not S.pending_events(h),'hour cap lost on restart'
+    now[0]-=100;make().settle_work(3,[]);assert not S.pending_events(h),'backward clock bypassed cap'
+    now[0]+=3701;make().settle_work(3,[]);assert len(S.pending_events(h))==1
+    clear_pending()
+    for n,mode in [(4,'done'),(5,'unknown')]:
+        work(n,mode);make().settle_work(n,[]);assert not S.pending_events(h)
+    work(5);make().settle_work(6,[]);assert not S.pending_events(h),'stale status continued'
+    work(7);Path(h,'PAUSE').touch();make().settle_work(7,[]);assert not S.pending_events(h)
+    Path(h,'PAUSE').unlink()
+    S.append_event(h,event('founder-new',instructs=True));make().settle_work(7,[])
+    assert [x['id'] for x in S.pending_events(h)]==['founder-new'];clear_pending()
+    waiting=event('m');waiting['payload']['thread_ts']='t'
+    work(8,'waiting',who='Hermes',since=now[0]-60,deadline=now[0]+900)
+    make().settle_work(8,[waiting]);assert any('timer_clock' in a for a in added),added
+    status=subprocess.run([sys.executable,str(ROOT/'manager/hydra'),'status'],env={**os.environ,'HYDRA_HOME':h},capture_output=True,text=True)
+    assert status.returncode==0 and 'waiting on Hermes since' in status.stdout,status.stdout
+    work(9,'continue');make().settle_work(9,[])
+    assert any('timer_clock' in a for a in removed),removed
+    # Actual turn integration: engine writes a matching request, no test call to settle_work.
+    ih=home();payload={'turn':1,'mode':'continue','track':'dogfood','next_action':'oracle',
+                     'channel':'C','thread_ts':'t','message_ts':'m'}
+    extra='import json\nfrom pathlib import Path\nPath('+repr(str(Path(ih)/'work-status.json'))+').write_text('+repr(json.dumps(payload))+')\n'
+    integrated=S.Supervisor(home=ih,engines=fake_engine(ih,'working\n'+HANDOFF,extra),poster=lambda *a:None)
+    S.append_event(ih,event('initial',instructs=True));assert integrated.run_once()
+    assert any(x['id']=='continue-1' for x in S.pending_events(ih)), 'successful turn did not schedule next work'
+
+
+def persistence_reconciliation():
+    root=Path(tempfile.mkdtemp(prefix='b7-git-'));remote=root/'remote.git';repo=root/'manager';other=root/'other'
+    def git(path,*args,check=True):
+        return subprocess.run(['git','-C',str(path),'-c','user.name=fixture','-c','user.email=fixture@example.test',*args],check=check,capture_output=True,text=True)
+    git(root,'init','--bare',str(remote));git(root,'clone',str(remote),str(repo))
+    (repo/'seed').write_text('seed');git(repo,'add','.');git(repo,'commit','-m','seed');git(repo,'push','origin','HEAD')
+    git(root,'clone',str(remote),str(other));(other/'external').write_text('keep');git(other,'add','.');git(other,'commit','-m','external');git(other,'push','origin','HEAD')
+    h=home();write(Path(h)/'state.json',{'tracks':[]})
+    (repo/'factory').mkdir();(repo/'factory/local').write_text('keep local');git(repo,'add','.');git(repo,'commit','-m','local')
+    local=git(repo,'rev-parse','HEAD').stdout.strip();external=git(other,'rev-parse','HEAD').stdout.strip()
+    sup=S.Supervisor(home=h,repo=str(repo),poster=lambda *a:None)
+    sup.sync_repo_before();sup.persist(1)
+    assert git(repo,'merge-base','--is-ancestor',local,'HEAD',check=False).returncode==0
+    assert git(repo,'merge-base','--is-ancestor',external,'HEAD',check=False).returncode==0,'remote history absent'
+    head=git(repo,'rev-parse','HEAD').stdout.strip()
+    assert git(remote,'rev-parse','HEAD').stdout.strip()==head,'diverged commits not pushed'
+    status=json.loads(Path(h,'logs/persistence.json').read_text());assert status['status']=='synced' and status['last_successful_push_sha']==head,status
+    hook=remote/'hooks/pre-receive';hook.write_text('#!/bin/sh\nexit 1\n');hook.chmod(0o755)
+    write(Path(h)/'state.json',{'tracks':[],'changed':True});sup.persist(2)
+    failed=json.loads(Path(h,'logs/persistence.json').read_text());assert failed['status']!='synced' and failed['error']
+    pending=git(repo,'rev-parse','HEAD').stdout.strip();hook.unlink()
+    # No new state change: retry must still publish the previous local commit.
+    sup.persist(3);assert git(remote,'rev-parse','HEAD').stdout.strip()==pending
+    recovered=json.loads(Path(h,'logs/persistence.json').read_text());assert recovered['status']=='synced'
+    assert (repo/'external').read_text()=='keep' and (repo/'factory/local').read_text()=='keep local'
+
+
+
+def continuation_crashes():
+    assert hasattr(S.Supervisor,'settle_work'), 'settle_work missing'
+    for checkpoint in ('continuation_reserved','continuation_enqueued'):
+        h=home();cfg={'continuation':{'max_per_hour':1}}
+        payload={'turn':1,'mode':'continue','track':'dogfood','next_action':'check',
+                 'channel':'C','thread_ts':'t','message_ts':'m'}
+        write(Path(h)/'work-status.json',payload)
+        def make():return S.Supervisor(home=h,config=cfg,clock=lambda:1791070200,poster=lambda *a:None)
+        sup=make();assert hasattr(S,'persistence_checkpoint'),'missing crash boundary'
+        seen=[]
+        class Crash(BaseException):pass
+        def crash(name,*a,**kw):
+            if name==checkpoint:seen.append(name);raise Crash()
+        with patch.object(S,'persistence_checkpoint',side_effect=crash):
+            try:sup.settle_work(1,[])
+            except Crash:pass
+        assert seen,checkpoint+' not reached'
+        make().settle_work(1,[]);make().settle_work(1,[])
+        q=S.pending_events(h);assert len(q)==1 and q[0]['id']=='continue-1',q
+        assert 'dogfood' in q[0]['payload']['text'] and 'check' in q[0]['payload']['text']
+        sup.deliver({'slack':[],'cli':[]},['continue-1'],1)
+        payload['turn']=2;write(Path(h)/'work-status.json',payload);make().settle_work(2,[])
+        assert not S.pending_events(h),'reservation cap lost across crash'
+    for cap in (0,-1,True,'6',61):
+        h=home();write(Path(h)/'work-status.json',payload)
+        sup=S.Supervisor(home=h,config={'continuation':{'max_per_hour':cap}},poster=lambda *a:None)
+        sup.settle_work(2,[]);assert not S.pending_events(h),repr(cap)
+
+
+def waiting_delivery():
+    assert hasattr(S.Supervisor,'settle_work'),'settle_work missing'
+    for mode in ('idle','waiting','continue','done'):
+        h=home();posted=[];reactions=[]
+        payload={'turn':1,'mode':mode,'track':'dogfood','channel':'C','thread_ts':'m','message_ts':'m',
+                 'next_action':'check','deadline':1791070200,'since':1791069600,'who':'Hermes'}
+        extra='pathlib.Path('+repr(str(Path(h)/'work-status.json'))+').write_text('+repr(json.dumps(payload))+')\n'
+        reactor=SimpleNamespace(add=lambda *a:reactions.append(a),remove=lambda *a:None)
+        sup=S.Supervisor(home=h,engines=fake_engine(h,'progress\n'+HANDOFF,extra),poster=lambda *a:posted.append(a),reactor=reactor)
+        S.append_event(h,event('m',instructs=True));assert sup.run_once()
+        text='\n'.join(x[2] for x in posted)
+        if mode in ('idle','waiting'):
+            assert text.count('⏲')==1 and '16:30 PDT' in text,text
+            if mode=='waiting':assert 'waiting on Hermes' in text
+        else:assert '⏲' not in text,text
+    # Recover a failed reply: the success intent must still schedule its next action.
+    h=home();payload={'turn':1,'mode':'continue','track':'dogfood','next_action':'check',
+                     'channel':'C','thread_ts':'m','message_ts':'m'}
+    extra='pathlib.Path('+repr(str(Path(h)/'work-status.json'))+').write_text('+repr(json.dumps(payload))+')\n'
+    def fail(*a):raise RuntimeError('offline fixture')
+    sup=S.Supervisor(home=h,engines=fake_engine(h,'progress\n'+HANDOFF,extra),poster=fail)
+    S.append_event(h,event('m',instructs=True));assert sup.run_once()
+    assert not any(x['id']=='continue-1' for x in S.pending_events(h))
+    recovered=S.Supervisor(home=h,poster=lambda *a:None)
+    assert recovered.deliver_pending()
+    assert any(x['id']=='continue-1' for x in S.pending_events(h)),'recovered delivery lost settlement'
+
+
+def persistence_dirty_safety():
+    root=Path(tempfile.mkdtemp(prefix='b7-dirty-'));remote=root/'remote.git';repo=root/'manager'
+    def git(path,*args,check=True):return subprocess.run(['git','-C',str(path),'-c','user.name=fixture','-c','user.email=fixture@example.test',*args],check=check,capture_output=True,text=True)
+    git(root,'init','--bare',str(remote));git(root,'clone',str(remote),str(repo))
+    (repo/'unrelated').write_text('old');git(repo,'add','.');git(repo,'commit','-m','seed');git(repo,'push','origin','HEAD')
+    initial=git(repo,'rev-parse','HEAD').stdout
+    h=home();write(Path(h)/'state.json',{'tracks':[]})
+    sup=S.Supervisor(home=h,repo=str(repo),poster=lambda *a:None)
+    for staged in (False,True):
+        (repo/'unrelated').write_text('preserve')
+        if staged:git(repo,'add','unrelated')
+        before=git(repo,'diff','--cached','--binary').stdout
+        sup.persist(1)
+        assert git(repo,'rev-parse','HEAD').stdout==initial,'unrelated work committed'
+        assert (repo/'unrelated').read_text()=='preserve'
+        assert git(repo,'diff','--cached','--binary').stdout==before,'index altered'
+        assert json.loads(Path(h,'logs/persistence.json').read_text())['status']=='blocked'
+    # Clean the fixture only, then make two conflicting committed histories.
+    git(repo,'reset','--hard','HEAD');other=root/'other';git(root,'clone',str(remote),str(other))
+    (other/'unrelated').write_text('remote');git(other,'add','.');git(other,'commit','-m','remote');git(other,'push','origin','HEAD')
+    (repo/'unrelated').write_text('local');git(repo,'add','.');git(repo,'commit','-m','local')
+    local=git(repo,'rev-parse','HEAD').stdout
+    sup.sync_repo_before();sup.persist(2)
+    assert git(repo,'rev-parse','HEAD').stdout==local
+    assert (repo/'unrelated').read_text()=='local'
+    assert not (repo/'.git/MERGE_HEAD').exists(),'conflicted merge not aborted'
+    assert json.loads(Path(h,'logs/persistence.json').read_text())['status']=='blocked'
+
+
 if __name__=='__main__':
     if '--serve-child' in sys.argv: serve_child()
     failures=[]
-    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution,fallback_matrix,failure_diagnostics,atomic_session_replace,explicit_fallback_selection,notice_crashes):
+    for fn in (liveness,context,tracks,migration_integration,empty,blocks,outbox,engine_errors,engine_fallback,ledger_failures,rollover,attribution,fallback_matrix,failure_diagnostics,atomic_session_replace,explicit_fallback_selection,notice_crashes,continuation_waiting,persistence_reconciliation,continuation_crashes,waiting_delivery,persistence_dirty_safety):
         try: fn()
         except (AssertionError, Exception) as exc:
             failures.append(fn.__name__); print(f'[b7] FAIL {fn.__name__}: {type(exc).__name__}: {exc}',flush=True)
