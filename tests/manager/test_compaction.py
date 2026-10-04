@@ -1,7 +1,15 @@
-"""The compaction policy (loops/b4.md): input tokens recorded from the engine's usage; triggers by tokens and by
-bytes; the `[compaction]` turn then `/compact` on the same session; the ledger entry; the failure path (one buildlog
-post, the session kept, a back-off); quiet hours and the 25% override in the configured timezone; the Codex periodic
-flush; `hydra compact` and `@manager compact`; the status line."""
+"""The compaction/rollover policy (loops/b4.md, amended by loops/b7.md requirement 13): context tokens recorded
+from the engine's first-request usage; triggers by tokens and by bytes; a `[compaction]` turn writes durable memory
+on the same session, then, only once it produces a valid five-line handoff and actually changes MEMORY.md's bytes,
+the session id is atomically replaced with a new UUID (never `/compact`); the failure path (one buildlog post, the
+old id kept, a back-off); quiet hours and the 25% override in the configured timezone; the Codex periodic flush;
+`hydra compact` and `@manager compact`; the status line.
+
+Changed for b7 (documented in docs/notes/b7.md "Changed assertions"): the engine fixture performs a memory write
+and a session-id rollover instead of `/compact`; assertions read `sup.compaction_state()['last']` (old_id/new_id/
+ok) instead of a ledger "compaction" value, since a failed rollover is recorded in logs/attempts.jsonl rather than
+the family-turn ledger; turns.jsonl records `context_tokens`, not just `input_tokens`; offline fixtures set
+`compaction.rollover_enabled: true` since automatic rollover now defaults held/disabled."""
 import datetime as dt
 import json
 import os
@@ -33,18 +41,29 @@ class Poster:
         self.posted.append((channel, thread_ts, text))
 
 
-def fake_claude(dir_, tokens=None, after_tokens=40000, fail_compact=False, name="claude", json_out=False):
-    """Records argv/stdin; reports `tokens` input tokens until a successful `/compact`, then `after_tokens`;
-    `/compact` exits 1 when fail_compact; a `[compaction]` turn replies `compacted`."""
+def fake_claude(dir_, tokens=None, after_tokens=40000, fail_compact=False, name="claude", json_out=False,
+                fail_message="usage limit reached"):
+    """Records argv/stdin; reports `tokens` input tokens until a successful rollover, then `after_tokens` (the
+    new session is told apart from the original `sess-test` fixture id by `--session-id` not matching it). The
+    `[compaction]` turn writes MEMORY.md and the five-line handoff; it fails (exit 1, `fail_message` on stderr)
+    when `fail_compact`."""
     p = os.path.join(dir_, name)
     lines = ["#!/usr/bin/env python3", "import sys, os, json",
              "msg = sys.stdin.read() if not sys.stdin.isatty() else ''",
              f"D = {dir_!r}",
              "open(D + '/calls.jsonl', 'a').write(json.dumps({'argv': sys.argv[1:], 'stdin': msg}) + '\\n')",
-             "if '/compact' in sys.argv[1:]:",
-             f"    sys.exit(1) if {fail_compact!r} else (open(D + '/compacted', 'w').write('1'), sys.exit(0))",
+             "assert '/compact' not in sys.argv, 'obsolete compaction invocation'",
              "if '[compaction]' in msg:",
-             "    print('compacted'); sys.exit(0)",
+             f"    if {fail_compact!r}:",
+             f"        print({fail_message!r}, file=sys.stderr); sys.exit(1)",
+             "    from pathlib import Path",
+             "    m = Path(os.environ['HYDRA_MEMORY_DIR']) / 'MEMORY.md'",
+             "    m.write_text(m.read_text() + '\\nfixture memory flushed\\n')",
+             "    print('compacted\\n---HANDOFF---\\ntracks: t1\\nwaiting on: none\\nlast decision: flush\\n"
+             "next action: resume\\nopen question: none')",
+             "    sys.exit(0)",
+             "if '--session-id' in sys.argv and sys.argv[sys.argv.index('--session-id') + 1] != 'sess-test':",
+             "    open(D + '/compacted', 'w').write('1')",
              f"n = {after_tokens} if os.path.exists(D + '/compacted') else {tokens!r}"]
     if json_out:
         lines += ["usage = {'input_tokens': n - 10, 'cache_read_input_tokens': 10, 'output_tokens': 7} if n else {}",
@@ -61,7 +80,7 @@ def fake_claude(dir_, tokens=None, after_tokens=40000, fail_compact=False, name=
 
 def config(home, **over):
     cfg = {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "quiet_hours": [2, 5],
-           "quiet_hours_tz": "UTC"}
+           "quiet_hours_tz": "UTC", "rollover_enabled": True}
     cfg.update(over)
     open(os.path.join(home, "config.json"), "w").write(json.dumps({"compaction": cfg}))
 
@@ -78,25 +97,25 @@ def turns(home):
     return S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))
 
 
-def ledger_compactions(sup):
-    return [e["compaction"] for e in S.read_ledger(sup.memory_dir) if "compaction" in e]
-
-
 def compact_calls(d):
-    return [c for c in calls(d) if "/compact" in c["argv"]]
+    """Attempts of the `[compaction]` memory-writing turn (never a literal `/compact`, requirement 13)."""
+    return [c for c in calls(d) if "[compaction]" in c["stdin"]]
 
 
 # ----------------------------------------------------------------------------------------------- usage parsing
 
 def test_usage_from_text_and_json_output(home, tmp_path):
+    """Changed for b7 (requirement 3, loops/b7.md): usage now also carries `context_tokens`, the first request's
+    usage alone; a single legacy `[usage]` line or a non-stream JSON result still parse, documented in
+    docs/notes/b7.md "Changed assertions"."""
     text = "REPLY: ok\n[usage] input_tokens=1234 output_tokens=5\n---HANDOFF---\ntracks: x\n"
     out, usage, is_error, sid = S.Supervisor._parse_claude_output(text)
     assert "[usage]" not in out and out.startswith("REPLY: ok") and "---HANDOFF---" in out
-    assert usage == {"tokens": 1239, "input_tokens": 1234}
+    assert usage == {"tokens": 1239, "input_tokens": 1234, "context_tokens": 1234}
     js = json.dumps({"result": "r", "usage": {"input_tokens": 5, "cache_creation_input_tokens": 20,
                                                  "cache_read_input_tokens": 100, "output_tokens": 7}, "session_id": "s1"})
     out, usage, is_error, sid = S.Supervisor._parse_claude_output(js)
-    assert out == "r" and usage == {"tokens": 132, "input_tokens": 125} and sid == "s1"
+    assert out == "r" and usage == {"tokens": 132, "input_tokens": 125, "context_tokens": None} and sid == "s1"
     assert S.Supervisor._parse_claude_output("plain")[1] is None
 
 
@@ -124,15 +143,20 @@ def test_config_defaults_and_overrides(home, poster):
 # ----------------------------------------------------------------------------------------------- triggers and the run
 
 def test_over_threshold_schedules_defers_then_runs_in_quiet_hours(home, tmp_path):
+    """Changed for b7 (requirement 13, loops/b7.md): the `[compaction]` turn is followed by an atomic session-id
+    rollover, not a separate `claude -p --resume ... /compact` call, so the real turn after it is `cs[i+1]`, not
+    `cs[i+2]`, and it starts the new id with `--session-id` (never `--resume`). Outcome fields (before/after
+    tokens, old/new id, ok) now live in `sup.compaction_state()['last']`, not a ledger "compaction" value."""
     config(home)
     clock = Clock(); blog = Poster()
     sup, d = make(home, tmp_path, 350000, clock=clock, blog=blog)
     queue_event(home, "one"); assert sup.run_once() is True
-    assert turns(home)[-1]["input_tokens"] == 350000 and sup.compaction_pending() is True
+    assert turns(home)[-1]["context_tokens"] == 350000 and sup.compaction_pending() is True
     queue_event(home, "two"); assert sup.run_once() is True
     assert not compact_calls(d), "under 25% over the threshold and outside quiet hours: deferred"
     assert sup.compaction_pending() is True
     clock.set(2026, 10, 3, 3, 0, 0)
+    old_sid = open(os.path.join(home, "session-id")).read().strip()
     queue_event(home, "three"); assert sup.run_once() is True
     cs = calls(d)
     i = next(i for i, c in enumerate(cs) if "[compaction]" in c["stdin"])
@@ -140,25 +164,27 @@ def test_over_threshold_schedules_defers_then_runs_in_quiet_hours(home, tmp_path
     assert "update MANAGER-HANDOFF.md, then reply only `compacted`" in cs[i]["stdin"]
     assert "[memory]" not in cs[i]["stdin"], "the compaction turn is the bare instruction"
     argv = cs[i]["argv"]
-    assert argv[argv.index("--resume") + 1] == "sess-test" and "--model" in argv
-    comp = cs[i + 1]
-    assert "/compact" in comp["argv"] and comp["argv"][comp["argv"].index("--resume") + 1] == "sess-test" and comp["stdin"] == ""
-    assert "[compaction]" not in cs[i + 2]["stdin"] and "three" in cs[i + 2]["stdin"], "then the real turn"
-    # the turn after compaction reports the reduced count: verified and recorded
-    rec = ledger_compactions(sup)[-1]
+    assert argv[argv.index("--resume") + 1] == old_sid and "--model" in argv
+    assert "[compaction]" not in cs[i + 1]["stdin"] and "three" in cs[i + 1]["stdin"], "then the real turn"
+    new_sid = open(os.path.join(home, "session-id")).read().strip()
+    assert new_sid != old_sid, "rollover must select a new session id"
+    real_argv = cs[i + 1]["argv"]
+    assert real_argv[real_argv.index("--session-id") + 1] == new_sid, "the fresh session starts with --session-id"
+    # the turn after rollover reports the reduced count: verified and recorded
+    rec = sup.compaction_state()["last"]
     assert rec["before_tokens"] == 350000 and rec["after_tokens"] == 40000 and rec["ok"] is True and rec["at"]
-    assert rec["reason"] == "tokens"
-    assert turns(home)[-1]["input_tokens"] == 40000 and sup.compaction_pending() is False
+    assert rec["reason"] == "tokens" and rec["old_id"] == old_sid and rec["new_id"] == new_sid
+    assert turns(home)[-1]["context_tokens"] == 40000 and sup.compaction_pending() is False
     assert blog.posted == []
     kinds = [t.get("kind") for t in turns(home)]
     assert kinds.count("compaction") == 1 and turns(home)[-1].get("kind") is None
     led = S.read_ledger(sup.memory_dir)
     assert any(e.get("kind") == "compaction" for e in led), "the compaction turn has its own ledger line"
-    assert open(os.path.join(home, "session-id")).read().strip() == "sess-test"
     assert "last compaction:" in S.status_text(home) and "(350000 -> 40000)" in S.status_text(home)
 
 
 def test_far_over_threshold_runs_immediately(home, tmp_path):
+    """Changed for b7: no separate `/compact` call, so the real "two" turn is stdins[2], not stdins[3]."""
     config(home)
     sup, d = make(home, tmp_path, 740000)
     queue_event(home, "one"); assert sup.run_once() is True
@@ -166,7 +192,7 @@ def test_far_over_threshold_runs_immediately(home, tmp_path):
     queue_event(home, "two"); assert sup.run_once() is True
     assert len(compact_calls(d)) == 1
     stdins = [c["stdin"] for c in calls(d)]
-    assert "[compaction]" in stdins[1] and "two" in stdins[3]
+    assert "[compaction]" in stdins[1] and "two" in stdins[2]
 
 
 def test_exactly_25_percent_is_immediate(home, tmp_path):
@@ -195,6 +221,8 @@ def test_quiet_hours_in_the_configured_timezone(home, tmp_path):
 
 
 def test_session_file_over_max_bytes_schedules(home, tmp_path):
+    """Changed for b7: the outcome is read from `compaction_state()['last']`; growth is tracked against the
+    *new* session's transcript after rollover, since the old one is left byte-for-byte untouched."""
     config(home, max_bytes=1000)
     sd = os.path.join(home, ".claude", "projects", home.replace("/", "-")); os.makedirs(sd)
     open(os.path.join(sd, "sess-test.jsonl"), "w").write("x" * 5000)
@@ -204,11 +232,15 @@ def test_session_file_over_max_bytes_schedules(home, tmp_path):
     assert json.load(open(os.path.join(home, "logs", "compaction.json")))["pending"]["reason"] == "bytes"
     queue_event(home, "two"); assert sup.run_once() is True
     assert len(compact_calls(d)) == 1, "5000 over 1000 is more than 25% over: immediate"
+    new_sid = open(os.path.join(home, "session-id")).read().strip()
+    assert new_sid != "sess-test"
+    open(os.path.join(sd, f"{new_sid}.jsonl"), "w").write("")
     queue_event(home, "three"); assert sup.run_once() is True
     assert sup.compaction_pending() is False, "the file cannot shrink: bytes re-trigger only after max_bytes more growth"
-    rec = ledger_compactions(sup)[-1]
+    rec = sup.compaction_state()["last"]
     assert rec["reason"] == "bytes" and rec["before_tokens"] == 1000 and rec["ok"] is True
-    open(os.path.join(sd, "sess-test.jsonl"), "a").write("y" * 1500)
+    assert open(os.path.join(sd, "sess-test.jsonl")).read() == "x" * 5000, "the old transcript is untouched"
+    open(os.path.join(sd, f"{new_sid}.jsonl"), "a").write("y" * 1500)
     queue_event(home, "four"); assert sup.run_once() is True
     assert sup.compaction_pending() is True
 
@@ -223,18 +255,21 @@ def test_no_usage_means_no_token_trigger(home, tmp_path):
 # ----------------------------------------------------------------------------------------------- failure
 
 def test_failed_compact_posts_once_keeps_the_session_and_backs_off(home, tmp_path):
+    """Changed for b7: the memory-writing turn fails this time (`fail_compact`), so no rollover happens and no
+    `kind=compaction` entry reaches turns.jsonl (requirement 13: a failed attempt belongs in attempts.jsonl, not
+    the family-turn ledger) -- five queued events still produce five turns.jsonl rows, not six."""
     config(home)
     clock = Clock(); blog = Poster()
     sup, d = make(home, tmp_path, 740000, clock=clock, blog=blog, fail_compact=True)
     for i in range(5):
         queue_event(home, f"t{i}"); assert sup.run_once() is True
     assert open(os.path.join(home, "session-id")).read().strip() == "sess-test"
-    assert len(compact_calls(d)) == 1, "after a failure the supervisor backs off instead of compacting every turn"
-    assert len(blog.posted) == 1 and "compaction" in blog.posted[0][2].lower() and "sess-test" in blog.posted[0][2]
-    rec = ledger_compactions(sup)[-1]
-    assert rec["ok"] is False and rec["after_tokens"] is None and rec["before_tokens"] == 740000 and rec["error"]
+    assert len(compact_calls(d)) == 1, "after a failure the supervisor backs off instead of retrying every turn"
+    assert len(blog.posted) == 1 and "rollover" in blog.posted[0][2].lower() and "sess-test" in blog.posted[0][2]
+    rec = sup.compaction_state()["last"]
+    assert rec["ok"] is False and rec.get("after_tokens") is None and rec["before_tokens"] == 740000 and rec["error"]
     assert sup.compaction_pending() is True, "still over the threshold"
-    assert len(turns(home)) == 6 and sum(1 for t in turns(home) if t.get("kind") == "compaction") == 1
+    assert len(turns(home)) == 5 and sum(1 for t in turns(home) if t.get("kind") == "compaction") == 0
     assert "(740000 -> failed)" in S.status_text(home)
     # after the back-off it tries again, without a second post
     clock.now = clock.now + dt.timedelta(hours=7)
@@ -243,30 +278,37 @@ def test_failed_compact_posts_once_keeps_the_session_and_backs_off(home, tmp_pat
 
 
 def test_no_reduction_after_compact_is_a_failure(home, tmp_path):
+    """The memory turn and rollover succeed; the next measured turn still shows context over the threshold, so
+    verification alone marks it a failure (requirement 13: a successful memory-write alone cannot claim a
+    reduction)."""
     config(home)
     blog = Poster()
     sup, d = make(home, tmp_path, 740000, blog=blog, after_tokens=600000)
     for i in range(3):
         queue_event(home, f"t{i}"); assert sup.run_once() is True
-    rec = ledger_compactions(sup)[-1]
+    rec = sup.compaction_state()["last"]
     assert rec["ok"] is False and rec["after_tokens"] == 600000 and rec["before_tokens"] == 740000
+    assert rec["old_id"] == "sess-test" and rec["new_id"] and rec["new_id"] != "sess-test"
     assert len(blog.posted) == 1 and "600000" in blog.posted[0][2]
 
 
 def test_failed_compaction_turn_skips_compact_and_posts(home, tmp_path):
+    """Changed for b7: the `[compaction]` turn itself fails with a classifiable (quota-like) error; no rollover
+    is attempted, the old session id is kept, and the failure is recorded in logs/attempts.jsonl (requirement
+    11/12), not the family-turn ledger."""
     config(home)
     d = tmp_path / "cl"; d.mkdir()
-    eng = fake_claude(str(d), tokens=740000)
-    # the [compaction] turn itself fails (quota) by making the engine exit 1 on it
-    src = open(eng).read().replace("print('compacted'); sys.exit(0)", "print('usage limit', file=sys.stderr); sys.exit(1)")
-    open(eng, "w").write(src)
+    eng = fake_claude(str(d), tokens=740000, fail_compact=True, fail_message="usage limit reached")
     blog = Poster()
     sup = S.Supervisor(home=home, engines=engines(eng), poster=Poster(), clock=Clock(), buildlog_poster=blog)
     for i in range(3):
         queue_event(home, f"t{i}"); assert sup.run_once() is True
-    assert not compact_calls(str(d)) and len(blog.posted) == 1
+    assert len(compact_calls(str(d))) == 1 and len(blog.posted) == 1
     assert open(os.path.join(home, "session-id")).read().strip() == "sess-test"
-    assert ledger_compactions(sup)[-1]["ok"] is False
+    assert sup.compaction_state()["last"]["ok"] is False
+    attempts = S.read_jsonl(os.path.join(home, "logs", "attempts.jsonl"))
+    failed = [a for a in attempts if a.get("success") is False]
+    assert len(failed) == 1 and failed[0]["classification"] == "usage_limit"
 
 
 # ----------------------------------------------------------------------------------------------- forcing
@@ -282,7 +324,7 @@ def test_forced_compaction_runs_on_the_next_tick_even_without_events(home, tmp_p
     assert len(compact_calls(d)) == 1 and not os.path.exists(os.path.join(home, "COMPACT"))
     assert sup.run_once() is False
     queue_event(home, "after"); assert sup.run_once() is True
-    rec = ledger_compactions(sup)[-1]
+    rec = sup.compaction_state()["last"]
     assert rec["reason"] == "forced" and rec["ok"] is True and rec["before_tokens"] == 1000
 
 

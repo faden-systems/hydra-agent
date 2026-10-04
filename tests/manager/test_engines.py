@@ -38,8 +38,12 @@ def test_absolute_cred_path_and_token_from_file(home, ok_engine, poster, tmp_pat
 
 
 def test_quota_rotates_persists_and_notes(home, quota_engine, ok_engine, poster):
+    """`engine_fallback.claude_models` defaults to `[claude-sonnet-5]` (requirement 12, loops/b7.md): disabled
+    here so this stays a test of plain account rotation, not the same-account model retry covered separately
+    in loops/b7.acceptance.py (engine_fallback/fallback_matrix)."""
     queue_event(home, "hello")
-    sup = S.Supervisor(home=home, engines=engines(quota_engine, ok_engine), poster=poster)
+    sup = S.Supervisor(home=home, engines=engines(quota_engine, ok_engine), poster=poster,
+                       config={"engine_fallback": {"claude_models": []}})
     assert sup.run_once() is True
     assert "engine: claude-l (claude-fable-5-1)" in poster.texts and "handled 1 events" in poster.texts
     assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-fable-5-1"}, "the switch is persisted as JSON"
