@@ -80,6 +80,7 @@ RATE_LIMIT_RE = re.compile(r"\brate[\s-]?limit(?:ed)?\b|\b429\b", re.IGNORECASE)
 PROMPT_TOO_LONG_RE = re.compile(r"\bprompt\s+(?:is\s+)?too long\b", re.IGNORECASE)
 FAILURE_REASON_MAX = 4000
 LONG_REPLY_LINES = 40
+NO_REPLY_PLACEHOLDER = "(turn produced no reply text)"
 LONG_REPLY_HEAD = 15
 TIMER_EVERY_S = 900
 LOOP_SLEEP_S = 5
@@ -1801,6 +1802,9 @@ class Supervisor:
         if name == "codex" or spec.get("kind") == "codex":
             return self.invoke_codex(spec, message, model, preamble)
         if preamble:
+            handoff_text = self.read_handoff()
+            if handoff_text:
+                preamble = preamble + "\n\n# MANAGER-HANDOFF.md\n" + handoff_text.rstrip()
             message = preamble + "\n\n" + message
         sid = self.session_id()
         resume = bool(sid) and self._resume_allowed(sid)
@@ -2426,11 +2430,16 @@ class Supervisor:
         return f"{head}\n… full reply ({len(lines)} lines): {link}"
 
     def plan_deliveries(self, events, reply, n):
-        """[{channel, thread_ts, text}] for Slack threads and [{id, text}] for console events."""
+        """[{channel, thread_ts, text}] for Slack threads and [{id, text}] for console events. A blank reply
+        (#32, requirement 6, loops/b7.md) is never posted: a thread whose events are purely indirect/informational
+        is skipped; a thread touched by an `instructs:true` sender or a mention of the manager gets
+        NO_REPLY_PLACEHOLDER instead. Decided per thread, not globally, across a mixed batch. CLI replies keep
+        their existing semantics (the text, blank or not, always reaches the reply file)."""
+        blank = not reply.strip()
         text = reply
-        if reply.count("\n") + 1 > LONG_REPLY_LINES:
+        if not blank and reply.count("\n") + 1 > LONG_REPLY_LINES:
             text = self.long_reply_link(reply, n)
-        slack, cli, seen = [], [], set()
+        order, authoritative, cli = [], {}, []
         for ev in events:
             p = _payload(ev)
             if ev.get("source") == "cli":
@@ -2441,10 +2450,23 @@ class Supervisor:
             if not channel:
                 continue
             key = (channel, p.get("thread_ts"))
-            if key in seen:
+            is_authoritative = bool(p.get("instructs")) or bool(p.get("addressed"))
+            if key not in authoritative:
+                order.append(key)
+                authoritative[key] = is_authoritative
+            elif is_authoritative:
+                authoritative[key] = True
+        slack = []
+        for key in order:
+            channel, thread_ts = key
+            if blank:
+                if authoritative[key]:
+                    slack.append({"channel": channel, "thread_ts": thread_ts, "text": NO_REPLY_PLACEHOLDER})
+                    log(f"turn {n}: no reply text, placeholder sent")
+                else:
+                    log(f"turn {n}: no reply text, delivery skipped")
                 continue
-            seen.add(key)
-            slack.append({"channel": channel, "thread_ts": p.get("thread_ts"), "text": text})
+            slack.append({"channel": channel, "thread_ts": thread_ts, "text": text})
         return {"slack": slack, "cli": cli}
 
     def deliver(self, deliveries, event_ids, n):
@@ -2457,7 +2479,10 @@ class Supervisor:
         try:
             while pending["slack"]:
                 item = pending["slack"][0]
-                self.post_and_note(item["channel"], item["thread_ts"], item["text"], n)
+                if not (item.get("text") or "").strip():  # a legacy pending blank (requirement 6, loops/b7.md)
+                    log(f"turn {n}: no reply text, delivery skipped")
+                else:
+                    self.post_and_note(item["channel"], item["thread_ts"], item["text"], n)
                 pending["slack"].pop(0)
                 self.react_delivered(event_ids, item["channel"], item["thread_ts"])
             while pending["cli"]:
