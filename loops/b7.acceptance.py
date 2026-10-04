@@ -60,7 +60,7 @@ def liveness():
             self.connected = False
             self.reconnects = 0
         def is_connected(self): return self.connected
-        def connect_to_new_endpoint(self):
+        def connect_to_new_endpoint(self, force=False):
             self.reconnects += 1
             raise RuntimeError('offline-fixture')
         def close(self): pass
@@ -84,12 +84,14 @@ def liveness():
     # timeout or a disconnected return must fail the service main thread.
     for mode in ('success', 'disconnected', 'timeout'):
         handler = Handler(); stop = threading.Event(); release = threading.Event()
-        def recover(mode=mode, client=handler.client):
+        def recover(force=False, mode=mode, client=handler.client):
             client.reconnects += 1
             if mode == 'timeout': release.wait(1)
             elif mode == 'success':
                 client.connected = True
-                threading.Timer(.02, stop.set).start()
+                client.current_session = SimpleNamespace(last_ping_pong_time=None)
+                threading.Timer(.005, lambda: setattr(client.current_session, 'last_ping_pong_time', time.time())).start()
+                threading.Timer(.03, stop.set).start()
         handler.client.connect_to_new_endpoint = recover
         started = time.monotonic()
         try:
@@ -153,7 +155,7 @@ def serve_child():
                 'type':'message','user':'U','channel':'C','ts':'child','text':'<@M> report'}})
             for listener in list(self.socket_mode_request_listeners): listener(self,req)
         def is_connected(self): return False
-        def connect_to_new_endpoint(self):
+        def connect_to_new_endpoint(self, force=False):
             print('RECOVERY_ATTEMPT',flush=True)
             raise RuntimeError('fixture recovery failure')
         def send_socket_mode_response(self,response): print('ACKED',flush=True)

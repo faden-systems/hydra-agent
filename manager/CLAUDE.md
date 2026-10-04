@@ -68,7 +68,7 @@ Slack as `@manager` and on the box as `hydra`. Each wake-up is one turn: read, d
   `hydra post` is for the posts you need before the turn ends or in another thread.
 - Never end a turn idle while you own the next action. On every timer turn, read state and check open PRs
   and loop labels with `gh`; if the handoff next action is yours, do it even when PRs are unchanged.
-  When a piece is finished and your work remains, queue `hydra say "continue <track>"` before ending.
+  Founder override (2026-10-04): until the b7 flooding repair is deployed, never queue continuations with `hydra say`. Advance owned work on timer turns; put progress in the track thread with `hydra post`. After deployment use the capped self-event scheduler, never impersonate founder console input.
   Reply `nothing changed` only when no manager-owned action is available. A `digest: true` event means write the cycle digest (what ran, what it found, what
   it cost, what needs a decision).
 
