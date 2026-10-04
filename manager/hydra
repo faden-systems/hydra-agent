@@ -22,6 +22,9 @@
                                commit. The git steps run as hydra (`sudo -n -u hydra -H git` when root); the copy,
                                the link and the restarts need root: run as anyone else, it stops after the git
                                steps and prints `sudo -n hydra update` for the rest.
+  hydra usage                  context_tokens=<N|unknown> for the last measured Claude turn (loops/b7.md)
+  hydra migrate-tracks         mechanical track migration: short `now` on every track, complete legacy stage
+                               archived to factory/log/tracks/<id>.md (loops/b7.md)
 
 Honours HYDRA_HOME (default /srv/hydra/manager); `update` also honours HYDRA_REPO (default
 /srv/hydra/repos/hydra-agent) and HYDRA_APP (default /srv/hydra/manager/app/manager), and HYDRA_FAKE_UID (an
@@ -128,6 +131,24 @@ def cmd_engine(home, args):
     return 0
 
 
+def cmd_usage(home, args):
+    sup = S.Supervisor(home=home, poster=lambda *a: None)
+    ctx = sup.last_claude_context_tokens()
+    print(f"context_tokens={ctx if ctx is not None else 'unknown'}")
+    return 0
+
+
+def cmd_migrate_tracks(home, args):
+    cfg = S.load_config(home)
+    repo = cfg.get("repo")
+    if not repo:
+        print("migrate-tracks: no repo configured; nothing to archive (0 track(s) touched)")
+        return 0
+    changed = S.migrate_track_history(home, repo) or 0
+    print(f"migrate-tracks: {changed} track(s) migrated")
+    return 0
+
+
 def cmd_pause(home, args):
     reason = " ".join(args) if args else who()
     S.write_text(os.path.join(home, "PAUSE"), reason + "\n")
@@ -231,13 +252,13 @@ def cmd_post(home, args):
     timeout = float(os.environ.get("HYDRA_POST_TIMEOUT", "30"))
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not any(it.get("id") == rec["id"] for it in S.read_outbox(home)):
-            failed = next((it for it in S.read_jsonl(S.outbox_failed_path(home)) if it.get("id") == rec["id"]), None)
-            if failed:
-                print(f"post failed after {failed.get('attempts')} attempts: {failed.get('error')}", file=sys.stderr)
-                return 1
-            print(f"posted to {channel}/{thread_ts or '-'}")
-            return 0
+        receipt = S.post_receipt(home, rec["id"])
+        if receipt is not None:
+            if receipt.get("status") == "posted":
+                print(f"posted to {channel}/{thread_ts or '-'}")
+                return 0
+            print(f"post failed: {receipt.get('error')}", file=sys.stderr)
+            return 1
         time.sleep(0.2)
     print(f"post {rec['id']} still queued after {timeout:.0f}s; the bridge posts it when it catches up", file=sys.stderr)
     return 1
@@ -342,7 +363,7 @@ def cmd_update(home, args):
 
 COMMANDS = {"status": cmd_status, "say": cmd_say, "logs": cmd_logs, "tail": cmd_tail, "engine": cmd_engine,
             "pause": cmd_pause, "resume": cmd_resume, "attach": cmd_attach, "compact": cmd_compact, "post": cmd_post,
-            "update": cmd_update}
+            "update": cmd_update, "usage": cmd_usage, "migrate-tracks": cmd_migrate_tracks}
 
 
 def main(argv):
