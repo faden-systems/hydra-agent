@@ -118,9 +118,11 @@ it; it never infers this from Slack text). It is the explicit scheduling input f
  "deadline": <for idle/waiting: a UTC epoch>, "who": "<for waiting: who you're waiting on>", "since": <UTC epoch>}
 ```
 
-- `continue`: you own the next action and no external dependency remains; the supervisor reserves and queues an
-  informational `continue <track>: <next_action>` event for you (capped per hour; it carries no new authority).
-  Prefer this over manually queuing `hydra say "continue <track>"` when nothing but your own next step is missing.
+- `continue`: you own the next action and no external dependency remains; the supervisor reserves and queues a
+  capped, informational `continue <track>: <next_action>` event for you itself (source `self`, `instructs:false`;
+  it carries no new authority). Never queue this yourself with `hydra say` -- that command is for the founder's
+  own input, not for self-scheduled continuation (see the founder override below); just write an accurate
+  `work-status.json` and the scheduler does the rest.
 - `idle`/`waiting`: you are blocked on a deadline or on someone (`who`); the supervisor appends a `⏲ next check
   HH:MM PDT` (idle) or `⏲ waiting on <who>; next check HH:MM PDT` (waiting) footer to your reply itself and puts a
   `timer_clock` reaction on the message named by `channel`/`message_ts` -- do not write that footer yourself, and

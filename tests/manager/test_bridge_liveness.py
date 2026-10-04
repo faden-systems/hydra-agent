@@ -114,7 +114,7 @@ def test_run_socket_mode_connects_once_and_wires_the_raw_listener():
 
 def test_run_socket_mode_raises_on_disconnected_after_reconnect():
     client = make_client(connected=False)
-    client.connect_to_new_endpoint = lambda: None  # returns without reconnecting
+    client.connect_to_new_endpoint = lambda force=False: None  # returns without reconnecting
     handler = FakeHandler(client)
     with pytest.raises(Exception):
         B.run_socket_mode(handler, threading.Event(), clock=time.monotonic, poll_s=0.001, reconnect_timeout_s=0.05)
@@ -124,7 +124,7 @@ def test_run_socket_mode_raises_on_reconnect_timeout():
     client = make_client(connected=False)
     release = threading.Event()
 
-    def slow_reconnect():
+    def slow_reconnect(force=False):
         release.wait(2)
     client.connect_to_new_endpoint = slow_reconnect
     handler = FakeHandler(client)
@@ -139,7 +139,7 @@ def test_run_socket_mode_raises_on_reconnect_timeout():
 
 def test_run_socket_mode_raises_on_reconnect_exception():
     client = make_client(connected=False)
-    client.connect_to_new_endpoint = lambda: (_ for _ in ()).throw(RuntimeError("fixture"))
+    client.connect_to_new_endpoint = lambda force=False: (_ for _ in ()).throw(RuntimeError("fixture"))
     handler = FakeHandler(client)
     with pytest.raises(RuntimeError, match="fixture"):
         B.run_socket_mode(handler, threading.Event(), clock=time.monotonic, poll_s=0.001, reconnect_timeout_s=0.05)
@@ -157,9 +157,12 @@ def test_run_socket_mode_watchdog_timeout_recovers_and_keeps_monitoring():
     # the poll loop checks health every poll_s "seconds" of our fake clock; drive it externally
     attempts = []
 
-    def flaky_reconnect():
+    def flaky_reconnect(force=False):
         attempts.append(1)
         client.is_connected = lambda: True
+        # B4 repair: a forced reconnect alone is not proof of a working replacement, so the grace-verification
+        # needs genuinely fresh activity -- a changed pong -- or it would otherwise wait out its bounded grace.
+        client.current_session = SimpleNamespace(last_ping_pong_time=time.time())
     client.connect_to_new_endpoint = flaky_reconnect
 
     def driver():

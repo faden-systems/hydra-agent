@@ -484,6 +484,24 @@ def read_reactions_state(home):
     return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
 
 
+def _normalize_work_reaction(data):
+    """{"applied": [(channel, ts, name), ...], "desired": (channel, ts, name) or None} from either the current
+    shape or a pre-S1 single-record one (requirement 18, loops/b7.md: S1), so a direct legacy-shape read or
+    write is interpreted the same way as the new multi-target bookkeeping."""
+    data = data if isinstance(data, dict) else {}
+    if "applied" in data or "desired" in data:
+        applied = [tuple(a) for a in (data.get("applied") or []) if isinstance(a, (list, tuple)) and len(a) == 3]
+        desired = data.get("desired")
+        desired = tuple(desired) if isinstance(desired, (list, tuple)) and len(desired) == 3 else None
+        return {"applied": applied, "desired": desired}
+    if data.get("channel"):
+        target = (data.get("channel"), data.get("ts"), data.get("name"))
+        if data.get("action") == "remove":
+            return {"applied": [target], "desired": None}
+        return {"applied": [target] if data.get("confirmed") else [], "desired": target}
+    return {"applied": [], "desired": None}
+
+
 def reaction_target(ev):
     """(channel, ts, thread_ts) of the Slack message an event stands for; None for timer and cli events, or when
     the event has no message ts (the payload's `ts`, else an id shaped like a Slack ts, as the bridge queues them)."""
@@ -1572,6 +1590,8 @@ class Supervisor:
             return False
         if os.path.exists(self.path("inbox", "pending-replies.jsonl")):
             return self.deliver_pending()
+        if self._reconcile_settlement_journal():
+            return True
         self._reconcile_continuation_intent()
         self.reconcile_work_reaction()
         self.reconcile_persistence()
@@ -1657,11 +1677,16 @@ class Supervisor:
         if footer and footer not in reply:
             reply = (reply + "\n" if reply else "") + footer
         deliveries = self.plan_deliveries(events, reply, n)
-        delivered = self.deliver(deliveries, [ev["id"] for ev in events], n)
+        ids = [ev["id"] for ev in events]
+        self._save_settlement_journal(n, ids, deliveries)  # before delivery (requirement 21, loops/b7.md: B2):
+        self.persistence_checkpoint("settlement_before_delivery")  # retained until settlement finishes
+        delivered = self.deliver(deliveries, ids, n)
         self.migrate_tracks()  # and before persist: catch what this turn's engine wrote to state.json
         self.persist(n)
         if delivered:
             self.settle_work(n, events)  # after a successful delivery+persistence attempt, including blanks
+            self.persistence_checkpoint("settlement_completed")
+            self._clear_settlement_journal()
         return True
 
     # ---- shared memory (factory/manager-memory in the clone)
@@ -2307,14 +2332,18 @@ class Supervisor:
             self._write_rollover_intent(intent)
 
     def _reconcile_rollover_intent(self):
-        """Before any Claude invocation (restart recovery, requirement 13): finish an incomplete replacement when
-        the session id is still the old one, retain it when already replaced, and make sure `compaction_state`
-        reflects the pending verification either way. A process death at any checkpoint recovers the same
-        intended UUID, never a second memory turn (the memory turn already ran before the intent was written)."""
+        """Before any Claude invocation (restart recovery, requirement 13/22, loops/b7.md: B3): finish an
+        incomplete replacement when the session id is still the old one, retain it when already replaced, then
+        -- unless this intent's bookkeeping already finished -- recover the last/verify state, the one
+        successful-compaction ledger entry and the original COMPACT/pending trigger consumption from the same
+        intent, never a second memory turn (it already ran before the intent was written). Finishing shrinks the
+        intent to just the long-lived new-session startup marker (`old_id`/`new_id`/`started`), which this must
+        never discard: a later `invoke()` still needs it to force `--session-id` over `--resume` until the first
+        successful fresh-session startup."""
         intent = self._read_rollover_intent()
         old_id, new_id = intent.get("old_id"), intent.get("new_id")
-        if not old_id or not new_id:
-            return
+        if not new_id or "old_id" not in intent:
+            return  # no intent at all (old_id can legitimately be "" -- a rollover from no prior session)
         current = self.session_id()
         if current == new_id:
             pass  # already replaced: retain it
@@ -2323,12 +2352,39 @@ class Supervisor:
                 self.replace_session_id(new_id)
         else:
             return  # an unrelated session id (a later rollover, or a manual change): nothing to reconcile
+        if "turn" not in intent and "reason" not in intent:
+            return  # bookkeeping already finished for this intent; nothing left to recover
+        self._finish_rollover_bookkeeping(intent)
+        self.persistence_checkpoint("rollover_recovered")
+        self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": bool(intent.get("started"))})
+
+    def _finish_rollover_bookkeeping(self, intent, before_dir=None):
+        """The durable last/verify state, the one successful-compaction ledger entry and the original
+        COMPACT/pending trigger consumption for a single rollover (requirement 22, loops/b7.md: B3). Idempotent:
+        safe to call again on an already-finished rollover (restart, or a repeated checkpoint crash) without a
+        second ledger entry, a second memory-writing turn, or losing the intended UUID."""
+        old_id, new_id = intent.get("old_id"), intent.get("new_id")
+        turn = intent.get("turn")
+        reason = intent.get("reason") or "rollover"
+        before_tokens, at = intent.get("before_tokens"), intent.get("at") or self.now()
+        name, model = intent.get("engine"), intent.get("model")
         state = self.compaction_state()
-        last = state.get("last") or {}
-        if last.get("old_id") != old_id or last.get("new_id") != new_id:
-            state["last"] = {"old_id": old_id, "new_id": new_id, "ok": None, "at": last.get("at") or self.now(),
-                             "before_tokens": last.get("before_tokens"), "reason": last.get("reason") or "rollover"}
-            self.save_compaction_state(state)
+        state["last"] = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None,
+                         "reason": reason, "old_id": old_id, "new_id": new_id}
+        state["pending"] = None
+        state["verify"] = {"before_tokens": before_tokens, "at": at, "reason": reason, "turn": turn,
+                           "old_id": old_id, "new_id": new_id}
+        state["baseline_bytes"] = 0
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.path("COMPACT"))
+        self.save_compaction_state(state)
+        if turn is not None and not any(r.get("kind") == "compaction" and r.get("turn") == turn
+                                        for r in read_ledger(self.memory_dir)):
+            self.append_ledger(turn, name, model, before_dir if before_dir is not None else dir_hashes(self.memory_dir),
+                               kind="compaction", compaction=None)
+            append_jsonl(self.path("logs", "turns.jsonl"),
+                        {"n": turn, "at": time.time(), "engine": name, "model": model, "events": [],
+                         "duration_s": 0.0, "kind": "compaction"})
 
     def replace_session_id(self, new_id):
         """Atomically replace `$HYDRA_HOME/session-id` with `new_id` (os.replace); raises on write failure without
@@ -2471,8 +2527,13 @@ class Supervisor:
                 else:
                     self.write_handoff(handoff, name)
                     self.snapshot_claude_memory()
+                    old_id = self.session_id()  # the compaction turn itself may have just bootstrapped this
+                    # id (there was no prior session at all): the actual "old" side of this rollover is whatever
+                    # session that turn ran on, not the empty value read before invoke().
                     new_id = str(uuid.uuid4())
-                    self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": False})
+                    intent = {"old_id": old_id, "new_id": new_id, "started": False, "turn": n, "reason": reason,
+                              "before_tokens": before_tokens, "at": at, "engine": name, "model": model}
+                    self._write_rollover_intent(intent)
                     self.persistence_checkpoint("rollover_intent_saved")
                     try:
                         self.replace_session_id(new_id)
@@ -2481,23 +2542,11 @@ class Supervisor:
                         error = f"session replacement failed: {e}"
                     else:
                         self.persistence_checkpoint("rollover_id_replaced")
-                        rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None,
-                               "reason": reason, "old_id": old_id, "new_id": new_id}
-                        state["last"] = rec
-                        state["pending"] = None
-                        state["verify"] = {"before_tokens": before_tokens, "at": at, "reason": reason, "turn": n,
-                                           "old_id": old_id, "new_id": new_id}
-                        state["baseline_bytes"] = 0
-                        with contextlib.suppress(FileNotFoundError):
-                            os.remove(self.path("COMPACT"))
-                        self.save_compaction_state(state)
-                        self.append_ledger(n, name, model, before_dir, kind="compaction", compaction=None)
-                        record = {"n": n, "at": started, "engine": name, "model": model, "events": [],
-                                  "duration_s": round(time.time() - started, 3), "kind": "compaction"}
-                        append_jsonl(self.path("logs", "turns.jsonl"), record)
+                        self._finish_rollover_bookkeeping(intent, before_dir)
                         self.persistence_checkpoint("rollover_state_saved")
+                        self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": False})
                         log(f"rollover done: session {old_id} -> {new_id}; the next Claude turn verifies it")
-                        return rec
+                        return self.compaction_state()["last"]
             record_attempt(self.home, name, model, rc, classify_engine_error(error), error, False)
         rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": False, "reason": reason,
                "error": error}
@@ -2543,26 +2592,32 @@ class Supervisor:
         return f"{head}\n… full reply ({len(lines)} lines): {link}"
 
     def plan_deliveries(self, events, reply, n):
-        """[{channel, thread_ts, text}] for Slack threads and [{id, text}] for console events. A blank reply
-        (#32, requirement 6, loops/b7.md) is never posted: a thread whose events are purely indirect/informational
-        is skipped; a thread touched by an `instructs:true` sender or a mention of the manager gets
-        NO_REPLY_PLACEHOLDER instead. Decided per thread, not globally, across a mixed batch. CLI replies keep
-        their existing semantics (the text, blank or not, always reaches the reply file)."""
+        """[{channel, thread_ts, text}] for Slack threads, [{id, text}] for console events, and [{id, text}] for
+        self events with no usable Slack destination. A blank reply (#32, requirement 6, loops/b7.md) is never
+        posted: a thread whose events are purely indirect/informational is skipped; a thread touched by an
+        `instructs:true` sender or a mention of the manager gets NO_REPLY_PLACEHOLDER instead. Decided per
+        thread, not globally, across a mixed batch. CLI replies keep their existing semantics (the text, blank or
+        not, always reaches the reply file). A `self` event (requirement 25, loops/b7.md: FLOOD) is never
+        mirrored as founder-console and never falls back to a dev-channel top-level post: without its own
+        validated channel *and* thread it is logged locally instead of posted at all."""
         blank = not reply.strip()
         text = reply
         if not blank and reply.count("\n") + 1 > LONG_REPLY_LINES:
             text = self.long_reply_link(reply, n)
-        order, authoritative, cli = [], {}, []
+        order, authoritative, cli, selflog = [], {}, [], []
         for ev in events:
             p = _payload(ev)
             if ev.get("source") == "cli":
                 cli.append({"id": ev.get("id"), "text": reply, "channel": p.get("channel") or self.dev_channel,
                             "user": p.get("user") or "founder-console", "prompt": p.get("text") or ""})
                 continue
-            channel = p.get("channel")
+            channel, thread_ts = p.get("channel"), p.get("thread_ts")
+            if ev.get("source") == "self" and (not channel or not thread_ts):
+                selflog.append({"id": ev.get("id"), "text": reply})
+                continue
             if not channel:
                 continue
-            key = (channel, p.get("thread_ts"))
+            key = (channel, thread_ts)
             is_authoritative = bool(p.get("instructs")) or bool(p.get("addressed"))
             if key not in authoritative:
                 order.append(key)
@@ -2580,15 +2635,26 @@ class Supervisor:
                     log(f"turn {n}: no reply text, delivery skipped")
                 continue
             slack.append({"channel": channel, "thread_ts": thread_ts, "text": text})
-        return {"slack": slack, "cli": cli}
+        return {"slack": slack, "cli": cli, "self": selflog}
+
+    def _record_self_reply(self, item):
+        """Durable, local, Slack-free record for a self event with no usable destination (requirement 25, loops/
+        b7.md: FLOOD): id and text only, never credentials. Idempotent, so a delivery retry of the same batch
+        never duplicates the line."""
+        path = self.path("logs", "self-replies.jsonl")
+        if any(r.get("id") == item.get("id") for r in read_jsonl(path)):
+            return
+        append_jsonl(path, {"id": item.get("id"), "text": item.get("text")})
 
     def deliver(self, deliveries, event_ids, n):
         """Post every planned reply; on the first failure the remainder is kept pending and the events unhandled.
         The working indicator comes off a thread's messages as soon as that thread's reply is posted."""
         pending = {"turn": n, "events": event_ids, "slack": list(deliveries.get("slack") or []),
-                   "cli": list(deliveries.get("cli") or [])}
+                   "cli": list(deliveries.get("cli") or []), "self": list(deliveries.get("self") or [])}
         for item in list(pending["cli"]):
             write_text(self.path("inbox", "replies", f"{item['id']}.txt"), item["text"].rstrip() + "\n")
+        for item in list(pending["self"]):
+            self._record_self_reply(item)
         try:
             while pending["slack"]:
                 item = pending["slack"][0]
@@ -2766,8 +2832,9 @@ class Supervisor:
         mirror_own_post(self.home, channel, thread_ts, text, ts=ts, turn=n)
 
     def deliver_pending(self):
-        """A pending reply defers settlement (requirement 16, loops/b7.md): once a recovered delivery succeeds,
-        settle_work runs here, once, with the turn's original events (by id, from the durable event log)."""
+        """A pending reply defers settlement (requirement 16/21, loops/b7.md: B2): once a recovered delivery is
+        confirmed (already handled -- never reposted -- or newly delivered now), the persistence attempt and
+        settle_work run here, once, with the turn's original events (by id, from the durable event log)."""
         path = self.path("inbox", "pending-replies.jsonl")
         items = read_jsonl(path)
         with contextlib.suppress(FileNotFoundError):
@@ -2775,11 +2842,65 @@ class Supervisor:
         ok = True
         for item in items:
             ids = item.get("events") or []
-            if self.deliver({"slack": item.get("slack") or [], "cli": item.get("cli") or []}, ids, item.get("turn")):
-                self.settle_work(item.get("turn"), events_by_ids(self.home, ids))
+            n = item.get("turn")
+            delivered = all(i in handled_ids(self.home) for i in ids) if ids else False
+            if not delivered:
+                delivered = self.deliver({"slack": item.get("slack") or [], "cli": item.get("cli") or [],
+                                          "self": item.get("self") or []}, ids, n)
+            if delivered:
+                self._finish_settlement(n, ids)
             else:
                 ok = False
+        if ok:
+            self._clear_settlement_journal()
         return ok
+
+    # ---- deferred settlement journal (requirement 21, loops/b7.md: B2): written before delivery is even
+    # attempted, so a crash before, during or after delivery -- never a second engine turn -- can still finish
+    # the persistence attempt and settlement without reposting an already-confirmed reply.
+
+    def settlement_journal_path(self):
+        return self.path("logs", "settlement-pending.json")
+
+    def _save_settlement_journal(self, n, event_ids, deliveries):
+        write_text(self.settlement_journal_path(), json.dumps(
+            {"turn": n, "events": event_ids, "deliveries": deliveries}) + "\n")
+
+    def _clear_settlement_journal(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.settlement_journal_path())
+
+    def _read_settlement_journal(self):
+        try:
+            data = json.loads(read_text(self.settlement_journal_path(), "") or "null")
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) and data.get("events") else None
+
+    def _finish_settlement(self, n, ids):
+        """The persistence attempt and settle_work for a turn whose delivery is already confirmed (requirement
+        21, loops/b7.md: B2): never reruns the engine. `settlement_recovered` marks the actual boundary between
+        the persistence attempt and the idempotent scheduling/settlement that follows."""
+        self.persist(n)
+        self.persistence_checkpoint("settlement_recovered")
+        self.settle_work(n, events_by_ids(self.home, ids))
+
+    def _reconcile_settlement_journal(self):
+        """A turn interrupted before delivery was even attempted, or after delivery was confirmed but before its
+        persistence attempt and settlement completed (requirement 21, loops/b7.md: B2). Never reruns the engine;
+        reposts only when the original delivery truly never completed (in which case `deliver` itself defers to
+        the ordinary pending-replies retry). True when this tick did recovery work."""
+        journal = self._read_settlement_journal()
+        if journal is None:
+            return False
+        n, ids = journal.get("turn"), journal["events"]
+        delivered = all(i in handled_ids(self.home) for i in ids) if ids else False
+        if not delivered:
+            delivered = self.deliver(journal.get("deliveries") or {"slack": [], "cli": [], "self": []}, ids, n)
+        if delivered:
+            self._finish_settlement(n, ids)
+            self._clear_settlement_journal()
+        return True
 
     def post_unavailable(self, events):
         seen = set()
@@ -2911,48 +3032,66 @@ class Supervisor:
         return self.path("logs", "work-reaction.json")
 
     def _read_work_reaction(self):
+        """{"applied": [(channel, ts, name), ...], "desired": (channel, ts, name) or None}. `applied` is every
+        target currently believed to carry the reaction (confirmed added, not yet confirmed removed); a target
+        change retains every one of them until it is actually removed (requirement 18, loops/b7.md: S1), instead
+        of the one-record shape that silently forgot a previous target."""
         try:
             data = json.loads(read_text(self.work_reaction_path(), "{}") or "{}")
         except json.JSONDecodeError:
-            return {}
-        return data if isinstance(data, dict) else {}
+            data = {}
+        return _normalize_work_reaction(data)
 
-    def _save_work_reaction(self, data):
-        write_text(self.work_reaction_path(), json.dumps(data) + "\n")
+    def _save_work_reaction(self, state):
+        state = _normalize_work_reaction(state)  # also accepts a direct pre-S1 single-record write
+        write_text(self.work_reaction_path(), json.dumps(
+            {"applied": [list(a) for a in state["applied"]],
+             "desired": list(state["desired"]) if state["desired"] else None}) + "\n")
 
     def _set_desired_work_reaction(self, desired):
         """`desired` is (channel, ts, name) to ensure added, or None to ensure any standing clock is removed
-        (active work resumed). Attempts immediately; a failure persists confirmed=False so run_once retries."""
+        (active work resumed). Every previously-applied target besides `desired` is retained for removal
+        (requirement 18, loops/b7.md: S1), so changing waiting targets -- or a failed/restarted removal --
+        never orphans an old clock. Reconciles immediately; a failure retries next tick, never falsely
+        confirmed."""
         state = self._read_work_reaction()
-        current = (state.get("channel"), state.get("ts"), state.get("name")) if state.get("channel") else None
-        if desired is None and current is None:
-            return
-        if desired == current and state.get("confirmed") and state.get("action") == "add":
-            return
-        if desired is not None:
-            channel, ts, name = desired
-            new_state = {"channel": channel, "ts": ts, "name": name, "action": "add", "confirmed": False}
-        else:
-            channel, ts, name = current
-            new_state = {"channel": channel, "ts": ts, "name": name, "action": "remove", "confirmed": False}
-        self._save_work_reaction(new_state)
+        already_settled = [desired] if desired is not None else []
+        if state.get("desired") == desired and (state.get("applied") or []) == already_settled:
+            return  # already exactly as desired, nothing stale or pending
+        state["desired"] = desired
+        self._save_work_reaction(state)
         self.reconcile_work_reaction()
 
     def reconcile_work_reaction(self):
         """Retried on every run_once tick, including one with no events, and after restart (requirement 18/19,
-        loops/b7.md): a failed add/remove is logged and retried next tick, never recorded as confirmed."""
+        loops/b7.md): a failed add/remove is logged and retried next tick, never recorded as confirmed. Every
+        applied target besides the current desired one is removed (requirement 18, S1 repair: active settlement,
+        or a later target change, removes every previously-applied waiting clock, not only the most recent)."""
         state = self._read_work_reaction()
-        if not state or state.get("confirmed") or not state.get("channel"):
-            return
-        channel, ts, name = state.get("channel"), state.get("ts"), state.get("name")
-        action = state.get("action") or "add"
-        try:
-            getattr(self.reactor, action)(channel, ts, name)
-        except Exception as e:  # best effort; retried next tick, never falsely confirmed
-            log(f"work reaction {action} failed ({name} on {channel}/{ts}): {e} (retried next tick)")
-            return
-        state["confirmed"] = True
-        self._save_work_reaction(state)
+        applied, desired = list(state.get("applied") or []), state.get("desired")
+        changed = False
+        for target in list(applied):
+            if target == desired:
+                continue
+            channel, ts, name = target
+            try:
+                self.reactor.remove(channel, ts, name)
+            except Exception as e:  # best effort; retried next tick, never falsely confirmed
+                log(f"work reaction remove failed ({name} on {channel}/{ts}): {e} (retried next tick)")
+                continue
+            applied.remove(target)
+            changed = True
+        if desired is not None and desired not in applied:
+            channel, ts, name = desired
+            try:
+                self.reactor.add(channel, ts, name)
+            except Exception as e:  # best effort; retried next tick, never falsely confirmed
+                log(f"work reaction add failed ({name} on {channel}/{ts}): {e} (retried next tick)")
+            else:
+                applied.append(desired)
+                changed = True
+        if changed:
+            self._save_work_reaction({"applied": applied, "desired": desired})
 
     # ---- automatic continuation (requirement 17, loops/b7.md): a deterministic id, a rolling-hour reservation
     # counted across restarts, and a crash-safe two-step intent (reserved, then enqueued).
@@ -3004,37 +3143,54 @@ class Supervisor:
 
     def _reserve_continuation(self, turn, track, next_action, channel, thread_ts):
         event_id = f"continue-{turn}"
+        at = self.clock_epoch()
         intent = {"turn": turn, "id": event_id, "track": track, "next_action": next_action,
-                  "channel": channel, "thread_ts": thread_ts}
+                  "channel": channel, "thread_ts": thread_ts, "at": at}
         write_text(self.continuation_intent_path(), json.dumps(intent) + "\n")
-        append_jsonl(self.continuation_reservations_path(), {"turn": turn, "at": self.clock_epoch(), "id": event_id})
+        self.persistence_checkpoint("continuation_intent_saved")  # requirement 20, loops/b7.md: B1 -- the
+        # intent (with its original reservation timestamp) is durable before the reservation is counted, so
+        # a crash between the two can never bypass the hourly cap: recovery still has the original `at`.
+        self._reserve_and_enqueue(intent)
+
+    def _reserve_and_enqueue(self, intent):
+        """The single counted reservation for `intent`, using its original timestamp (never a fresh one on
+        recovery), then the idempotent enqueue (requirement 20, loops/b7.md: B1). Safe to repeat: a reservation
+        already recorded for this id is never counted twice."""
+        event_id, at = intent["id"], intent.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            at = self.clock_epoch()
+        if not any(r.get("id") == event_id for r in read_jsonl(self.continuation_reservations_path())):
+            append_jsonl(self.continuation_reservations_path(), {"turn": intent.get("turn"), "at": at, "id": event_id})
         self.persistence_checkpoint("continuation_reserved")
         self._enqueue_continuation(intent)
 
     def _enqueue_continuation(self, intent):
         """Idempotent: a restart (or a second settle_work for the same turn) never duplicates the event. It
-        carries instructs:false and cannot grant new authority -- the manager still decides whether to act."""
+        carries instructs:false and cannot grant new authority -- the manager still decides whether to act.
+        Source `self` (requirement 25, loops/b7.md): never founder-console, replied to only in its own named
+        track thread."""
         event_id = intent["id"]
         if event_id not in handled_ids(self.home) and not any(e.get("id") == event_id for e in pending_events(self.home)):
             text = f"continue {intent['track']}: {intent['next_action']}"
             append_event(self.home, new_event(
-                "timer", {"text": text, "instructs": False, "channel": intent.get("channel"),
-                          "thread_ts": intent.get("thread_ts"), "continuation": True, "track": intent.get("track")},
+                "self", {"text": text, "instructs": False, "channel": intent.get("channel"),
+                         "thread_ts": intent.get("thread_ts"), "continuation": True, "track": intent.get("track")},
                 event_id=event_id))
         self.persistence_checkpoint("continuation_enqueued")
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.continuation_intent_path())
 
     def _reconcile_continuation_intent(self):
-        """Restart reconciles an incomplete reservation once (requirement 17, loops/b7.md): the reservation was
-        already counted before the intent was written, so this only ever finishes the enqueue, never repeats
-        the count or double-enqueues."""
+        """Restart reconciles an incomplete reservation once (requirement 17/20, loops/b7.md: B1): the intent
+        carries the original reservation timestamp, so recovery never double-counts and never loses it -- it
+        establishes the single reservation (if not already recorded) before enqueueing, exactly like the
+        forward path, and calling this again on an already-enqueued intent (the file is gone) is a no-op."""
         try:
             intent = json.loads(read_text(self.continuation_intent_path(), "") or "null")
         except json.JSONDecodeError:
             intent = None
         if isinstance(intent, dict) and intent.get("id"):
-            self._enqueue_continuation(intent)
+            self._reserve_and_enqueue(intent)
 
     # ---- durable persistence status (requirement 19, loops/b7.md)
 
@@ -3118,9 +3274,16 @@ class Supervisor:
     def sync_repo_before(self):
         """Fetch and reconcile a clean diverged clone with an ordinary merge, preserving both histories (no
         force-push, reset or automatic conflict resolution, requirement 19, loops/b7.md). A real conflict
-        aborts the merge, retains local work and marks `blocked`; unmanaged dirt blocks before touching git."""
+        aborts the merge, retains local work and marks `blocked`; unmanaged dirt blocks before touching git.
+        Respects the same pending-retry deadline as `persist`/`reconcile_persistence` (requirement 19, S2
+        repair): an incoming turn never resets it, so this is a no-op git-wise until it has passed."""
         self._sync_blocked = False
         if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
+            return
+        status = self._read_persistence_status()
+        retry_after = status.get("retry_after")
+        if status.get("status") == "pending" and isinstance(retry_after, (int, float)) \
+                and self.clock_epoch() < retry_after:
             return
         if self._repo_unsafe_dirty():
             self._sync_blocked = True

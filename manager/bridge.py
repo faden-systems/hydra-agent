@@ -655,14 +655,16 @@ class SocketHealth:
 
 
 def _reconnect_or_die(client, timeout_s):
-    """`client.connect_to_new_endpoint()` bounded to `timeout_s` seconds, in a daemon thread so a hung SDK call
-    cannot block the watchdog past the bound. Exception, timeout, or a still-disconnected result is fatal
-    (requirement 2, loops/b7.md): raises so the caller's process exits nonzero."""
+    """Force `client.connect_to_new_endpoint(force=True)` bounded to `timeout_s` seconds, in a daemon thread so a
+    hung SDK call cannot block the watchdog past the bound. Exception, timeout, or a still-disconnected result is
+    fatal (requirement 2/23, loops/b7.md: B4): raises so the caller's process exits nonzero. The installed SDK's
+    `connect_to_new_endpoint(force=False)` only reconnects when already disconnected, so an established-but-
+    silent connection (is_connected() still True) needs `force=True` to actually request a new endpoint at all."""
     outcome = {}
 
     def attempt():
         try:
-            client.connect_to_new_endpoint()
+            client.connect_to_new_endpoint(force=True)
         except Exception as e:  # noqa: BLE001 - captured across the thread boundary, re-raised below
             outcome["error"] = e
     t = threading.Thread(target=attempt, daemon=True, name="socket-reconnect")
@@ -681,13 +683,35 @@ def _reconnect_or_die(client, timeout_s):
         raise RuntimeError(reason)
 
 
+def _verify_fresh_activity_or_die(health, clock, grace_s, stop):
+    """A forced reconnect that returns connected is not proof of a working replacement (requirement 23, loops/
+    b7.md: B4): the old session's pong cannot certify it, so this blocks for a genuinely new envelope or pong
+    value before accepting the connection as healthy again, bounded by `grace_s` of the supplied monotonic
+    `clock` -- never the injected `stop.wait`, whose caller-controlled clock jumps must not corrupt this bound.
+    No fresh activity within the grace period is fatal, same as a failed reconnect itself."""
+    baseline_activity, baseline_pong = health._last_activity, health._last_pong_seen
+    deadline = clock() + grace_s
+    while True:
+        health._note_pong_if_changed()
+        if health._last_activity != baseline_activity or health._last_pong_seen != baseline_pong:
+            return
+        if stop.is_set():
+            return
+        if clock() >= deadline:
+            reason = "reconnected endpoint showed no fresh inbound activity within the grace period"
+            S.log(reason)
+            raise RuntimeError(reason)
+        time.sleep(min(0.01, grace_s))
+
+
 def run_socket_mode(handler, stop, clock=time.monotonic, poll_s=10, reconnect_timeout_s=30):
     """The required testable seam (requirement 2, loops/b7.md): connects once, installs the raw receipt listener,
     then monitors `SocketHealth` in the calling thread (never a background one: "a background SystemExit alone is
     insufficient" means the process must actually fail from its own main thread) every `poll_s` seconds, at most
-    `reconnect_timeout_s` seconds per recovery attempt. Disables the SDK's own competing auto-reconnect for this
-    managed lifecycle. Raises (an exception, or lets one propagate) on failed recovery; it never calls
-    `handler.start()`, which blocks forever instead of returning control to the caller."""
+    `reconnect_timeout_s` seconds per recovery attempt plus the same bound again to verify fresh activity
+    (requirement 23, loops/b7.md: B4). Disables the SDK's own competing auto-reconnect for this managed lifecycle.
+    Raises (an exception, or lets one propagate) on failed recovery; it never calls `handler.start()`, which
+    blocks forever instead of returning control to the caller."""
     client = handler.client
     client.auto_reconnect_enabled = False
     client.default_auto_reconnect_enabled = False
@@ -697,6 +721,7 @@ def run_socket_mode(handler, stop, clock=time.monotonic, poll_s=10, reconnect_ti
     while not stop.is_set():
         if not health.check():
             _reconnect_or_die(client, reconnect_timeout_s)
+            _verify_fresh_activity_or_die(health, clock, reconnect_timeout_s, stop)
         if stop.wait(poll_s):
             return
 
