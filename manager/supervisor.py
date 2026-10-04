@@ -115,6 +115,53 @@ REACTION_HEARTBEAT = "hourglass_flowing_sand"
 HEARTBEAT_DEFAULT_S = 20
 HEARTBEAT_JOIN_S = 60  # how long delivery waits for a swap in flight before going on without the ticker
 OUTBOX_MAX_ATTEMPTS = 5
+REACTION_TIMER_CLOCK = "timer_clock"
+WORK_STATUS_MODES = ("continue", "idle", "waiting", "done")
+WORK_STATUS_STR_LIMIT = 4096
+CONTINUATION_WINDOW_S = 3600
+CONTINUATION_DEFAULT_MAX_PER_HOUR = 6
+PERSISTENCE_RETRY_AFTER_S = 60
+MANAGED_REPO_PATHS = ("factory/state.json",)
+MANAGED_REPO_PREFIXES = ("factory/log/", MEMORY_DIRNAME + "/")
+LA_ZONE = zoneinfo.ZoneInfo("America/Los_Angeles")
+
+
+def la_time_label(epoch):
+    """`HH:MM PDT`/`HH:MM PST` for a UTC epoch in America/Los_Angeles (requirement 18, loops/b7.md)."""
+    when = _dt.datetime.fromtimestamp(float(epoch), _dt.timezone.utc).astimezone(LA_ZONE)
+    return when.strftime("%H:%M %Z")
+
+
+def read_work_status(home):
+    """The raw `work-status.json` dict, or None when absent/unreadable/not an object. Manager-owned: never
+    parsed from an incoming Slack message (requirement 16, loops/b7.md)."""
+    try:
+        raw = read_text(os.path.join(home, "work-status.json"), "")
+        if not raw.strip():
+            return None
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ws_str(value, required=True):
+    """A validated work-status string field: at most 4096 characters, never a bool. None (invalid) or '' is
+    rejected when `required`; an absent optional field is the empty string."""
+    if value is None:
+        return None if required else ""
+    if isinstance(value, bool) or not isinstance(value, str) or len(value) > WORK_STATUS_STR_LIMIT:
+        return None
+    if required and not value:
+        return None
+    return value
+
+
+def _ws_num(value):
+    """A validated finite, non-boolean number (a UTC epoch), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
 
 
 # ----------------------------------------------------------------------------------------------- paths and files
@@ -239,6 +286,18 @@ def pending_events(home):
             continue
         seen.add(eid)
         out.append(ev)
+    return out
+
+
+def events_by_ids(home, ids):
+    """The full event records for `ids`, in queue order, from the durable event log (regardless of handled
+    status) -- used to recover the original events for a deferred settlement (requirement 16, loops/b7.md)."""
+    wanted, seen, out = set(ids), set(), []
+    for ev in read_jsonl(os.path.join(home, "inbox", "events.jsonl")):
+        eid = ev.get("id")
+        if eid in wanted and eid not in seen:
+            seen.add(eid)
+            out.append(ev)
     return out
 
 
@@ -1005,6 +1064,37 @@ def status_text(home, repo=None):
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
         lines.append(f"heartbeat: {now_iso(os.path.getmtime(hb))}")
+    # idle-until / waiting-on-since (requirement 18, loops/b7.md); legacy output with no (valid) work-status
+    work_status = read_work_status(home)
+    if isinstance(work_status, dict):
+        mode = work_status.get("mode")
+        if mode == "waiting":
+            who, since = work_status.get("who"), _ws_num(work_status.get("since"))
+            if isinstance(who, str) and who and since is not None:
+                lines.append(f"waiting on {who} since {la_time_label(since)}")
+        elif mode == "idle":
+            deadline = _ws_num(work_status.get("deadline"))
+            if deadline is not None:
+                lines.append(f"idle until {la_time_label(deadline)}")
+    cont_cfg = cfg.get("continuation")
+    cont_cfg = cont_cfg if isinstance(cont_cfg, dict) else {}
+    limit = cont_cfg.get("max_per_hour", CONTINUATION_DEFAULT_MAX_PER_HOUR)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (0 <= limit <= 60):
+        limit = 0
+    if limit > 0:
+        now = time.time()
+        recent = [r["at"] for r in read_jsonl(os.path.join(home, "logs", "continuation-reservations.jsonl"))
+                  if isinstance(r.get("at"), (int, float)) and not isinstance(r.get("at"), bool)
+                  and now - r["at"] < CONTINUATION_WINDOW_S]
+        if len(recent) >= limit:
+            lines.append(f"continuation: capped until {now_iso(min(recent) + CONTINUATION_WINDOW_S)}")
+    # persistence pending/blocked until remote verification (requirement 19, loops/b7.md)
+    try:
+        persistence = json.loads(read_text(os.path.join(home, "logs", "persistence.json"), "{}") or "{}")
+    except json.JSONDecodeError:
+        persistence = {}
+    if isinstance(persistence, dict) and persistence.get("status") in ("pending", "blocked"):
+        lines.append(f"persistence: {persistence['status']} ({(persistence.get('error') or '').strip()[:200]})")
     tracks = tracks_summary(read_state(home, repo))
     if tracks:
         lines.extend(tracks)  # one separate line per track, now first (requirement 5, loops/b7.md)
@@ -1377,7 +1467,8 @@ def record_attempt(home, engine, model, rc, classification, reason, success):
 
 class AllEnginesFailed(Exception):
     def __init__(self, errors):
-        super().__init__("; ".join(f"{n}: {e}" for n, e in errors))
+        parts = [f"{e[0]}: {e[1]}" if isinstance(e, (tuple, list)) and len(e) == 2 else str(e) for e in errors]
+        super().__init__("; ".join(parts))
         self.errors = errors
 
 
@@ -1437,6 +1528,13 @@ class Supervisor:
             return t if t.tzinfo else t.replace(tzinfo=_dt.timezone.utc)
         return _dt.datetime.fromtimestamp(float(t), _dt.timezone.utc)
 
+    def clock_epoch(self):
+        """The supervisor's time as a UTC epoch float (the controlled clock when one was given)."""
+        if self.clock is None:
+            return time.time()
+        t = self.clock()
+        return t.timestamp() if isinstance(t, _dt.datetime) else float(t)
+
     def heartbeat(self):
         write_text(self.path("logs", "heartbeat"), now_iso() + "\n")
 
@@ -1464,13 +1562,23 @@ class Supervisor:
 
     # ---- the public entry point
     def run_once(self):
-        """One tick: deliver a pending reply, or run one turn for the queued events. True when something ran."""
+        """One tick: deliver a pending reply, or run one turn for the queued events. True when something ran.
+        Continuation-intent, work reaction and persistence reconciliation run on every tick, including a tick
+        with no events at all (requirements 17/18/19, loops/b7.md), so a crash or a transient failure between
+        turns is repaired without busy polling (each is itself bounded: a reservation reconciles once, a
+        reaction retries once per tick, persistence backs off until its own deadline)."""
         self.heartbeat()
         if self.paused():
             return False
         if os.path.exists(self.path("inbox", "pending-replies.jsonl")):
             return self.deliver_pending()
+        self._reconcile_continuation_intent()
+        self.reconcile_work_reaction()
+        self.reconcile_persistence()
         events = pending_events(self.home)
+        non_continuation = [e for e in events if not _payload(e).get("continuation")]
+        if non_continuation and len(non_continuation) != len(events):
+            events = non_continuation  # new/founder work takes priority over an automatic continuation
         due, reason = self.compaction_due()
         if not events and not due:
             return False
@@ -1545,10 +1653,15 @@ class Supervisor:
         append_jsonl(self.path("logs", "turns.jsonl"), record)
         if is_claude:
             self.schedule_compaction(usage.get("context_tokens"))
+        footer = self._prepare_waiting_footer(n, events)  # before plan_deliveries (requirement 16, loops/b7.md)
+        if footer and footer not in reply:
+            reply = (reply + "\n" if reply else "") + footer
         deliveries = self.plan_deliveries(events, reply, n)
-        self.deliver(deliveries, [ev["id"] for ev in events], n)
+        delivered = self.deliver(deliveries, [ev["id"] for ev in events], n)
         self.migrate_tracks()  # and before persist: catch what this turn's engine wrote to state.json
         self.persist(n)
+        if delivered:
+            self.settle_work(n, events)  # after a successful delivery+persistence attempt, including blanks
         return True
 
     # ---- shared memory (factory/manager-memory in the clone)
@@ -2653,14 +2766,18 @@ class Supervisor:
         mirror_own_post(self.home, channel, thread_ts, text, ts=ts, turn=n)
 
     def deliver_pending(self):
+        """A pending reply defers settlement (requirement 16, loops/b7.md): once a recovered delivery succeeds,
+        settle_work runs here, once, with the turn's original events (by id, from the durable event log)."""
         path = self.path("inbox", "pending-replies.jsonl")
         items = read_jsonl(path)
         with contextlib.suppress(FileNotFoundError):
             os.remove(path)
         ok = True
         for item in items:
-            if not self.deliver({"slack": item.get("slack") or [], "cli": item.get("cli") or []},
-                                item.get("events") or [], item.get("turn")):
+            ids = item.get("events") or []
+            if self.deliver({"slack": item.get("slack") or [], "cli": item.get("cli") or []}, ids, item.get("turn")):
+                self.settle_work(item.get("turn"), events_by_ids(self.home, ids))
+            else:
                 ok = False
         return ok
 
@@ -2703,25 +2820,354 @@ class Supervisor:
         text = read_text(state_path(self.home, self.repo), "{}").rstrip()
         return f"# factory/state.json\n{text}\n" if text and text != "{}" else ""
 
-    def sync_repo_before(self):
+    # ---- work-status.json: the manager-owned scheduling input (requirement 16, loops/b7.md)
+
+    def _validate_work_status(self, n, events):
+        """The validated work-status record for turn `n` against this turn's `events`, or None when missing,
+        stale, malformed or an unknown mode -- which disables automatic continuation and is logged as an
+        explicit diagnostic. Never trusts a caller-selected reaction target: `_target` is the actual event in
+        `events` whose source, channel and ts match the validated channel/message_ts, else None."""
+        data = read_work_status(self.home)
+        if data is None:
+            return None
+        turn = data.get("turn")
+        if isinstance(turn, bool) or not isinstance(turn, int):
+            log("work-status.json: turn must be an integer; automatic continuation disabled")
+            return None
+        if n is not None and turn != n:
+            log(f"work-status.json: stale turn {turn} (current {n}); automatic continuation disabled")
+            return None
+        mode = data.get("mode")
+        if mode not in WORK_STATUS_MODES:
+            log(f"work-status.json: unknown mode {mode!r}; automatic continuation disabled")
+            return None
+        track, channel = _ws_str(data.get("track")), _ws_str(data.get("channel"))
+        thread_ts, message_ts = _ws_str(data.get("thread_ts")), _ws_str(data.get("message_ts"))
+        if None in (track, channel, thread_ts, message_ts):
+            log("work-status.json: missing/invalid track/channel/thread_ts/message_ts; "
+                "automatic continuation disabled")
+            return None
+        out = {"turn": turn, "mode": mode, "track": track, "channel": channel, "thread_ts": thread_ts,
+               "message_ts": message_ts}
+        if mode == "continue":
+            next_action = _ws_str(data.get("next_action"))
+            if next_action is None:
+                log("work-status.json: continue needs a nonempty next_action; automatic continuation disabled")
+                return None
+            out["next_action"] = next_action
+        if mode in ("idle", "waiting"):
+            deadline = _ws_num(data.get("deadline"))
+            if deadline is None:
+                log(f"work-status.json: {mode} needs a finite deadline; automatic continuation disabled")
+                return None
+            out["deadline"] = deadline
+        if mode == "waiting":
+            who, since = _ws_str(data.get("who")), _ws_num(data.get("since"))
+            if who is None or since is None:
+                log("work-status.json: waiting needs who and since; automatic continuation disabled")
+                return None
+            out["who"], out["since"] = who, since
+        target = None
+        for ev in events or []:
+            p = _payload(ev)
+            if ev.get("source") == "slack" and p.get("channel") == channel and str(p.get("ts")) == str(message_ts):
+                target = ev
+                break
+        out["_target"] = target
+        return out
+
+    def _prepare_waiting_footer(self, n, events):
+        """The `⏲` footer to append before plan_deliveries (requirement 18, loops/b7.md), or None for
+        continue/done/invalid. Idle shows the deadline alone; waiting also names who. Never generated for
+        active work (continue) or when there is no waiting claim (done)."""
+        data = self._validate_work_status(n, events)
+        if data is None:
+            return None
+        if data["mode"] == "idle":
+            return f"⏲ next check {la_time_label(data['deadline'])}"
+        if data["mode"] == "waiting":
+            return f"⏲ waiting on {data['who']}; next check {la_time_label(data['deadline'])}"
+        return None
+
+    def settle_work(self, n, events):
+        """Called after every successful turn's delivery and persistence attempt, including a blank reply
+        (requirement 16, loops/b7.md): reconciles the waiting-clock reaction, then, for mode `continue` only,
+        reserves and enqueues the automatic continuation (requirement 17)."""
+        data = self._validate_work_status(n, events)
+        self._set_desired_work_reaction(self._desired_work_reaction(data))
+        if data is not None and data["mode"] == "continue":
+            self._maybe_continue(data)
+
+    # ---- the waiting-clock reaction (requirement 18, loops/b7.md): persisted target and desired/confirmed
+    # state across restart; a failed add/remove retries once per tick without claiming false success.
+
+    def _desired_work_reaction(self, data):
+        if data is not None and data["mode"] in ("idle", "waiting") and data.get("_target") is not None:
+            p = _payload(data["_target"])
+            return (p.get("channel"), str(p.get("ts")), REACTION_TIMER_CLOCK)
+        return None
+
+    def work_reaction_path(self):
+        return self.path("logs", "work-reaction.json")
+
+    def _read_work_reaction(self):
+        try:
+            data = json.loads(read_text(self.work_reaction_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_work_reaction(self, data):
+        write_text(self.work_reaction_path(), json.dumps(data) + "\n")
+
+    def _set_desired_work_reaction(self, desired):
+        """`desired` is (channel, ts, name) to ensure added, or None to ensure any standing clock is removed
+        (active work resumed). Attempts immediately; a failure persists confirmed=False so run_once retries."""
+        state = self._read_work_reaction()
+        current = (state.get("channel"), state.get("ts"), state.get("name")) if state.get("channel") else None
+        if desired is None and current is None:
+            return
+        if desired == current and state.get("confirmed") and state.get("action") == "add":
+            return
+        if desired is not None:
+            channel, ts, name = desired
+            new_state = {"channel": channel, "ts": ts, "name": name, "action": "add", "confirmed": False}
+        else:
+            channel, ts, name = current
+            new_state = {"channel": channel, "ts": ts, "name": name, "action": "remove", "confirmed": False}
+        self._save_work_reaction(new_state)
+        self.reconcile_work_reaction()
+
+    def reconcile_work_reaction(self):
+        """Retried on every run_once tick, including one with no events, and after restart (requirement 18/19,
+        loops/b7.md): a failed add/remove is logged and retried next tick, never recorded as confirmed."""
+        state = self._read_work_reaction()
+        if not state or state.get("confirmed") or not state.get("channel"):
+            return
+        channel, ts, name = state.get("channel"), state.get("ts"), state.get("name")
+        action = state.get("action") or "add"
+        try:
+            getattr(self.reactor, action)(channel, ts, name)
+        except Exception as e:  # best effort; retried next tick, never falsely confirmed
+            log(f"work reaction {action} failed ({name} on {channel}/{ts}): {e} (retried next tick)")
+            return
+        state["confirmed"] = True
+        self._save_work_reaction(state)
+
+    # ---- automatic continuation (requirement 17, loops/b7.md): a deterministic id, a rolling-hour reservation
+    # counted across restarts, and a crash-safe two-step intent (reserved, then enqueued).
+
+    def continuation_reservations_path(self):
+        return self.path("logs", "continuation-reservations.jsonl")
+
+    def continuation_intent_path(self):
+        return self.path("logs", "continuation-intent.json")
+
+    def _continuation_cap(self):
+        cfg = self.config.get("continuation")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        if "max_per_hour" not in cfg:
+            return CONTINUATION_DEFAULT_MAX_PER_HOUR
+        limit = cfg.get("max_per_hour")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (0 <= limit <= 60):
+            log(f"continuation.max_per_hour invalid ({limit!r}); automatic continuation disabled")
+            return 0
+        return limit
+
+    def _continuation_count(self, now):
+        total = 0
+        for r in read_jsonl(self.continuation_reservations_path()):
+            at = r.get("at")
+            if isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < CONTINUATION_WINDOW_S:
+                total += 1
+        return total
+
+    def _continuation_blocked_by_queue(self):
+        """No pending reply and no pending external event (requirement 17): any event already queued, or a
+        reply still awaiting delivery, means real work exists and an automatic task must not run ahead of it."""
+        if os.path.exists(self.path("inbox", "pending-replies.jsonl")):
+            return True
+        return bool(pending_events(self.home))
+
+    def _maybe_continue(self, data):
+        if self.paused() or self._continuation_blocked_by_queue():
+            return
+        turn = data["turn"]
+        event_id = f"continue-{turn}"
+        if event_id in handled_ids(self.home) or any(e.get("id") == event_id for e in pending_events(self.home)):
+            return  # already reserved for this turn (idempotent across restart/retries)
+        cap = self._continuation_cap()
+        now = self.clock_epoch()
+        if cap <= 0 or self._continuation_count(now) >= cap:
+            return
+        self._reserve_continuation(turn, data["track"], data["next_action"], data["channel"], data["thread_ts"])
+
+    def _reserve_continuation(self, turn, track, next_action, channel, thread_ts):
+        event_id = f"continue-{turn}"
+        intent = {"turn": turn, "id": event_id, "track": track, "next_action": next_action,
+                  "channel": channel, "thread_ts": thread_ts}
+        write_text(self.continuation_intent_path(), json.dumps(intent) + "\n")
+        append_jsonl(self.continuation_reservations_path(), {"turn": turn, "at": self.clock_epoch(), "id": event_id})
+        self.persistence_checkpoint("continuation_reserved")
+        self._enqueue_continuation(intent)
+
+    def _enqueue_continuation(self, intent):
+        """Idempotent: a restart (or a second settle_work for the same turn) never duplicates the event. It
+        carries instructs:false and cannot grant new authority -- the manager still decides whether to act."""
+        event_id = intent["id"]
+        if event_id not in handled_ids(self.home) and not any(e.get("id") == event_id for e in pending_events(self.home)):
+            text = f"continue {intent['track']}: {intent['next_action']}"
+            append_event(self.home, new_event(
+                "timer", {"text": text, "instructs": False, "channel": intent.get("channel"),
+                          "thread_ts": intent.get("thread_ts"), "continuation": True, "track": intent.get("track")},
+                event_id=event_id))
+        self.persistence_checkpoint("continuation_enqueued")
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.continuation_intent_path())
+
+    def _reconcile_continuation_intent(self):
+        """Restart reconciles an incomplete reservation once (requirement 17, loops/b7.md): the reservation was
+        already counted before the intent was written, so this only ever finishes the enqueue, never repeats
+        the count or double-enqueues."""
+        try:
+            intent = json.loads(read_text(self.continuation_intent_path(), "") or "null")
+        except json.JSONDecodeError:
+            intent = None
+        if isinstance(intent, dict) and intent.get("id"):
+            self._enqueue_continuation(intent)
+
+    # ---- durable persistence status (requirement 19, loops/b7.md)
+
+    def persistence_status_path(self):
+        return self.path("logs", "persistence.json")
+
+    def _read_persistence_status(self):
+        try:
+            data = json.loads(read_text(self.persistence_status_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_persistence_status(self, **fields):
+        state = self._read_persistence_status()
+        state.update(fields)
+        write_text(self.persistence_status_path(), json.dumps(state, indent=1) + "\n")
+        return state
+
+    def _repo_unsafe_dirty(self):
+        """True when the working tree or index has anything outside the manager-owned factory/state.json,
+        factory/log/ and manager-memory paths (requirement 19, loops/b7.md): persistence must not stage,
+        commit, unstage or otherwise alter those files/entries, so it refuses to touch git at all."""
+        status = self._git("status", "--porcelain", "-uall")
+        if status.returncode != 0:
+            return True  # cannot verify safety; refuse rather than risk it
+        for line in status.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:].strip().split(" -> ")[-1].strip().strip('"')
+            if path in MANAGED_REPO_PATHS or any(path.startswith(p) for p in MANAGED_REPO_PREFIXES):
+                continue
+            return True
+        return False
+
+    def _persistence_fail(self, step, detail, blocked=False, pending_local_sha=None):
+        prev = self._read_persistence_status()
+        was_failing = prev.get("status") in ("pending", "blocked")
+        episode_id = prev.get("episode_id") if was_failing else str(uuid.uuid4())
+        status = "blocked" if blocked else "pending"
+        error = f"{step}: {detail}"[:2000]
+        fields = {"status": status, "error": error, "episode_id": episode_id,
+                  "retry_after": self.clock_epoch() + PERSISTENCE_RETRY_AFTER_S}
+        if pending_local_sha is not None:
+            fields["pending_local_sha"] = pending_local_sha
+        self._save_persistence_status(**fields)
+        log(f"persistence {status}: {error}")
+        if not was_failing:
+            _queue_notice_once(self.home, self.dev_channel, f"persistence {status} (episode {episode_id}): {error}",
+                               f"persistence-{episode_id}-failed")
+        return False
+
+    def _persistence_recovered(self, last_sha):
+        prev = self._read_persistence_status()
+        was_failing = prev.get("status") in ("pending", "blocked")
+        episode_id = prev.get("episode_id")
+        self._save_persistence_status(status="synced", error=None, pending_local_sha=None,
+                                      last_successful_push_sha=last_sha, retry_after=None)
+        if was_failing and episode_id:
+            _queue_notice_once(self.home, self.dev_channel,
+                               f"persistence recovered (episode {episode_id}): synced at {last_sha[:12]}",
+                               f"persistence-{episode_id}-recovered")
+        return True
+
+    def reconcile_persistence(self):
+        """Retried on every run_once tick, including one with no events, and after restart (requirement 19,
+        loops/b7.md): only a `pending` (retryable) status is retried automatically, and only once its own
+        60-second deadline has passed -- never a tight loop, and a new turn never resets that deadline.
+        `blocked` (a dirty tree or a real merge conflict) needs the founder, not an automatic retry."""
         if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
             return
+        status = self._read_persistence_status()
+        if status.get("status") != "pending":
+            return
+        retry_after = status.get("retry_after")
+        if isinstance(retry_after, (int, float)) and self.clock_epoch() < retry_after:
+            return
+        self.sync_repo_before()
+        self.persist(status.get("last_turn") or 0)
+
+    def sync_repo_before(self):
+        """Fetch and reconcile a clean diverged clone with an ordinary merge, preserving both histories (no
+        force-push, reset or automatic conflict resolution, requirement 19, loops/b7.md). A real conflict
+        aborts the merge, retains local work and marks `blocked`; unmanaged dirt blocks before touching git."""
+        self._sync_blocked = False
+        if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
+            return
+        if self._repo_unsafe_dirty():
+            self._sync_blocked = True
+            self._persistence_fail("dirty", "repo has unmanaged local changes outside managed paths", blocked=True)
+            return
         try:
-            self._git("pull", "-q", "--ff-only", timeout=120)
+            fetch = self._git("fetch", "-q", "origin", timeout=120)
+            if fetch.returncode != 0:
+                self._persistence_fail("fetch", (fetch.stderr or "").strip()[-500:] or f"exit {fetch.returncode}")
+                return
+            branch = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            upstream = self._git("rev-parse", "--verify", f"origin/{branch}")
+            if upstream.returncode == 0:
+                merge = self._git("merge", "-q", "--no-edit", f"origin/{branch}", timeout=120)
+                if merge.returncode != 0:
+                    self._git("merge", "--abort")
+                    self._sync_blocked = True
+                    self._persistence_fail("merge", (merge.stderr or merge.stdout or "").strip()[-500:], blocked=True)
+                    return
         except (OSError, subprocess.SubprocessError) as e:
-            log(f"pull skipped: {e}")
+            self._persistence_fail("fetch", str(e))
+            return
         repo_state = os.path.join(self.repo, "factory", "state.json")
         if not os.path.exists(self.path("state.json")) and os.path.exists(repo_state):
             shutil.copyfile(repo_state, self.path("state.json"))
 
     def persist(self, n):
         """Copy mirror/ into factory/log/ and state.json into factory/, add the memory folder, commit
-        `manager: turn <n>`, push."""
+        `manager: turn <n>`, push -- checking every Git return code (requirement 19, loops/b7.md): a failed
+        pull/add/commit/push is never reported as synced, and an existing unpushed local commit is retried
+        even with nothing newly staged this turn."""
         if not self.repo:
+            self._save_persistence_status(status="no_repo", error=None)
             return False
         if not os.path.isdir(os.path.join(self.repo, ".git")):
             log(f"repo {self.repo} is not a git clone; persistence skipped")
+            self._save_persistence_status(status="no_repo", error=None)
             return False
+        self._save_persistence_status(last_turn=n)
+        status = self._read_persistence_status()
+        retry_after = status.get("retry_after")
+        if status.get("status") == "pending" and isinstance(retry_after, (int, float)) \
+                and self.clock_epoch() < retry_after:
+            return False  # back off; a new turn does not reset this deadline
+        if getattr(self, "_sync_blocked", False) or self._repo_unsafe_dirty():
+            return self._persistence_fail("dirty", "repo has unmanaged local changes outside managed paths",
+                                          blocked=True)
         log_dir = os.path.join(self.repo, "factory", "log")
         os.makedirs(log_dir, exist_ok=True)
         mirror = self.path("mirror")
@@ -2738,18 +3184,24 @@ class Supervisor:
         paths = ["factory/log"] + (["factory/state.json"] if os.path.exists(repo_state) else []) + \
                 ([MEMORY_DIRNAME] if os.path.isdir(os.path.join(self.repo, MEMORY_DIRNAME)) else [])
         try:
-            self._git("add", "-A", "--", *paths)
-            if self._git("diff", "--cached", "--quiet").returncode == 0:
-                return False
-            self._git("commit", "-q", "-m", f"manager: turn {n}", check=True)
+            add = self._git("add", "-A", "--", *paths)
+            if add.returncode != 0:
+                return self._persistence_fail("add", (add.stderr or "").strip()[-500:] or f"exit {add.returncode}")
+            diff = self._git("diff", "--cached", "--quiet")
+            if diff.returncode not in (0, 1):
+                return self._persistence_fail("diff", (diff.stderr or "").strip()[-500:] or f"exit {diff.returncode}")
+            if diff.returncode == 1:
+                commit = self._git("commit", "-q", "-m", f"manager: turn {n}")
+                if commit.returncode != 0:
+                    return self._persistence_fail("commit", (commit.stderr or commit.stdout or "").strip()[-500:])
+            local_sha = self._git("rev-parse", "HEAD").stdout.strip()
             push = self._git("push", "-q", "origin", "HEAD", timeout=180)
             if push.returncode != 0:
-                log(f"push failed: {push.stderr.strip()[-300:]}")
-                return False
+                return self._persistence_fail("push", (push.stderr or "").strip()[-500:] or f"exit {push.returncode}",
+                                              pending_local_sha=local_sha)
         except (OSError, subprocess.SubprocessError) as e:
-            log(f"persist failed: {e}")
-            return False
-        return True
+            return self._persistence_fail("exception", str(e))
+        return self._persistence_recovered(local_sha)
 
     # ---- the service loop
     def add_timer_event(self, now=None):
