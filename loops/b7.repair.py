@@ -233,9 +233,53 @@ def self_retry_mixed():
     assert Path(h,'calls').read_text()=='x','FLOOD delivery retry reran engine'
     assert len(posted)==1 and posted[0][1]=='track','FLOOD recovered reply escaped thread'
 
+
+def partial_delivery_recovery():
+    # Real service dispatch; a persisted remainder already proves first was confirmed.
+    h=home();posted=[];fail=[True];hits=[]
+    extra=f"p=pathlib.Path({str(Path(h)/'calls')!r});p.write_text(p.read_text()+'x' if p.exists() else 'x')\n"
+    engines=fake_engine(h,'partial reply\n'+HANDOFF,extra)
+    def poster(channel,thread,text):
+        if thread=='second' and fail[0]:raise RuntimeError('offline second')
+        posted.append(thread)
+    def make():return S.Supervisor(home=h,engines=engines,poster=poster)
+    for ts in ('first','second'):S.append_event(h,event(ts,instructs=True))
+    make().run_once()
+    assert posted==['first'],'PARTIAL fixture did not confirm first only'
+    assert Path(h,'inbox/pending-replies.jsonl').exists(),'PARTIAL missing durable remainder'
+    original=S.Supervisor.deliver
+    def crash_before_post(self,deliveries,ids,n):
+        hits.append('before_post');raise Crash()
+    # Twice restart before another request; confirmed first must remain excluded.
+    for _ in range(2):
+        with patch.object(S.Supervisor,'deliver',crash_before_post):
+            try:make().run_once()
+            except Crash:pass
+    assert len(hits)==2,'PARTIAL recovery fault not reached'
+    fail[0]=False
+    for _ in range(3):make().run_once()
+    assert posted==['first','second'],'PARTIAL confirmed destination replayed or remainder lost: '+repr(posted)
+    assert Path(h,'calls').read_text()=='x','PARTIAL recovery reran engine'
+    assert not S.pending_events(h),'PARTIAL original events not handled'
+
+
+def unavailable_self_routing():
+    for channel,thread in (('C',None),(None,None),('C','track')):
+        h=home();posted=[]
+        sup=S.Supervisor(home=h,poster=lambda *a:posted.append(a))
+        ev=S.new_event('self',{'text':'continue b','channel':channel,'thread_ts':thread,'instructs':False},event_id='self-unavailable')
+        # This is the actual shared all-engines-failed notice sink, not normal reply routing.
+        sup.post_unavailable([ev]);sup.post_unavailable([ev])
+        if channel and thread:
+            assert len(posted)==1 and posted[0][:2]==('C','track'),'SELF_FAILURE wrong thread or duplicate'
+        else:
+            assert not posted,'SELF_FAILURE unroutable notice posted to Slack'
+            rows=S.read_jsonl(sup.path('logs','self-replies.jsonl'))
+            assert len(rows)==1 and rows[0].get('id')=='self-unavailable' and rows[0].get('text'),'SELF_FAILURE missing durable local notice'
+
 if __name__=='__main__':
     failures=[]
-    for fn in (cap_recovery,delivery_settlement,rollover_service_recovery,stale_sdk_reconnect,waiting_target_recovery,incoming_turn_backoff,self_routing,self_retry_mixed):
+    for fn in (cap_recovery,delivery_settlement,rollover_service_recovery,stale_sdk_reconnect,waiting_target_recovery,incoming_turn_backoff,self_routing,self_retry_mixed,partial_delivery_recovery,unavailable_self_routing):
         try:fn()
         except Exception as e:failures.append(fn.__name__);print('[b7 repair] FAIL',fn.__name__,type(e).__name__,str(e),flush=True)
         else:print('[b7 repair] OK',fn.__name__,flush=True)
