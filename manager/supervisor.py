@@ -2674,7 +2674,11 @@ class Supervisor:
                 pending["cli"].pop(0)
         except Exception as e:  # delivery failed: keep the reply, do not handle the events
             log(f"delivery failed, reply kept pending: {e}")
-            append_jsonl(self.path("inbox", "pending-replies.jsonl"), pending)
+            # `pending` by now holds only the destinations not yet confirmed (already-posted/mirrored ones were
+            # popped above): replacing the durable record -- never appending on top of a still-present one made
+            # by an earlier failed attempt at the same remainder -- is what lets repeated recovery crashes keep
+            # retrying the same shrinking remainder instead of ever reposting a confirmed destination.
+            write_text(self.path("inbox", "pending-replies.jsonl"), json.dumps(pending, ensure_ascii=False) + "\n")
             return False
         self.react_delivered(event_ids)
         mark_handled(self.home, event_ids, turn=n)
@@ -2834,11 +2838,15 @@ class Supervisor:
     def deliver_pending(self):
         """A pending reply defers settlement (requirement 16/21, loops/b7.md: B2): once a recovered delivery is
         confirmed (already handled -- never reposted -- or newly delivered now), the persistence attempt and
-        settle_work run here, once, with the turn's original events (by id, from the durable event log)."""
+        settle_work run here, once, with the turn's original events (by id, from the durable event log).
+        The durable record is read but NOT removed up front (audit gap correction, loops/b7.md): once a
+        destination is confirmed, the remainder still on disk is the only durable progress this retry has made,
+        and a crash during that retry -- even mid-`deliver()` -- must find that same remainder again next tick
+        rather than falling back to the original full batch. It is removed for an item only once that item's
+        delivery is actually confirmed, immediately before the (idempotent) persistence attempt and settlement
+        that follow, so a confirmed item is never mistaken for a reply still awaiting delivery."""
         path = self.path("inbox", "pending-replies.jsonl")
         items = read_jsonl(path)
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(path)
         ok = True
         for item in items:
             ids = item.get("events") or []
@@ -2848,6 +2856,8 @@ class Supervisor:
                 delivered = self.deliver({"slack": item.get("slack") or [], "cli": item.get("cli") or [],
                                           "self": item.get("self") or []}, ids, n)
             if delivered:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path)
                 self._finish_settlement(n, ids)
             else:
                 ok = False
@@ -2903,22 +2913,32 @@ class Supervisor:
         return True
 
     def post_unavailable(self, events):
+        """The shared all-engines-failed notice sink (requirement 25, loops/b7.md; audit gap correction): a
+        founder CLI event still gets its reply file; every other event's notice goes to its own usable
+        (channel, thread_ts) at most once per note_once window, deduplicated across restarts. A `self` event
+        with no usable channel+thread never falls back to a dev-channel top-level post: it is durably recorded
+        in logs/self-replies.jsonl instead, with zero Slack posts, idempotent by event id (the same sink used
+        for an unroutable self reply)."""
+        msg = "manager unavailable (every engine failed), will retry"
         seen = set()
         for ev in events:
             p = _payload(ev)
-            channel = p.get("channel")
-            if not channel or ev.get("source") == "cli":
-                if ev.get("source") == "cli":
-                    write_text(self.path("inbox", "replies", f"{ev.get('id')}.txt"),
-                               "manager unavailable (every engine failed), will retry\n")
+            channel, thread_ts, source = p.get("channel"), p.get("thread_ts"), ev.get("source")
+            if source == "cli":
+                write_text(self.path("inbox", "replies", f"{ev.get('id')}.txt"), msg + "\n")
                 continue
-            key = (channel, p.get("thread_ts"))
+            if source == "self" and not (channel and thread_ts):
+                self._record_self_reply({"id": ev.get("id"), "text": msg})
+                continue
+            if not channel:
+                continue
+            key = (channel, thread_ts)
             if key in seen:
                 continue
             seen.add(key)
-            if self.note_once(f"unavailable:{channel}:{p.get('thread_ts')}"):
+            if self.note_once(f"unavailable:{channel}:{thread_ts}"):
                 try:
-                    self.poster(channel, p.get("thread_ts"), "manager unavailable (every engine failed), will retry")
+                    self.poster(channel, thread_ts, msg)
                 except Exception as e:
                     log(f"could not post the unavailable note: {e}")
 
