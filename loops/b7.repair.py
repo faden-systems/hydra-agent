@@ -24,7 +24,18 @@ def cap_recovery():
         except Crash:pass
     assert hits,'B1 missing actual intent-before-reservation checkpoint'
     now[0]=1100
-    for _ in range(2):make()._reconcile_continuation_intent()
+    recovery_hits=[]
+    def recovery_crash(self,name):
+        if name=='continuation_reserved':recovery_hits.append(name);raise Crash()
+    with patch.object(S.Supervisor,'persistence_checkpoint',recovery_crash):
+        try:
+            recovering=make()
+            with patch.object(recovering,'turn',return_value=False):recovering.run_once()
+        except Crash:pass
+    assert recovery_hits,'B1 recovery did not expose durable reservation boundary'
+    for _ in range(2):
+        recovering=make()
+        with patch.object(recovering,'turn',return_value=False):recovering.run_once()
     q=S.pending_events(h);assert [e['id'] for e in q]==['continue-1']
     reservations=S.read_jsonl(make().continuation_reservations_path())
     assert len(reservations)==1 and reservations[0]['at']==1000,'B1 reservation timestamp/count lost'
@@ -33,11 +44,15 @@ def cap_recovery():
     assert not S.pending_events(h),'B1 hourly cap bypassed after recovery'
 
 def delivery_settlement():
-    for boundary in ('settlement_before_delivery','persist','settlement_completed'):
+    for boundary in ('settlement_before_delivery','persist','settlement_completed','failed_delivery'):
         h=home();posted=[];status(h)
         extra=f"p=pathlib.Path({str(Path(h)/'engine-calls')!r});p.write_text(p.read_text()+'x' if p.exists() else 'x')\n"
         engines=fake_engine(h,'repair reply\n'+HANDOFF,extra)
-        def make():return S.Supervisor(home=h,engines=engines,poster=lambda *a:posted.append(a),config={'continuation':{'max_per_hour':1}})
+        fail_post=[boundary=='failed_delivery']
+        def poster(*args):
+            if fail_post[0]:raise RuntimeError('offline fixture')
+            posted.append(args)
+        def make():return S.Supervisor(home=h,engines=engines,poster=poster,config={'continuation':{'max_per_hour':1}})
         sup=make();S.append_event(h,event('origin',instructs=True));hits=[]
         def crash(name):
             if name==boundary:hits.append(name);raise Crash()
@@ -48,7 +63,17 @@ def delivery_settlement():
         with cm:
             try:sup.run_once()
             except Crash:pass
-        assert hits,'B2 missing boundary '+boundary
+        if boundary=='failed_delivery':
+            assert Path(h,'inbox/pending-replies.jsonl').exists(),'B2 failed reply not retained'
+            fail_post[0]=False
+            recovery_hits=[]
+            def recovery_crash(self,name):
+                if name=='settlement_recovered':recovery_hits.append(name);raise Crash()
+            with patch.object(S.Supervisor,'persistence_checkpoint',recovery_crash):
+                try:make().run_once()
+                except Crash:pass
+            assert recovery_hits,'B2 recovered delivery boundary not reached'
+        else:assert hits,'B2 missing boundary '+boundary
         for _ in range(2):
             restarted=make()
             with patch.object(restarted,'turn',return_value=False),patch.object(restarted,'compaction_due',return_value=(False,'')):
@@ -71,6 +96,13 @@ def rollover_service_recovery():
             except Crash:pass
         assert hits,'B3 checkpoint not hit'
         intended=json.loads(Path(h,'rollover-intent.json').read_text())['new_id']
+        recovery_hits=[]
+        def recovery_crash(self,name):
+            if name=='rollover_recovered':recovery_hits.append(name);raise Crash()
+        with patch.object(S.Supervisor,'persistence_checkpoint',recovery_crash):
+            try:make().run_once()
+            except Crash:pass
+        assert recovery_hits,'B3 recovery bookkeeping boundary not reached'
         for _ in range(2):
             restarted=make();restarted.run_once()
             assert restarted.session_id()==intended,'B3 replay changed intended UUID'
@@ -82,15 +114,37 @@ def rollover_service_recovery():
 
 def stale_sdk_reconnect():
     from slack_sdk.socket_mode.client import BaseSocketModeClient
-    calls=[]
-    client=SimpleNamespace(connect_operation_lock=threading.Lock(),logger=logging.getLogger('repair'),
-        is_connected=lambda:True,current_session=SimpleNamespace(last_ping_pong_time=None),
-        issue_new_wss_url=lambda:(calls.append('url') or 'wss://fixture.invalid'),connect=lambda:calls.append('connect'))
-    client.connect_to_new_endpoint=MethodType(BaseSocketModeClient.connect_to_new_endpoint,client)
-    # A silent replacement may correctly raise after its bounded grace period.
-    try:B._reconnect_or_die(client,.05)
-    except (RuntimeError,TimeoutError):pass
-    assert calls==['url','connect'],'B4 SDK connected-but-stale reconnect was a no-op'
+    import time
+    for mode in ('silent','old-pong','fresh'):
+        calls=[];offset=[0.0];stopped=threading.Event();started=time.monotonic()
+        clock=lambda:time.monotonic()-started+offset[0]
+        client=SimpleNamespace(connect_operation_lock=threading.Lock(),logger=logging.getLogger('repair'),
+            socket_mode_request_listeners=[],auto_reconnect_enabled=True,default_auto_reconnect_enabled=True,
+            is_connected=lambda:True,current_session=SimpleNamespace(last_ping_pong_time=1),
+            issue_new_wss_url=lambda:(calls.append('url') or 'wss://fixture.invalid'))
+        def connect():
+            calls.append('connect')
+            client.current_session=SimpleNamespace(last_ping_pong_time=1 if mode=='old-pong' else None)
+            if mode=='fresh':
+                threading.Timer(.005,lambda:setattr(client.current_session,'last_ping_pong_time',2)).start()
+                threading.Timer(.03,stopped.set).start()
+        client.connect=connect
+        client.connect_to_new_endpoint=MethodType(BaseSocketModeClient.connect_to_new_endpoint,client)
+        class Stop:
+            def is_set(self):return stopped.is_set()
+            def wait(self,seconds):
+                if time.monotonic()-started>.4:raise AssertionError('B4 silent recovery did not fail within bound')
+                if offset[0]==0:offset[0]=301
+                return stopped.wait(.001)
+        handler=SimpleNamespace(client=client,connect=lambda:None)
+        failed=False
+        try:B.run_socket_mode(handler,Stop(),clock=clock,poll_s=.001,reconnect_timeout_s=.05)
+        except (RuntimeError,TimeoutError,SystemExit) as e:
+            if isinstance(e,SystemExit):assert e.code not in (None,0)
+            failed=True
+        assert failed==(mode!='fresh'),'B4 fresh activity verdict wrong: '+mode
+        assert calls==['url','connect'],'B4 must force exactly one bounded SDK reconnect: '+repr(calls)
+        assert time.monotonic()-started<.4,'B4 recovery deadline exceeded'
 
 def waiting_target_recovery():
     h=home();applied=set();failed=[True]
@@ -119,7 +173,7 @@ def incoming_turn_backoff():
     sup._save_persistence_status(status='pending',retry_after=1060,last_turn=1)
     with patch.object(sup,'_git',wraps=sup._git) as wrapped:
         for i in range(2):S.append_event(h,event('turn'+str(i),instructs=True));assert sup.run_once()
-        assert not any(c.args and c.args[0]=='fetch' for c in wrapped.call_args_list),'S2 new turn bypassed backoff'
+        assert not wrapped.called,'S2 new turn bypassed backoff'
         assert sup._read_persistence_status()['retry_after']==1060,'S2 retry deadline changed'
         now[0]=1061;S.append_event(h,event('after',instructs=True));sup.run_once()
         assert any(c.args and c.args[0]=='fetch' for c in wrapped.call_args_list),'S2 retry never resumed'
@@ -140,6 +194,8 @@ def self_routing():
         posted.clear();ev=S.new_event('self',payload)
         S.append_event(h,ev);assert sup.run_once();assert not posted,'FLOOD unthreaded self posted to Slack'
         assert ev['id'] in S.handled_ids(h)
+        rows=S.read_jsonl(str(Path(h)/'logs/self-replies.jsonl'))
+        assert any(r.get('id')==ev['id'] and 'self progress' in r.get('text','') for r in rows),'FLOOD local self reply lost'
     # Actual CLI entry: identical prompt text is still founder input.
     posted.clear()
     with patch.object(H,'supervisor_alive',return_value=False):assert H.cmd_say(h,['continue dogfood'])==0
@@ -147,9 +203,39 @@ def self_routing():
     assert sup.run_once()
     assert any(x[1] is None and 'from founder-console via console: continue dogfood' in x[2] for x in posted),'FLOOD founder CLI label changed'
 
+def self_retry_mixed():
+    for other in ('cli','slack'):
+        h=home();posted=[];engines=fake_engine(h,'mixed progress\n'+HANDOFF)
+        sup=S.Supervisor(home=h,engines=engines,poster=lambda *a:posted.append(a))
+        S.append_event(h,S.new_event('self',{'text':'continue dogfood','track':'dogfood','channel':'C','thread_ts':'track','instructs':False}))
+        if other=='cli':
+            with patch.object(H,'supervisor_alive',return_value=False):H.cmd_say(h,['founder request'])
+        else:S.append_event(h,event('human-thread',instructs=True))
+        # Priority may process external and self in separate turns; both must finish.
+        for _ in range(3):sup.run_once()
+        assert len([x for x in posted if x[1]=='track'])==1,'FLOOD mixed self thread lost'
+        tops=[x for x in posted if x[1] is None]
+        if other=='cli':
+            assert len(tops)==1 and 'from founder-console via console: founder request' in tops[0][2]
+        else:assert not tops and len([x for x in posted if x[1]=='human-thread'])==1
+        assert all('continue dogfood' not in x[2] for x in tops),'FLOOD self prompt mirrored as founder'
+    h=home();posted=[];failed=[True]
+    extra=f"p=pathlib.Path({str(Path(h)/'calls')!r});p.write_text(p.read_text()+'x' if p.exists() else 'x')\n"
+    engines=fake_engine(h,'retry self progress\n'+HANDOFF,extra)
+    def poster(*args):
+        if failed[0]:raise RuntimeError('offline')
+        posted.append(args)
+    def make():return S.Supervisor(home=h,engines=engines,poster=poster)
+    ev=S.new_event('self',{'text':'continue dogfood','track':'dogfood','channel':'C','thread_ts':'track','instructs':False})
+    S.append_event(h,ev);make().run_once()
+    assert Path(h,'inbox/pending-replies.jsonl').exists()
+    failed[0]=False;make().run_once();make().run_once()
+    assert Path(h,'calls').read_text()=='x','FLOOD delivery retry reran engine'
+    assert len(posted)==1 and posted[0][1]=='track','FLOOD recovered reply escaped thread'
+
 if __name__=='__main__':
     failures=[]
-    for fn in (cap_recovery,delivery_settlement,rollover_service_recovery,stale_sdk_reconnect,waiting_target_recovery,incoming_turn_backoff,self_routing):
+    for fn in (cap_recovery,delivery_settlement,rollover_service_recovery,stale_sdk_reconnect,waiting_target_recovery,incoming_turn_backoff,self_routing,self_retry_mixed):
         try:fn()
         except Exception as e:failures.append(fn.__name__);print('[b7 repair] FAIL',fn.__name__,type(e).__name__,str(e),flush=True)
         else:print('[b7 repair] OK',fn.__name__,flush=True)
