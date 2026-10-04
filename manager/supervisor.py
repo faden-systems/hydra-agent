@@ -49,6 +49,7 @@ import datetime as _dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -72,7 +73,14 @@ MEMORY_SKELETON = "# Manager memory (shared by every engine)\n\n## Facts\n\n## D
 HANDOFF_MARK = "---HANDOFF---"
 QUOTA_RE = re.compile(r"quota|usage limit|rate|\b40[13]\b", re.IGNORECASE)
 NO_SESSION_RE = re.compile(r"no conversation found|session.*not found|could not find session", re.IGNORECASE)
+CREDITS_RE = re.compile(r"\bcredits?\b", re.IGNORECASE)
+USAGE_LIMIT_RE = re.compile(r"\busage limit\b", re.IGNORECASE)
+AUTH_RE = re.compile(r"\b(?:http|status)\D{0,6}(401|403)\b|\b(?:unauthorized|forbidden)\b", re.IGNORECASE)
+RATE_LIMIT_RE = re.compile(r"\brate[\s-]?limit(?:ed)?\b|\b429\b", re.IGNORECASE)
+PROMPT_TOO_LONG_RE = re.compile(r"\bprompt\s+(?:is\s+)?too long\b", re.IGNORECASE)
+FAILURE_REASON_MAX = 4000
 LONG_REPLY_LINES = 40
+NO_REPLY_PLACEHOLDER = "(turn produced no reply text)"
 LONG_REPLY_HEAD = 15
 TIMER_EVERY_S = 900
 LOOP_SLEEP_S = 5
@@ -107,6 +115,53 @@ REACTION_HEARTBEAT = "hourglass_flowing_sand"
 HEARTBEAT_DEFAULT_S = 20
 HEARTBEAT_JOIN_S = 60  # how long delivery waits for a swap in flight before going on without the ticker
 OUTBOX_MAX_ATTEMPTS = 5
+REACTION_TIMER_CLOCK = "timer_clock"
+WORK_STATUS_MODES = ("continue", "idle", "waiting", "done")
+WORK_STATUS_STR_LIMIT = 4096
+CONTINUATION_WINDOW_S = 3600
+CONTINUATION_DEFAULT_MAX_PER_HOUR = 6
+PERSISTENCE_RETRY_AFTER_S = 60
+MANAGED_REPO_PATHS = ("factory/state.json",)
+MANAGED_REPO_PREFIXES = ("factory/log/", MEMORY_DIRNAME + "/")
+LA_ZONE = zoneinfo.ZoneInfo("America/Los_Angeles")
+
+
+def la_time_label(epoch):
+    """`HH:MM PDT`/`HH:MM PST` for a UTC epoch in America/Los_Angeles (requirement 18, loops/b7.md)."""
+    when = _dt.datetime.fromtimestamp(float(epoch), _dt.timezone.utc).astimezone(LA_ZONE)
+    return when.strftime("%H:%M %Z")
+
+
+def read_work_status(home):
+    """The raw `work-status.json` dict, or None when absent/unreadable/not an object. Manager-owned: never
+    parsed from an incoming Slack message (requirement 16, loops/b7.md)."""
+    try:
+        raw = read_text(os.path.join(home, "work-status.json"), "")
+        if not raw.strip():
+            return None
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ws_str(value, required=True):
+    """A validated work-status string field: at most 4096 characters, never a bool. None (invalid) or '' is
+    rejected when `required`; an absent optional field is the empty string."""
+    if value is None:
+        return None if required else ""
+    if isinstance(value, bool) or not isinstance(value, str) or len(value) > WORK_STATUS_STR_LIMIT:
+        return None
+    if required and not value:
+        return None
+    return value
+
+
+def _ws_num(value):
+    """A validated finite, non-boolean number (a UTC epoch), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
 
 
 # ----------------------------------------------------------------------------------------------- paths and files
@@ -128,7 +183,11 @@ def read_jsonl(path):
     if not os.path.exists(path):
         return []
     out = []
-    with open(path, encoding="utf-8") as f:
+    try:
+        f = open(path, encoding="utf-8")
+    except FileNotFoundError:  # a race between the exists check and open (requirement 8, loops/b7.md)
+        return []
+    with f:
         for line in f:
             line = line.strip()
             if not line:
@@ -227,6 +286,18 @@ def pending_events(home):
             continue
         seen.add(eid)
         out.append(ev)
+    return out
+
+
+def events_by_ids(home, ids):
+    """The full event records for `ids`, in queue order, from the durable event log (regardless of handled
+    status) -- used to recover the original events for a deferred settlement (requirement 16, loops/b7.md)."""
+    wanted, seen, out = set(ids), set(), []
+    for ev in read_jsonl(os.path.join(home, "inbox", "events.jsonl")):
+        eid = ev.get("id")
+        if eid in wanted and eid not in seen:
+            seen.add(eid)
+            out.append(ev)
     return out
 
 
@@ -413,6 +484,24 @@ def read_reactions_state(home):
     return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
 
 
+def _normalize_work_reaction(data):
+    """{"applied": [(channel, ts, name), ...], "desired": (channel, ts, name) or None} from either the current
+    shape or a pre-S1 single-record one (requirement 18, loops/b7.md: S1), so a direct legacy-shape read or
+    write is interpreted the same way as the new multi-target bookkeeping."""
+    data = data if isinstance(data, dict) else {}
+    if "applied" in data or "desired" in data:
+        applied = [tuple(a) for a in (data.get("applied") or []) if isinstance(a, (list, tuple)) and len(a) == 3]
+        desired = data.get("desired")
+        desired = tuple(desired) if isinstance(desired, (list, tuple)) and len(desired) == 3 else None
+        return {"applied": applied, "desired": desired}
+    if data.get("channel"):
+        target = (data.get("channel"), data.get("ts"), data.get("name"))
+        if data.get("action") == "remove":
+            return {"applied": [target], "desired": None}
+        return {"applied": [target] if data.get("confirmed") else [], "desired": target}
+    return {"applied": [], "desired": None}
+
+
 def reaction_target(ev):
     """(channel, ts, thread_ts) of the Slack message an event stands for; None for timer and cli events, or when
     the event has no message ts (the payload's `ts`, else an id shaped like a Slack ts, as the bridge queues them)."""
@@ -531,6 +620,42 @@ def queue_post(home, channel, thread_ts, text, user=None):
     return rec
 
 
+# ----------------------------------------------------------------------------------------------- durable post receipts (requirement 8, loops/b7.md)
+
+def outbox_receipts_path(home):
+    return os.path.join(home, "inbox", "outbox-receipts.jsonl")
+
+
+def post_receipt(home, item_id):
+    """The durable posted/failed acknowledgement for one outbox item id, or None before one exists. The CLI waits
+    for this instead of inferring delivery from the queue's absence; absence alone never proves a post succeeded."""
+    receipt = None
+    for rec in read_jsonl(outbox_receipts_path(home)):
+        if rec.get("id") == item_id:
+            receipt = {k: v for k, v in rec.items() if k not in ("id", "at")}
+    return receipt
+
+
+def _write_receipt(home, item_id, data):
+    """Written under the outbox lock, before the queue entry is removed, so an interruption between the two
+    leaves a durable receipt a later drain recognizes without reposting. No credentials are ever included."""
+    with _outbox_lock(home):
+        append_jsonl(outbox_receipts_path(home), {"id": item_id, "at": now_iso(), **data})
+
+
+def _queue_notice_once(home, channel, text, note_id):
+    """Queue a stable-id top-level notice at most once, deduplicated across a crash even when a bridge receipt
+    for it already exists (requirement 12, loops/b7.md). Returns True when it was freshly queued."""
+    if post_receipt(home, note_id) is not None:
+        return False
+    with _outbox_lock(home):
+        if any(it.get("id") == note_id for it in read_outbox(home)):
+            return False
+        rec = {"id": note_id, "at": time.time(), "channel": channel, "thread_ts": None, "text": text, "user": None}
+        append_jsonl(outbox_path(home), rec)
+    return True
+
+
 def outbox_stats(home):
     try:
         data = json.loads(read_text(outbox_stats_path(home), "{}") or "{}")
@@ -553,26 +678,37 @@ def drain_outbox(home, post):
     """Post every queued line, oldest first, through `post(channel, thread_ts, text)` (the bridge's `post`, which is
     `post_and_record`). A line whose post raises stays, with `attempts` and `error`, and the drain stops there so
     order is kept; after OUTBOX_MAX_ATTEMPTS it is moved to inbox/outbox-failed.jsonl and the next line goes out.
-    Lines queued while posting are kept. Returns the number posted."""
+    Lines queued while posting are kept. An item whose durable receipt already exists (requirement 8, loops/b7.md:
+    an interrupted prior drain) is removed without reposting. Returns the number posted."""
     with _outbox_lock(home):
         items = read_outbox(home)
     if not items:
         return 0
     done, failed = [], []
     for item in items:
+        iid = item.get("id")
+        receipt = post_receipt(home, iid) if iid else None
+        if receipt is not None:
+            (done if receipt.get("status") == "posted" else failed).append(item)
+            continue
         try:
-            post(item.get("channel"), item.get("thread_ts"), item.get("text") or "")
+            result = post(item.get("channel"), item.get("thread_ts"), item.get("text") or "")
         except Exception as e:
             item["attempts"] = int(item.get("attempts") or 0) + 1
             item["error"] = str(e)[:500]
             if item["attempts"] >= OUTBOX_MAX_ATTEMPTS:
                 log(f"outbox: post {item.get('id')} to {item.get('channel')}/{item.get('thread_ts') or '-'} set aside "
                     f"after {item['attempts']} attempts: {e}")
+                if iid:
+                    _write_receipt(home, iid, {"status": "failed", "error": item["error"]})
                 failed.append(item)
                 continue
             log(f"outbox: post {item.get('id')} to {item.get('channel')}/{item.get('thread_ts') or '-'} failed "
                 f"(attempt {item['attempts']}): {e}; kept for the next drain")
             break
+        if iid:
+            ts = response_ts(result)
+            _write_receipt(home, iid, {"status": "posted", **({"ts": ts} if ts else {})})
         done.append(item)
     taken = {it["id"] for it in done} | {it["id"] for it in failed}
     touched = {it["id"]: it for it in items}
@@ -581,7 +717,8 @@ def drain_outbox(home, post):
         rest = [touched.get(it.get("id"), it) for it in current if it.get("id") not in taken]
         _write_outbox(home, rest)
         for it in failed:
-            append_jsonl(outbox_failed_path(home), {**it, "failed_at": now_iso()})
+            if not any(it.get("id") == f.get("id") for f in read_jsonl(outbox_failed_path(home))):
+                append_jsonl(outbox_failed_path(home), {**it, "failed_at": now_iso()})
         if done or failed:
             _count_outbox(home, posted=len(done), failed=len(failed))
     return len(done)
@@ -606,29 +743,129 @@ def read_state(home, repo=None):
     return data if isinstance(data, dict) else {}
 
 
-def tracks_summary(state):
+TRACK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+TRACK_NOW_LIMIT = 240
+
+
+def _valid_now(value):
+    return isinstance(value, str) and bool(value) and "\n" not in value and len(value) <= TRACK_NOW_LIMIT
+
+
+def _derive_now(text, limit=TRACK_NOW_LIMIT):
+    """A conservative one-line `now` out of legacy stage/status text (requirement 5, loops/b7.md): the last
+    nonblank line, whitespace collapsed, truncated with an ellipsis when it still runs long."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    base = " ".join((lines[-1] if lines else (text or "")).split())
+    if len(base) <= limit:
+        return base
+    return base[:limit - 1].rstrip() + "…"
+
+
+def _track_items(state):
+    """[(id, track_dict_or_other)] for list- or dict-shaped `tracks`, in order."""
     tracks = state.get("tracks")
-    lines = []
     if isinstance(tracks, dict):
-        for tid, tr in tracks.items():
-            if isinstance(tr, dict):
-                stage = tr.get("stage") or tr.get("status") or tr.get("state") or ""
-                owner = tr.get("owner") or tr.get("assignee") or ""
-                lines.append(f"{tid}: {stage}" + (f" ({owner})" if owner else ""))
-            else:
-                lines.append(f"{tid}: {tr}")
-    elif isinstance(tracks, list):
-        for tr in tracks:
-            if isinstance(tr, dict):
-                tid = tr.get("id") or tr.get("name") or "?"
-                stage = tr.get("stage") or tr.get("status") or ""
-                lines.append(f"{tid}: {stage}")
-            else:
-                lines.append(str(tr))
+        return [(str(tid), tr) for tid, tr in tracks.items()]
+    if isinstance(tracks, list):
+        return [(str(tr.get("id") or tr.get("name") or "?") if isinstance(tr, dict) else "?", tr) for tr in tracks]
+    return []
+
+
+def tracks_summary(state):
+    """One short line per track, `now` first (requirement 5, loops/b7.md): a legacy stage/status fallback
+    collapses whitespace and truncates to 240 characters, never expanding history into status."""
+    lines = []
+    for tid, tr in _track_items(state):
+        if not isinstance(tr, dict):
+            lines.append(f"{tid}: {tr}")
+            continue
+        now = tr.get("now")
+        if _valid_now(now):
+            text = now
+        else:
+            legacy = tr.get("stage") or tr.get("status") or tr.get("state") or ""
+            legacy = legacy if isinstance(legacy, str) else str(legacy)
+            text = _derive_now(legacy) if legacy else ""
+        owner = tr.get("owner") or tr.get("assignee") or ""
+        lines.append(f"{tid}: {text}" + (f" ({owner})" if owner else ""))
     return lines
 
 
+def migrate_track_history(home, repo):
+    """Mechanical migration, not a new verdict (requirement 5, loops/b7.md): every track gets a short `now`;
+    complete legacy stage text is archived (appended, never overwritten or duplicated) to
+    factory/log/tracks/<id>.md in `repo` before state.json is atomically replaced. Without a repo this is a no-op
+    retaining the working state byte-for-byte. Unsafe ids ([A-Za-z0-9_-]+ only) are rejected before anything is
+    written; reruns, including recovery after an archive write but before the state replace, are idempotent."""
+    path = os.path.join(home, "state.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return
+    try:
+        state = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return
+    if not isinstance(state, dict):
+        return
+    entries = [(tid, tr) for tid, tr in _track_items(state) if isinstance(tr, dict)]
+    for tid, _tr in entries:
+        if not TRACK_ID_RE.match(tid):
+            raise ValueError(f"unsafe track id: {tid!r}")
+    if not repo:
+        return  # no repo: retain the working state byte-for-byte
+    archive_writes, changed = [], 0
+    for tid, tr in entries:
+        stage = tr.get("stage")
+        legacy = stage if isinstance(stage, str) else ("" if stage is None else str(stage))
+        now = tr.get("now")
+        new_now = now if _valid_now(now) else _derive_now(legacy or (tr.get("status") or ""))
+        history_file = f"factory/log/tracks/{tid}.md"
+        if tr.get("stage") == new_now and tr.get("now") == new_now and tr.get("history_file") == history_file:
+            continue  # already migrated, nothing new written since: a true no-op
+        if legacy and legacy != new_now:
+            archive_writes.append((tid, legacy))
+        tr["now"], tr["stage"], tr["history_file"] = new_now, new_now, history_file
+        changed += 1
+    if not changed:
+        return 0
+    for tid, legacy in archive_writes:
+        archive_path = os.path.join(repo, "factory", "log", "tracks", f"{tid}.md")
+        os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+        existing = read_text(archive_path, "")
+        if legacy not in existing:
+            with open(archive_path, "a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(legacy.rstrip("\n") + "\n")
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(state, indent=1))
+    os.replace(tmp, path)
+    return changed
+
+
 # ----------------------------------------------------------------------------------------------- engines and models
+
+def classify_engine_error(text):
+    """credits|usage_limit|rate_limit|auth|prompt_too_long|other, from an engine failure's combined reason text.
+    Matches phrases/tokens, not substrings (`rate` inside `generate`/`separate` is not a rate limit); recognizes
+    429 and an explicit HTTP/status 401/403, not arbitrary embedded digits. In a combined prompt-too-long /
+    compaction-credit error, `credits` takes precedence (requirement 11, loops/b7.md)."""
+    text = text or ""
+    if CREDITS_RE.search(text):
+        return "credits"
+    if USAGE_LIMIT_RE.search(text):
+        return "usage_limit"
+    if AUTH_RE.search(text):
+        return "auth"
+    if RATE_LIMIT_RE.search(text):
+        return "rate_limit"
+    if PROMPT_TOO_LONG_RE.search(text):
+        return "prompt_too_long"
+    return "other"
+
 
 class BadEngine(Exception):
     """An `engine ...` command that names an unknown account, an unknown alias or a model of the wrong family."""
@@ -769,15 +1006,40 @@ def current_engine(home):
     return read_engine(home)["acc"]
 
 
-def set_engine(home, name, model=None, engines=None):
-    """Write the JSON engine file; `model` defaults to the family default. Returns the pair written."""
+def set_engine(home, name, model=None, engines=None, explicit=True):
+    """Write the JSON engine file; `model` defaults to the family default. Returns the pair written. `explicit`
+    (default True) means this is an operator selection: it updates engine-runtime.json's `configured` pair
+    (requirement 12, loops/b7.md). Automatic fallback persistence calls this with `explicit=False` so it never
+    overwrites the operator's recorded preference."""
     pair = {"acc": name, "model": model or family_default_model(family_of(name, engines))}
     write_text(os.path.join(home, "engine"), json.dumps(pair) + "\n")
+    if explicit:
+        runtime = read_engine_runtime(home)
+        runtime["configured"] = pair
+        save_engine_runtime(home, runtime)
     return pair
 
 
 def engine_label(pair):
     return f"{pair['acc']} ({pair['model']})"
+
+
+# ----------------------------------------------------------------------------------------------- engine fallback (requirement 12, loops/b7.md)
+
+def engine_runtime_path(home):
+    return os.path.join(home, "engine-runtime.json")
+
+
+def read_engine_runtime(home):
+    try:
+        data = json.loads(read_text(engine_runtime_path(home), "{}") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_engine_runtime(home, data):
+    write_text(engine_runtime_path(home), json.dumps(data, indent=1) + "\n")
 
 
 def last_turn(home):
@@ -796,6 +1058,11 @@ def status_text(home, repo=None):
     if ws and ws[0] != "stale" and ws[1] and not ws[1].startswith("supervisor"):
         lines.append(f"manager in console session ({ws[1]})")
     lines.append(f"engine: {engine_label(read_engine(home))}")
+    runtime = read_engine_runtime(home)
+    if runtime.get("episode_id") and runtime.get("active"):
+        lines.append(f"engine fallback: configured {engine_label(runtime.get('configured') or {})}, "
+                     f"effective {engine_label(runtime.get('effective') or {})} (since {runtime.get('since')}, "
+                     f"{(runtime.get('reason') or '').strip()[:200]})")
     lt = last_turn(home)
     if lt:
         when = now_iso(lt.get("at")) if isinstance(lt.get("at"), (int, float)) else str(lt.get("at"))
@@ -815,8 +1082,42 @@ def status_text(home, repo=None):
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
         lines.append(f"heartbeat: {now_iso(os.path.getmtime(hb))}")
+    # idle-until / waiting-on-since (requirement 18, loops/b7.md); legacy output with no (valid) work-status
+    work_status = read_work_status(home)
+    if isinstance(work_status, dict):
+        mode = work_status.get("mode")
+        if mode == "waiting":
+            who, since = work_status.get("who"), _ws_num(work_status.get("since"))
+            if isinstance(who, str) and who and since is not None:
+                lines.append(f"waiting on {who} since {la_time_label(since)}")
+        elif mode == "idle":
+            deadline = _ws_num(work_status.get("deadline"))
+            if deadline is not None:
+                lines.append(f"idle until {la_time_label(deadline)}")
+    cont_cfg = cfg.get("continuation")
+    cont_cfg = cont_cfg if isinstance(cont_cfg, dict) else {}
+    limit = cont_cfg.get("max_per_hour", CONTINUATION_DEFAULT_MAX_PER_HOUR)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (0 <= limit <= 60):
+        limit = 0
+    if limit > 0:
+        now = time.time()
+        recent = [r["at"] for r in read_jsonl(os.path.join(home, "logs", "continuation-reservations.jsonl"))
+                  if isinstance(r.get("at"), (int, float)) and not isinstance(r.get("at"), bool)
+                  and now - r["at"] < CONTINUATION_WINDOW_S]
+        if len(recent) >= limit:
+            lines.append(f"continuation: capped until {now_iso(min(recent) + CONTINUATION_WINDOW_S)}")
+    # persistence pending/blocked until remote verification (requirement 19, loops/b7.md)
+    try:
+        persistence = json.loads(read_text(os.path.join(home, "logs", "persistence.json"), "{}") or "{}")
+    except json.JSONDecodeError:
+        persistence = {}
+    if isinstance(persistence, dict) and persistence.get("status") in ("pending", "blocked"):
+        lines.append(f"persistence: {persistence['status']} ({(persistence.get('error') or '').strip()[:200]})")
     tracks = tracks_summary(read_state(home, repo))
-    lines.append("tracks: " + ("; ".join(tracks) if tracks else "none in state.json"))
+    if tracks:
+        lines.extend(tracks)  # one separate line per track, now first (requirement 5, loops/b7.md)
+    else:
+        lines.append("tracks: none in state.json")
     return "\n".join(lines)
 
 
@@ -962,6 +1263,25 @@ def read_ledger(memory_dir):
     return [r for r in read_jsonl(os.path.join(memory_dir, "LEDGER.jsonl")) if isinstance(r, dict)]
 
 
+def _ledger_row_successful(row):
+    """Requirement 12, loops/b7.md: exclude kind=attempt, success=false, error-bearing and failed-compaction
+    historical rows from the successful-turn filter (switch_for, family_last_at, memory preamble, transition
+    window); retain old rows that simply lack a success field. Never rewrites the historical ledger file."""
+    if row.get("kind") == "attempt":
+        return False
+    if row.get("success") is False:
+        return False
+    if row.get("error"):
+        return False
+    if row.get("kind") == "compaction" and (row.get("compaction") or {}).get("ok") is False:
+        return False
+    return True
+
+
+def successful_ledger(memory_dir):
+    return [r for r in read_ledger(memory_dir) if _ledger_row_successful(r)]
+
+
 def dir_hashes(root, skip=("LEDGER.jsonl", TRANSITION_DIRNAME + "/")):
     """{relative path: sha256} of every regular file under `root` (the ledger and the supervisor's own transition
     records excluded; a `skip` entry ending in `/` is a directory prefix)."""
@@ -1041,8 +1361,9 @@ def snapshot_claude_memory(config_dir, cwd, dest):
 
 def memory_preamble(memory_dir, family, engines=None):
     """The three `[memory]` lines for a turn about to run on `family`, computed from the ledger and the handoff
-    header. Paths are relative to the memory folder; the engine never compares file dates itself."""
-    ledger = read_ledger(memory_dir)
+    header. Paths are relative to the memory folder; the engine never compares file dates itself. Uses the same
+    successful-turn filter as switch_for/family_last_at (requirement 12, loops/b7.md)."""
+    ledger = successful_ledger(memory_dir)
     fam = lambda e: family_of(str(e.get("engine") or ""), engines)  # noqa: E731
     last = ledger[-1] if ledger else None
     mine = [e for e in ledger if fam(e) == family]
@@ -1135,11 +1456,37 @@ def split_handoff(text):
     return text[:idx].strip(), text[idx + len(HANDOFF_MARK):].strip()
 
 
+HANDOFF_REQUIRED_PREFIXES = ("tracks:", "waiting on:", "last decision:", "next action:", "open question:")
+
+
+def _valid_handoff(text):
+    """All five required handoff lines present (requirement 13, loops/b7.md): a short reply alone, or a truncated
+    handoff missing lines, does not qualify a rollover."""
+    lines = [l.strip().lower() for l in (text or "").splitlines() if l.strip()]
+    return all(any(l.startswith(p) for l in lines) for p in HANDOFF_REQUIRED_PREFIXES)
+
+
+def _file_digest_or_none(path):
+    try:
+        return _digest(path)
+    except OSError:
+        return None
+
+
+def record_attempt(home, engine, model, rc, classification, reason, success):
+    """Append one line to `logs/attempts.jsonl` (requirement 11/12, loops/b7.md): every engine attempt, success or
+    failure; only successful turns enter the family-turn ledger. Historical ledger files are never rewritten."""
+    append_jsonl(os.path.join(home, "logs", "attempts.jsonl"),
+                 {"at": now_iso(), "engine": engine, "model": model, "rc": rc, "classification": classification,
+                  "reason": (reason or "")[:FAILURE_REASON_MAX], "success": bool(success)})
+
+
 # ----------------------------------------------------------------------------------------------- the supervisor
 
 class AllEnginesFailed(Exception):
     def __init__(self, errors):
-        super().__init__("; ".join(f"{n}: {e}" for n, e in errors))
+        parts = [f"{e[0]}: {e[1]}" if isinstance(e, (tuple, list)) and len(e) == 2 else str(e) for e in errors]
+        super().__init__("; ".join(parts))
         self.errors = errors
 
 
@@ -1176,6 +1523,8 @@ class Supervisor:
         self.memory_dir = memory_dir_for(self.home, self.repo)
         for d in ("inbox", "inbox/files", "inbox/replies", "logs", "mirror", "credentials", ".claude"):
             os.makedirs(os.path.join(self.home, d), exist_ok=True)
+        self._reconcile_rollover_intent()  # requirement 13, loops/b7.md: before any Claude invocation
+        self._reconcile_fallback_notice()  # requirement 12, loops/b7.md: before the next run_engines
 
     # ---- small helpers
     def path(self, *parts):
@@ -1196,6 +1545,13 @@ class Supervisor:
         if isinstance(t, _dt.datetime):
             return t if t.tzinfo else t.replace(tzinfo=_dt.timezone.utc)
         return _dt.datetime.fromtimestamp(float(t), _dt.timezone.utc)
+
+    def clock_epoch(self):
+        """The supervisor's time as a UTC epoch float (the controlled clock when one was given)."""
+        if self.clock is None:
+            return time.time()
+        t = self.clock()
+        return t.timestamp() if isinstance(t, _dt.datetime) else float(t)
 
     def heartbeat(self):
         write_text(self.path("logs", "heartbeat"), now_iso() + "\n")
@@ -1224,13 +1580,25 @@ class Supervisor:
 
     # ---- the public entry point
     def run_once(self):
-        """One tick: deliver a pending reply, or run one turn for the queued events. True when something ran."""
+        """One tick: deliver a pending reply, or run one turn for the queued events. True when something ran.
+        Continuation-intent, work reaction and persistence reconciliation run on every tick, including a tick
+        with no events at all (requirements 17/18/19, loops/b7.md), so a crash or a transient failure between
+        turns is repaired without busy polling (each is itself bounded: a reservation reconciles once, a
+        reaction retries once per tick, persistence backs off until its own deadline)."""
         self.heartbeat()
         if self.paused():
             return False
         if os.path.exists(self.path("inbox", "pending-replies.jsonl")):
             return self.deliver_pending()
+        if self._reconcile_settlement_journal():
+            return True
+        self._reconcile_continuation_intent()
+        self.reconcile_work_reaction()
+        self.reconcile_persistence()
         events = pending_events(self.home)
+        non_continuation = [e for e in events if not _payload(e).get("continuation")]
+        if non_continuation and len(non_continuation) != len(events):
+            events = non_continuation  # new/founder work takes priority over an automatic continuation
         due, reason = self.compaction_due()
         if not events and not due:
             return False
@@ -1254,8 +1622,12 @@ class Supervisor:
         n = len(self.turns()) + 1
         self.sync_repo_before()
         self.ensure_memory_layout()
+        self.migrate_tracks()  # before prompt creation (requirement 5, loops/b7.md)
         before = dir_hashes(self.memory_dir)
         message = build_message(events)
+        state_text = self.state_block()
+        if state_text:
+            message = state_text + "\n" + message
         notes = []
         reacted = self.react_start(events)
         ticker = self.start_heartbeat([ev["id"] for ev in events])
@@ -1289,21 +1661,32 @@ class Supervisor:
         compaction = None
         if is_claude:
             self.snapshot_claude_memory()
-            compaction = self.verify_compaction(usage.get("input_tokens"))
+            compaction = self.verify_compaction(usage.get("context_tokens"))
         self.append_ledger(n, engine, model, before, transition, compaction=compaction)
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
         record = {"n": n, "at": started, "engine": engine, "model": model, "events": [ev["id"] for ev in events],
                   "reacted": reacted, "duration_s": round(time.time() - started, 3)}
-        for k in ("tokens", "input_tokens"):
+        for k in ("tokens", "input_tokens", "context_tokens"):
             if usage.get(k) is not None:
                 record[k] = usage[k]
         append_jsonl(self.path("logs", "turns.jsonl"), record)
         if is_claude:
-            self.schedule_compaction(usage.get("input_tokens"))
+            self.schedule_compaction(usage.get("context_tokens"))
+        footer = self._prepare_waiting_footer(n, events)  # before plan_deliveries (requirement 16, loops/b7.md)
+        if footer and footer not in reply:
+            reply = (reply + "\n" if reply else "") + footer
         deliveries = self.plan_deliveries(events, reply, n)
-        self.deliver(deliveries, [ev["id"] for ev in events], n)
+        ids = [ev["id"] for ev in events]
+        self._save_settlement_journal(n, ids, deliveries)  # before delivery (requirement 21, loops/b7.md: B2):
+        self.persistence_checkpoint("settlement_before_delivery")  # retained until settlement finishes
+        delivered = self.deliver(deliveries, ids, n)
+        self.migrate_tracks()  # and before persist: catch what this turn's engine wrote to state.json
         self.persist(n)
+        if delivered:
+            self.settle_work(n, events)  # after a successful delivery+persistence attempt, including blanks
+            self.persistence_checkpoint("settlement_completed")
+            self._clear_settlement_journal()
         return True
 
     # ---- shared memory (factory/manager-memory in the clone)
@@ -1371,9 +1754,10 @@ class Supervisor:
         return out
 
     def switch_for(self, name):
-        """(from_family, to_family) when a turn on `name` changes the engine family from the last ledger turn's,
-        else None (same family, or no turn yet). The account does not matter: claude-r2d2 <-> claude-l is no switch."""
-        ledger = read_ledger(self.memory_dir)
+        """(from_family, to_family) when a turn on `name` changes the engine family from the last successful
+        ledger turn's, else None (same family, or no turn yet). The account does not matter: claude-r2d2 <->
+        claude-l is no switch. A failed attempt never advances this (requirement 12, loops/b7.md)."""
+        ledger = successful_ledger(self.memory_dir)
         if not ledger:
             return None
         last = family_of(str(ledger[-1].get("engine") or ""), self.engines)
@@ -1381,8 +1765,9 @@ class Supervisor:
         return (last, to) if last != to else None
 
     def family_last_at(self, family):
-        """The `at` of the last ledger turn run by `family`; None when that family never ran."""
-        for e in reversed(read_ledger(self.memory_dir)):
+        """The `at` of the last successful ledger turn run by `family`; None when that family never ran
+        (requirement 12, loops/b7.md: a failed attempt or failed compaction is never counted)."""
+        for e in reversed(successful_ledger(self.memory_dir)):
             if family_of(str(e.get("engine") or ""), self.engines) == family:
                 return e.get("at")
         return None
@@ -1458,48 +1843,72 @@ class Supervisor:
 
     def run_engines(self, message, notes):
         """Try the engines from the current one. Returns (engine, model, stdout, usage, transition), usage being
-        {"tokens", "input_tokens"} or None. Each attempt gets its own memory preamble (the family may differ), the
-        transition read when the attempt is a family switch, the `[flush]` line on Codex when one is due, and the
-        model carried over from the current pair."""
+        {"tokens", "input_tokens", "context_tokens"} or None. Each attempt gets its own memory preamble (the
+        family may differ), the transition read when the attempt is a family switch, the `[flush]` line on Codex
+        when one is due, and the model carried over from the current pair. On a credits/usage-limit failure, each
+        distinct configured non-Fable model is tried once more on the SAME account before the next account/family
+        (requirement 12, loops/b7.md); auth errors skip that retry; prompt-too-long is session-level and skips the
+        rest of the Claude family outright. Every attempt is recorded in logs/attempts.jsonl."""
         if engine_file_is_legacy(self.home):
             pair = read_engine(self.home, self.engines)
             set_engine(self.home, pair["acc"], pair["model"], self.engines)  # upgrade the one-word file to JSON
         pair = read_engine(self.home, self.engines)
         current = pair["acc"]
+        started_pair = dict(pair)
         errors = []
-        persist_switch = False  # a quota or budget move is persisted; a plain failure is not
+        persist_switch = False  # a quota, auth or budget move is persisted; a plain or session-level failure is not
+        skip_claude = False
+        last_reason = None
         for name in self.engine_order():
             spec = self.engines.get(name) or {}
             if not spec.get("bin"):
+                continue
+            family = family_of(name, self.engines)
+            if skip_claude and family == "claude":
                 continue
             if self.over_budget(name):
                 notes.append(f"budget: {name} over budget, trying the next engine")
                 errors.append((name, "over budget"))
                 persist_switch = True
                 continue
-            model = carry_model(pair["model"], family_of(current, self.engines), family_of(name, self.engines), self.models)
-            preamble = self.preamble_for(name)
-            transition = block = switch_at = None
-            switch = self.switch_for(name)
-            if switch and self.transition_config()["enabled"]:
-                switch_at = self.now()
-                block, transition = self.transition_read(switch[0], switch[1], switch_at)
-                preamble += "\n\n" + block
-            if family_of(name, self.engines) == "codex" and self.codex_flush_due():
-                preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
-            rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
-            if rc == 0:
-                if transition and transition.get("source_path"):
-                    self.save_transition(transition, block, switch_at)
-                if name != current:
-                    if persist_switch:
-                        set_engine(self.home, name, model, self.engines)
-                    notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
-                return name, model, out, usage, transition
-            errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
-            log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
-            if QUOTA_RE.search(err or ""):
-                persist_switch = True
+            base_model = carry_model(pair["model"], family_of(current, self.engines), family, self.models)
+            queue = [base_model]
+            while queue:
+                model = queue.pop(0)
+                preamble = self.preamble_for(name)
+                transition = block = switch_at = None
+                switch = self.switch_for(name)
+                if switch and self.transition_config()["enabled"]:
+                    switch_at = self.now()
+                    block, transition = self.transition_read(switch[0], switch[1], switch_at)
+                    preamble += "\n\n" + block
+                if family == "codex" and self.codex_flush_due():
+                    preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
+                rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
+                if rc == 0:
+                    record_attempt(self.home, name, model, rc, None, "", True)
+                    if transition and transition.get("source_path"):
+                        self.save_transition(transition, block, switch_at)
+                    if name != current:
+                        notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
+                    if persist_switch and (name != current or model != pair["model"]):
+                        set_engine(self.home, name, model, self.engines, explicit=False)
+                    self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch)
+                    return name, model, out, usage, transition
+                classification = classify_engine_error(err)
+                record_attempt(self.home, name, model, rc, classification, err, False)
+                errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
+                log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
+                last_reason = err
+                if classification == "prompt_too_long":
+                    skip_claude = True
+                    break
+                if classification in ("credits", "usage_limit", "auth"):
+                    persist_switch = True
+                if classification in ("credits", "usage_limit") and family == "claude" and model == base_model:
+                    fb_cfg = (self.config.get("engine_fallback") or {}).get("claude_models")
+                    fb_cfg = fb_cfg if isinstance(fb_cfg, list) else ["claude-sonnet-5"]
+                    queue = [m for m in dict.fromkeys(fb_cfg) if m not in ("claude-fable-5-1", base_model)]
         raise AllEnginesFailed(errors)
 
     def engine_env(self, spec):
@@ -1523,36 +1932,53 @@ class Supervisor:
 
     def invoke(self, name, spec, message, model=None, preamble=""):
         """Run one engine on the batched message behind its preamble (the `[memory]` lines and, at a switch, the
-        `[transition]` block). Returns (rc, stdout, stderr, usage) with usage {"tokens", "input_tokens"} or None."""
+        `[transition]` block). Returns (rc, stdout, stderr, usage) with usage {"tokens", "input_tokens",
+        "context_tokens"} or None. Parses stdout on every return code (requirement 11, loops/b7.md): a nonzero
+        process return is a failure even when the JSON looks successful, and a failed result never saves a
+        session id. A pending rollover's new id is never resumed before it has started once (requirement 13)."""
         model = model or family_default_model(family_of(name, self.engines), self.models)
         if name == "codex" or spec.get("kind") == "codex":
             return self.invoke_codex(spec, message, model, preamble)
         if preamble:
+            handoff_text = self.read_handoff()
+            if handoff_text:
+                preamble = preamble + "\n\n# MANAGER-HANDOFF.md\n" + handoff_text.rstrip()
             message = preamble + "\n\n" + message
         sid = self.session_id()
-        resume = bool(sid)
+        resume = bool(sid) and self._resume_allowed(sid)
         if not sid:
             sid = str(uuid.uuid4())
         argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
-               ["--model", model, "--dangerously-skip-permissions", "--output-format", "json"]
+               ["--model", model, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
         rc, out, err = self._run(argv, message, self.engine_env(spec))
         if rc != 0 and resume and NO_SESSION_RE.search(err or ""):
             sid = str(uuid.uuid4())
             argv = [spec["bin"], "-p", "--session-id", sid, "--model", model, "--dangerously-skip-permissions",
-                    "--output-format", "json"]
+                    "--output-format", "stream-json", "--verbose"]
             rc, out, err = self._run(argv, message, self.engine_env(spec))
-        usage = None
-        if rc == 0:
-            out, usage, is_error, new_sid = self._parse_claude_output(out)
-            write_text(self.path("session-id"), (new_sid or sid) + "\n")
-            if is_error:
-                return 1, "", out, None
-        return rc, out, err, usage
+        reply, usage, error_text, new_sid = self._parse_claude_output(out)
+        if rc != 0 or error_text:
+            return (rc or 1), "", self._failure_reason(error_text, out, err), None
+        self._mark_session_started(sid)
+        write_text(self.path("session-id"), (new_sid or sid) + "\n")
+        return rc, reply, err, usage
+
+    @staticmethod
+    def _failure_reason(message, stdout, stderr):
+        """A bounded, useful reason out of a failed attempt: the extracted terminal message (else a raw stdout
+        tail) combined with stderr diagnostics, never environment or credentials (requirement 11)."""
+        primary = (message or "").strip() or (stdout or "").strip()
+        stderr = (stderr or "").strip()
+        if stderr and stderr not in primary:
+            combined = f"{primary}\n{stderr}" if primary else stderr
+        else:
+            combined = primary or stderr
+        return combined[:FAILURE_REASON_MAX]
 
     @staticmethod
     def _usage_from(usage):
         """{"tokens": every *tokens count summed, "input_tokens": the input-side ones (input, cache creation, cache
-        read): the context the turn carried}; None when the engine reported nothing."""
+        read): the aggregate the turn reported}; None when the engine reported nothing."""
         if not isinstance(usage, dict):
             return None
         nums = {k: v for k, v in usage.items() if isinstance(v, (int, float)) and "tokens" in k}
@@ -1561,31 +1987,88 @@ class Supervisor:
         return {"tokens": int(sum(nums.values())), "input_tokens": int(sum(v for k, v in nums.items() if "input" in k))}
 
     @staticmethod
-    def _parse_claude_output(stdout):
-        """`--output-format json` gives one object with result/usage/session_id; plain text is the reply itself, in
-        which `[usage] key=value ...` lines are read as usage and removed. Returns (reply, usage, is_error, session_id)."""
-        text = stdout.strip()
-        if text.startswith("{"):
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                data = None
-            if isinstance(data, dict) and "result" in data:
-                return (str(data.get("result") or ""), Supervisor._usage_from(data.get("usage")),
-                        bool(data.get("is_error")), data.get("session_id"))
-        found = {}
+    def _context_tokens_from(usage):
+        """input_tokens + cache_creation_input_tokens + cache_read_input_tokens from one assistant message's
+        usage, each counted once (nested cache-creation breakdowns are not re-added); None when usage is
+        missing or invalid (never a substitute aggregate, requirement 3, loops/b7.md). A valid zero is 0."""
+        if not isinstance(usage, dict) or "input_tokens" not in usage:
+            return None
+        total = 0
+        for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            if key not in usage:
+                continue
+            v = usage[key]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                return None
+            total += v
+        return int(total)
 
-        def take(m):
-            for part in m.group(1).split():
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    with contextlib.suppress(ValueError):
-                        found[k.strip()] = int(float(v))
-            return ""
-        cleaned = USAGE_LINE_RE.sub(take, stdout)
-        if found:
-            return cleaned, Supervisor._usage_from(found), False, None
-        return stdout, None, False, None
+    @staticmethod
+    def _terminal_error_text(terminal):
+        """The human-readable reason out of a terminal result with `is_error: true`: an `error` dict's `message`,
+        a plain `error` string, else `result` doubling as the error text (requirement 11)."""
+        err = terminal.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str) and err.strip():
+            return err
+        result = terminal.get("result")
+        if isinstance(result, str) and result.strip():
+            return result
+        return "the engine reported is_error=true"
+
+    @staticmethod
+    def _parse_claude_output(stdout):
+        """Complete JSONL assistant records and the terminal result (`--output-format stream-json --verbose`), or
+        one terminal JSON object (`--output-format json`), or plain text with legacy `[usage] key=value` lines.
+        Returns (reply, usage, error_text, session_id): usage carries the aggregate `tokens`/`input_tokens` (for
+        accounting) and `context_tokens`, the first assistant message's usage (requirement 3); error_text is None
+        unless the terminal result is `is_error: true`, in which case it is the human-readable reason. A nonzero
+        return code is checked by the caller; malformed unrelated lines are skipped, never fabricating usage."""
+        text = (stdout or "").strip()
+        records = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                records.append(obj)
+        if not records:
+            found = {}
+
+            def take(m):
+                for part in m.group(1).split():
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        with contextlib.suppress(ValueError):
+                            found[k.strip()] = int(float(v))
+                return ""
+            cleaned = USAGE_LINE_RE.sub(take, stdout)
+            if found:
+                usage = Supervisor._usage_from(found) or {"tokens": 0, "input_tokens": 0}
+                usage["context_tokens"] = found.get("input_tokens")  # one legacy line explicitly is one request
+                return cleaned, usage, None, None
+            return stdout, None, None, None
+        context_tokens, have_context, terminal = None, False, None
+        for obj in records:
+            t = obj.get("type")
+            if t == "assistant" and not have_context:
+                context_tokens = Supervisor._context_tokens_from((obj.get("message") or {}).get("usage"))
+                have_context = True
+            if t == "result" or (t is None and "result" in obj):
+                terminal = obj  # the last terminal-shaped record wins
+        if terminal is None:
+            return stdout, None, None, None
+        reply = str(terminal.get("result") or "")
+        usage = Supervisor._usage_from(terminal.get("usage")) or {"tokens": 0, "input_tokens": 0}
+        usage["context_tokens"] = context_tokens
+        session_id = terminal.get("session_id")
+        error_text = Supervisor._terminal_error_text(terminal) if terminal.get("is_error") else None
+        return reply, usage, error_text, session_id
 
     def invoke_codex(self, spec, message, model=None, preamble=""):
         """Codex has no session memory of its own: the preamble, then the handoff and state, then the message."""
@@ -1699,11 +2182,13 @@ class Supervisor:
         except OSError:
             return 0
 
-    def last_claude_input_tokens(self):
+    def last_claude_context_tokens(self):
+        """The last measured Claude turn's context_tokens (requirement 4, loops/b7.md); unknown (None) when no
+        Claude turn ever measured it. Replaces the old aggregate `input_tokens` lookup."""
         for t in reversed(self.turns()):
-            if t.get("input_tokens") is not None and t.get("kind") != "compaction" \
+            if t.get("context_tokens") is not None and t.get("kind") != "compaction" \
                     and family_of(str(t.get("engine") or ""), self.engines) == "claude":
-                return t["input_tokens"]
+                return t["context_tokens"]
         return None
 
     def compaction_pending(self):
@@ -1732,22 +2217,23 @@ class Supervisor:
             return True, pending.get("reason") or "tokens"
         return False, None
 
-    def schedule_compaction(self, input_tokens):
-        """After a Claude turn: input tokens over `threshold_tokens`, or the session file grown by more than
+    def schedule_compaction(self, context_tokens):
+        """After a Claude turn: context tokens over `threshold_tokens`, or the session file grown by more than
         `max_bytes` since the last compaction (the file never shrinks, so growth is what counts), schedules a
-        compaction before the next turn. A turn under both limits clears the schedule; a turn without usage keeps it."""
+        compaction before the next turn. A turn under both limits clears the schedule; a turn without usage keeps
+        it (requirement 4, loops/b7.md: context_tokens drives scheduling, never aggregate input_tokens)."""
         cfg = self.compaction_config()
         state = self.compaction_state()
         at = self.now()
         pending = None
-        if input_tokens is not None and input_tokens > cfg["threshold_tokens"]:
-            pending = {"reason": "tokens", "value": int(input_tokens), "limit": cfg["threshold_tokens"], "since": at}
+        if context_tokens is not None and context_tokens > cfg["threshold_tokens"]:
+            pending = {"reason": "tokens", "value": int(context_tokens), "limit": cfg["threshold_tokens"], "since": at}
         else:
             size = self.session_file_size()
             grown = size - int(state.get("baseline_bytes") or 0)
             if size > cfg["max_bytes"] and grown > cfg["max_bytes"]:
                 pending = {"reason": "bytes", "value": grown, "limit": cfg["max_bytes"], "bytes": size, "since": at}
-        if pending is None and input_tokens is None and state.get("pending"):
+        if pending is None and context_tokens is None and state.get("pending"):
             return state["pending"]
         previous = state.get("pending") or {}
         if pending and previous.get("reason") == pending["reason"] and previous.get("since"):
@@ -1762,26 +2248,36 @@ class Supervisor:
             state["failed_at"] = self.now()
             if not state.get("fail_posted"):
                 hours = self.compaction_config()["retry_after_s"] // 3600
-                self.buildlog(f"hydra-manager compaction failed: {rec.get('error')}; session {self.session_id() or '-'} "
-                              f"kept ({rec.get('before_tokens')} input tokens); next try in {hours}h, or `hydra compact`")
+                self.buildlog(f"hydra-manager rollover failed: {rec.get('error')}; session {self.session_id() or '-'} "
+                              f"kept ({rec.get('before_tokens')} context tokens); next try in {hours}h, or `hydra compact`")
                 state["fail_posted"] = True
         elif rec.get("ok"):
             state["failed_at"] = None
             state["fail_posted"] = False
 
-    def verify_compaction(self, input_tokens):
-        """At the first Claude turn after a compaction: did its input tokens drop below the threshold? Returns the
-        ledger record `{before_tokens, after_tokens, at, ok, reason}`; None when nothing awaits verification."""
+    def verify_compaction(self, context_tokens):
+        """At a Claude turn after a rollover: did its context tokens drop below the threshold? Returns the ledger
+        record `{before_tokens, after_tokens, at, ok, reason, old_id, new_id}`; None when nothing awaits
+        verification. Missing measurement cannot falsely declare success or failure (requirement 4/13, loops/b7.md):
+        it leaves `ok` null and the verification pending for a later measured turn, which alone may settle it."""
         state = self.compaction_state()
         v = state.get("verify")
         if not v:
             return None
+        rec = {"before_tokens": v.get("before_tokens"), "after_tokens": context_tokens, "at": v.get("at"),
+               "ok": None, "reason": v.get("reason")}
+        for k in ("old_id", "new_id"):
+            if v.get(k) is not None:
+                rec[k] = v[k]
+        if context_tokens is None:
+            state["last"] = rec  # still records old/new ids with ok=null; verification stays pending
+            self.save_compaction_state(state)
+            log(f"compaction verification pending (no measured context yet): {rec}")
+            return rec
         cfg = self.compaction_config()
-        ok = None if input_tokens is None else bool(input_tokens < cfg["threshold_tokens"])
-        rec = {"before_tokens": v.get("before_tokens"), "after_tokens": input_tokens, "at": v.get("at"), "ok": ok,
-               "reason": v.get("reason")}
-        if ok is False:
-            rec["error"] = f"input tokens still {input_tokens} after /compact (threshold {cfg['threshold_tokens']})"
+        rec["ok"] = bool(context_tokens < cfg["threshold_tokens"])
+        if rec["ok"] is False:
+            rec["error"] = f"context tokens still {context_tokens} after rollover (threshold {cfg['threshold_tokens']})"
         state["verify"] = None
         state["last"] = rec
         self._compaction_outcome(state, rec)
@@ -1799,22 +2295,214 @@ class Supervisor:
                 return name, spec
         return None, None
 
+    # ---- rollover (requirement 13, loops/b7.md): a memory-writing [compaction] turn, then an atomic session
+    # id replacement, instead of `/compact`. `rollover-intent.json` survives a crash at any point.
+
+    def rollover_enabled(self):
+        cfg = self.config.get("compaction")
+        return bool((cfg if isinstance(cfg, dict) else {}).get("rollover_enabled"))
+
+    def rollover_intent_path(self):
+        return self.path("rollover-intent.json")
+
+    def _read_rollover_intent(self):
+        try:
+            data = json.loads(read_text(self.rollover_intent_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_rollover_intent(self, data):
+        write_text(self.rollover_intent_path(), json.dumps(data) + "\n")
+
+    def _cancel_rollover_intent(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.rollover_intent_path())
+
+    def _resume_allowed(self, sid):
+        """False when `sid` is a rolled-over id that has never yet had a successful startup: it must start with
+        `--session-id`, never `--resume` (requirement 13)."""
+        intent = self._read_rollover_intent()
+        return not (intent.get("new_id") == sid and not intent.get("started"))
+
+    def _mark_session_started(self, sid):
+        intent = self._read_rollover_intent()
+        if intent.get("new_id") == sid and not intent.get("started"):
+            intent["started"] = True
+            self._write_rollover_intent(intent)
+
+    def _reconcile_rollover_intent(self):
+        """Before any Claude invocation (restart recovery, requirement 13/22, loops/b7.md: B3): finish an
+        incomplete replacement when the session id is still the old one, retain it when already replaced, then
+        -- unless this intent's bookkeeping already finished -- recover the last/verify state, the one
+        successful-compaction ledger entry and the original COMPACT/pending trigger consumption from the same
+        intent, never a second memory turn (it already ran before the intent was written). Finishing shrinks the
+        intent to just the long-lived new-session startup marker (`old_id`/`new_id`/`started`), which this must
+        never discard: a later `invoke()` still needs it to force `--session-id` over `--resume` until the first
+        successful fresh-session startup."""
+        intent = self._read_rollover_intent()
+        old_id, new_id = intent.get("old_id"), intent.get("new_id")
+        if not new_id or "old_id" not in intent:
+            return  # no intent at all (old_id can legitimately be "" -- a rollover from no prior session)
+        current = self.session_id()
+        if current == new_id:
+            pass  # already replaced: retain it
+        elif current == old_id or not current:
+            with contextlib.suppress(OSError):
+                self.replace_session_id(new_id)
+        else:
+            return  # an unrelated session id (a later rollover, or a manual change): nothing to reconcile
+        if "turn" not in intent and "reason" not in intent:
+            return  # bookkeeping already finished for this intent; nothing left to recover
+        self._finish_rollover_bookkeeping(intent)
+        self.persistence_checkpoint("rollover_recovered")
+        self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": bool(intent.get("started"))})
+
+    def _finish_rollover_bookkeeping(self, intent, before_dir=None):
+        """The durable last/verify state, the one successful-compaction ledger entry and the original
+        COMPACT/pending trigger consumption for a single rollover (requirement 22, loops/b7.md: B3). Idempotent:
+        safe to call again on an already-finished rollover (restart, or a repeated checkpoint crash) without a
+        second ledger entry, a second memory-writing turn, or losing the intended UUID."""
+        old_id, new_id = intent.get("old_id"), intent.get("new_id")
+        turn = intent.get("turn")
+        reason = intent.get("reason") or "rollover"
+        before_tokens, at = intent.get("before_tokens"), intent.get("at") or self.now()
+        name, model = intent.get("engine"), intent.get("model")
+        state = self.compaction_state()
+        state["last"] = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None,
+                         "reason": reason, "old_id": old_id, "new_id": new_id}
+        state["pending"] = None
+        state["verify"] = {"before_tokens": before_tokens, "at": at, "reason": reason, "turn": turn,
+                           "old_id": old_id, "new_id": new_id}
+        state["baseline_bytes"] = 0
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.path("COMPACT"))
+        self.save_compaction_state(state)
+        if turn is not None and not any(r.get("kind") == "compaction" and r.get("turn") == turn
+                                        for r in read_ledger(self.memory_dir)):
+            self.append_ledger(turn, name, model, before_dir if before_dir is not None else dir_hashes(self.memory_dir),
+                               kind="compaction", compaction=None)
+            append_jsonl(self.path("logs", "turns.jsonl"),
+                        {"n": turn, "at": time.time(), "engine": name, "model": model, "events": [],
+                         "duration_s": 0.0, "kind": "compaction"})
+
+    def replace_session_id(self, new_id):
+        """Atomically replace `$HYDRA_HOME/session-id` with `new_id` (os.replace); raises on write failure without
+        touching the old id (requirement 13's required seam)."""
+        path = self.path("session-id")
+        tmp = f"{path}.tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_id + "\n")
+        os.replace(tmp, path)
+
+    def persistence_checkpoint(self, name):
+        """A no-op seam hooked right after each durable persistence step of a fallback or rollover transition
+        (requirement 12/13, loops/b7.md): fallback_start_saved/_queued, fallback_end_saved/_queued,
+        rollover_intent_saved, rollover_id_replaced, rollover_state_saved. Tests patch it to simulate process
+        death at an exact point; this seam itself must never catch BaseException."""
+        return None
+
+    # ---- the fallback episode (requirement 12, loops/b7.md): one top-level dev-channel notice per episode,
+    # never per retry/turn, surviving a crash at any persistence step without losing or duplicating it.
+
+    def _fallback_notice_text(self, runtime, transition):
+        episode_id = runtime.get("episode_id")
+        if transition == "start":
+            configured, effective = runtime.get("configured") or {}, runtime.get("effective") or {}
+            return (f"fallback started (episode {episode_id}): {engine_label(configured)} unavailable "
+                    f"({(runtime.get('reason') or '').strip()[:300]}); now running {engine_label(effective)}")
+        effective = runtime.get("effective") or {}
+        return f"fallback ended (episode {episode_id}): back on {engine_label(effective)}"
+
+    def _reconcile_fallback_notice(self):
+        """Before the next run_engines (restart recovery, requirement 12): finish queueing a notice whose
+        transition was durably persisted but never confirmed queued, deduplicated even when a bridge receipt for
+        it already exists. Process death at either checkpoint neither loses nor duplicates the notice."""
+        runtime = read_engine_runtime(self.home)
+        pending = runtime.get("pending_notice")
+        episode_id = runtime.get("episode_id")
+        if not pending or not episode_id:
+            return
+        text = self._fallback_notice_text(runtime, pending)
+        _queue_notice_once(self.home, self.dev_channel, text, f"fallback-{episode_id}-{pending}")
+        self.persistence_checkpoint(f"fallback_{pending}_queued")
+        runtime["pending_notice"] = None
+        save_engine_runtime(self.home, runtime)
+
+    def _start_fallback_episode(self, runtime, configured, effective, reason):
+        episode_id = str(uuid.uuid4())
+        runtime.update({"configured": configured, "effective": effective, "episode_id": episode_id,
+                        "since": self.now(), "reason": reason or "", "active": True, "pending_notice": "start"})
+        save_engine_runtime(self.home, runtime)
+        self.persistence_checkpoint("fallback_start_saved")
+        text = self._fallback_notice_text(runtime, "start")
+        _queue_notice_once(self.home, self.dev_channel, text, f"fallback-{episode_id}-start")
+        self.persistence_checkpoint("fallback_start_queued")
+        runtime["pending_notice"] = None
+        save_engine_runtime(self.home, runtime)
+
+    def _close_fallback_episode(self, runtime):
+        runtime["effective"] = runtime.get("configured")
+        runtime["active"] = False
+        runtime["pending_notice"] = "end"
+        save_engine_runtime(self.home, runtime)
+        self.persistence_checkpoint("fallback_end_saved")
+        text = self._fallback_notice_text(runtime, "end")
+        _queue_notice_once(self.home, self.dev_channel, text, f"fallback-{runtime.get('episode_id')}-end")
+        self.persistence_checkpoint("fallback_end_queued")
+        runtime["pending_notice"] = None
+        save_engine_runtime(self.home, runtime)
+
+    def _note_fallback_transition(self, winning_acc, winning_model, started_pair, reason, persist_worthy):
+        """After a turn resolves successfully: start, update or close the fallback episode. Deliberately
+        selecting a different engine (no failure at all) is never itself a fallback episode."""
+        runtime = read_engine_runtime(self.home)
+        configured = runtime.get("configured") or started_pair
+        winning = {"acc": winning_acc, "model": winning_model}
+        active = bool(runtime.get("episode_id")) and bool(runtime.get("active"))
+        if winning == configured:
+            if active:
+                self._close_fallback_episode(runtime)
+            return
+        if not persist_worthy:
+            return  # transient (rate_limit/other) or session-level (prompt_too_long): never announced/persisted
+        if not active:
+            self._start_fallback_episode(runtime, configured, winning, reason)
+        else:
+            runtime["effective"] = winning
+            if reason:
+                runtime["reason"] = reason
+            save_engine_runtime(self.home, runtime)
+
     def run_compaction(self, reason="tokens"):
-        """The compaction: a `[compaction]` turn on the same Claude session (memory written by the engine), then
-        `claude -p --resume <id> "/compact"`; the next Claude turn verifies it. The session id is never touched. A
-        failure (either step) is recorded in the ledger, posted once to the buildlog, and backed off."""
+        """The rollover (requirement 13, loops/b7.md): a `[compaction]` turn writes durable memory on the same
+        Claude session; only once it succeeds, produces a valid five-line handoff, and actually changes
+        MEMORY.md's bytes, the session id is atomically replaced with a new UUID (the old transcript is left
+        byte-for-byte untouched). Disabled by default (`compaction.rollover_enabled`): a held outcome is recorded
+        without an engine call. Any other failure retains the old id, is recorded in logs/attempts.jsonl (never
+        the family-turn ledger), posted once to the buildlog, and backed off."""
+        self._reconcile_rollover_intent()
         state = self.compaction_state()
         started = time.time()
         n = len(self.turns()) + 1
         at = self.now()
         pending = state.get("pending") or {}
-        before_tokens = pending.get("value") if pending.get("reason") == "tokens" else self.last_claude_input_tokens()
-        if state.get("verify"):  # the previous compaction never got its verifying turn: close it as unverified
+        before_tokens = pending.get("value") if pending.get("reason") == "tokens" else self.last_claude_context_tokens()
+        if state.get("verify"):  # the previous rollover never got its verifying turn: close it as unverified
             state["last"] = dict(state["verify"], after_tokens=None, ok=None)
-        rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None, "reason": reason}
+        old_id = self.session_id()
+        if not self.rollover_enabled():
+            rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None, "reason": reason,
+                   "error": "held: automatic rollover is disabled (compaction.rollover_enabled is false)"}
+            state["last"] = rec
+            state["pending"] = None
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(self.path("COMPACT"))
+            self.save_compaction_state(state)
+            log(f"compaction held: rollover disabled; session {old_id or '-'} kept")
+            return rec
         name, spec = self.compaction_engine()
-        compact_ok, error, model, usage, before = False, None, None, None, None
-        sid = self.session_id()
+        error, model = None, None
         if name is None:
             error = "no Claude engine configured"
         else:
@@ -1822,47 +2510,54 @@ class Supervisor:
             model = pair["model"] if family_of(pair["acc"], self.engines) == "claude" \
                 else family_default_model("claude", self.models)
             self.ensure_memory_layout()
-            before = dir_hashes(self.memory_dir)
+            memory_path = os.path.join(self.memory_dir, "MEMORY.md")
+            before_hash = _file_digest_or_none(memory_path)
+            before_dir = dir_hashes(self.memory_dir)
             log(f"compaction ({reason}) on {name}: [compaction] turn")
             rc, out, err, usage = self.invoke(name, spec, COMPACTION_MESSAGE, model)
             if rc != 0:
-                error = f"[compaction] turn failed on {name} (rc={rc}): {(err or '').strip()[-200:]}"
+                error = f"[compaction] turn failed on {name} (rc={rc}): {(err or out or '').strip()[-200:]}"
             else:
-                _reply, handoff = split_handoff(out)
-                if handoff:
-                    self.write_handoff(handoff, name)
-                self.snapshot_claude_memory()
-                sid = self.session_id()
-                argv = [spec["bin"], "-p", "--resume", sid, "--model", model, "--dangerously-skip-permissions", "/compact"]
-                rc2, out2, err2 = self._run(argv, "", self.engine_env(spec))
-                if rc2 == 0:
-                    compact_ok = True
+                reply, handoff = split_handoff(out)
+                after_hash = _file_digest_or_none(memory_path)
+                if not handoff or not _valid_handoff(handoff):
+                    error = "the memory-writing turn produced no valid five-line handoff"
+                elif after_hash == before_hash:
+                    error = "the memory-writing turn did not change MEMORY.md"
                 else:
-                    error = f"/compact failed (rc={rc2}): {(err2 or out2 or '').strip()[-200:]}"
-        if not compact_ok:
-            rec.update({"ok": False, "error": error})
-        if name is not None:
-            self.append_ledger(n, name, model, before, kind="compaction", compaction=None if compact_ok else rec)
-            record = {"n": n, "at": started, "engine": name, "model": model, "events": [],
-                      "duration_s": round(time.time() - started, 3), "kind": "compaction"}
-            for k in ("tokens", "input_tokens"):
-                if (usage or {}).get(k) is not None:
-                    record[k] = usage[k]
-            if error:
-                record["error"] = error[:2000]
-            append_jsonl(self.path("logs", "turns.jsonl"), record)
-        state["pending"] = None
+                    self.write_handoff(handoff, name)
+                    self.snapshot_claude_memory()
+                    old_id = self.session_id()  # the compaction turn itself may have just bootstrapped this
+                    # id (there was no prior session at all): the actual "old" side of this rollover is whatever
+                    # session that turn ran on, not the empty value read before invoke().
+                    new_id = str(uuid.uuid4())
+                    intent = {"old_id": old_id, "new_id": new_id, "started": False, "turn": n, "reason": reason,
+                              "before_tokens": before_tokens, "at": at, "engine": name, "model": model}
+                    self._write_rollover_intent(intent)
+                    self.persistence_checkpoint("rollover_intent_saved")
+                    try:
+                        self.replace_session_id(new_id)
+                    except OSError as e:
+                        self._cancel_rollover_intent()
+                        error = f"session replacement failed: {e}"
+                    else:
+                        self.persistence_checkpoint("rollover_id_replaced")
+                        self._finish_rollover_bookkeeping(intent, before_dir)
+                        self.persistence_checkpoint("rollover_state_saved")
+                        self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": False})
+                        log(f"rollover done: session {old_id} -> {new_id}; the next Claude turn verifies it")
+                        return self.compaction_state()["last"]
+            record_attempt(self.home, name, model, rc, classify_engine_error(error), error, False)
+        rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": False, "reason": reason,
+               "error": error}
+        state["last"] = rec
+        state["pending"] = pending or None
         state["baseline_bytes"] = self.session_file_size()
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("COMPACT"))
-        if compact_ok:
-            state["verify"] = {"before_tokens": before_tokens, "at": at, "reason": reason, "turn": n}
-            log(f"compaction done on session {sid}; the next Claude turn verifies it")
-        else:
-            state["last"] = rec
-            self._compaction_outcome(state, rec)
-            log(f"compaction failed: {error}; session {sid} kept")
+        self._compaction_outcome(state, rec)
         self.save_compaction_state(state)
+        log(f"compaction failed: {error}; session {old_id or '-'} kept")
         return rec
 
     def codex_flush_due(self):
@@ -1897,38 +2592,76 @@ class Supervisor:
         return f"{head}\n… full reply ({len(lines)} lines): {link}"
 
     def plan_deliveries(self, events, reply, n):
-        """[{channel, thread_ts, text}] for Slack threads and [{id, text}] for console events."""
+        """[{channel, thread_ts, text}] for Slack threads, [{id, text}] for console events, and [{id, text}] for
+        self events with no usable Slack destination. A blank reply (#32, requirement 6, loops/b7.md) is never
+        posted: a thread whose events are purely indirect/informational is skipped; a thread touched by an
+        `instructs:true` sender or a mention of the manager gets NO_REPLY_PLACEHOLDER instead. Decided per
+        thread, not globally, across a mixed batch. CLI replies keep their existing semantics (the text, blank or
+        not, always reaches the reply file). A `self` event (requirement 25, loops/b7.md: FLOOD) is never
+        mirrored as founder-console and never falls back to a dev-channel top-level post: without its own
+        validated channel *and* thread it is logged locally instead of posted at all."""
+        blank = not reply.strip()
         text = reply
-        if reply.count("\n") + 1 > LONG_REPLY_LINES:
+        if not blank and reply.count("\n") + 1 > LONG_REPLY_LINES:
             text = self.long_reply_link(reply, n)
-        slack, cli, seen = [], [], set()
+        order, authoritative, cli, selflog = [], {}, [], []
         for ev in events:
             p = _payload(ev)
             if ev.get("source") == "cli":
                 cli.append({"id": ev.get("id"), "text": reply, "channel": p.get("channel") or self.dev_channel,
                             "user": p.get("user") or "founder-console", "prompt": p.get("text") or ""})
                 continue
-            channel = p.get("channel")
+            channel, thread_ts = p.get("channel"), p.get("thread_ts")
+            if ev.get("source") == "self" and (not channel or not thread_ts):
+                selflog.append({"id": ev.get("id"), "text": reply})
+                continue
             if not channel:
                 continue
-            key = (channel, p.get("thread_ts"))
-            if key in seen:
+            key = (channel, thread_ts)
+            is_authoritative = bool(p.get("instructs")) or bool(p.get("addressed"))
+            if key not in authoritative:
+                order.append(key)
+                authoritative[key] = is_authoritative
+            elif is_authoritative:
+                authoritative[key] = True
+        slack = []
+        for key in order:
+            channel, thread_ts = key
+            if blank:
+                if authoritative[key]:
+                    slack.append({"channel": channel, "thread_ts": thread_ts, "text": NO_REPLY_PLACEHOLDER})
+                    log(f"turn {n}: no reply text, placeholder sent")
+                else:
+                    log(f"turn {n}: no reply text, delivery skipped")
                 continue
-            seen.add(key)
-            slack.append({"channel": channel, "thread_ts": p.get("thread_ts"), "text": text})
-        return {"slack": slack, "cli": cli}
+            slack.append({"channel": channel, "thread_ts": thread_ts, "text": text})
+        return {"slack": slack, "cli": cli, "self": selflog}
+
+    def _record_self_reply(self, item):
+        """Durable, local, Slack-free record for a self event with no usable destination (requirement 25, loops/
+        b7.md: FLOOD): id and text only, never credentials. Idempotent, so a delivery retry of the same batch
+        never duplicates the line."""
+        path = self.path("logs", "self-replies.jsonl")
+        if any(r.get("id") == item.get("id") for r in read_jsonl(path)):
+            return
+        append_jsonl(path, {"id": item.get("id"), "text": item.get("text")})
 
     def deliver(self, deliveries, event_ids, n):
         """Post every planned reply; on the first failure the remainder is kept pending and the events unhandled.
         The working indicator comes off a thread's messages as soon as that thread's reply is posted."""
         pending = {"turn": n, "events": event_ids, "slack": list(deliveries.get("slack") or []),
-                   "cli": list(deliveries.get("cli") or [])}
+                   "cli": list(deliveries.get("cli") or []), "self": list(deliveries.get("self") or [])}
         for item in list(pending["cli"]):
             write_text(self.path("inbox", "replies", f"{item['id']}.txt"), item["text"].rstrip() + "\n")
+        for item in list(pending["self"]):
+            self._record_self_reply(item)
         try:
             while pending["slack"]:
                 item = pending["slack"][0]
-                self.post_and_note(item["channel"], item["thread_ts"], item["text"], n)
+                if not (item.get("text") or "").strip():  # a legacy pending blank (requirement 6, loops/b7.md)
+                    log(f"turn {n}: no reply text, delivery skipped")
+                else:
+                    self.post_and_note(item["channel"], item["thread_ts"], item["text"], n)
                 pending["slack"].pop(0)
                 self.react_delivered(event_ids, item["channel"], item["thread_ts"])
             while pending["cli"]:
@@ -1941,7 +2674,11 @@ class Supervisor:
                 pending["cli"].pop(0)
         except Exception as e:  # delivery failed: keep the reply, do not handle the events
             log(f"delivery failed, reply kept pending: {e}")
-            append_jsonl(self.path("inbox", "pending-replies.jsonl"), pending)
+            # `pending` by now holds only the destinations not yet confirmed (already-posted/mirrored ones were
+            # popped above): replacing the durable record -- never appending on top of a still-present one made
+            # by an earlier failed attempt at the same remainder -- is what lets repeated recovery crashes keep
+            # retrying the same shrinking remainder instead of ever reposting a confirmed destination.
+            write_text(self.path("inbox", "pending-replies.jsonl"), json.dumps(pending, ensure_ascii=False) + "\n")
             return False
         self.react_delivered(event_ids)
         mark_handled(self.home, event_ids, turn=n)
@@ -2099,34 +2836,109 @@ class Supervisor:
         mirror_own_post(self.home, channel, thread_ts, text, ts=ts, turn=n)
 
     def deliver_pending(self):
+        """A pending reply defers settlement (requirement 16/21, loops/b7.md: B2): once a recovered delivery is
+        confirmed (already handled -- never reposted -- or newly delivered now), the persistence attempt and
+        settle_work run here, once, with the turn's original events (by id, from the durable event log).
+        The durable record is read but NOT removed up front (audit gap correction, loops/b7.md): once a
+        destination is confirmed, the remainder still on disk is the only durable progress this retry has made,
+        and a crash during that retry -- even mid-`deliver()` -- must find that same remainder again next tick
+        rather than falling back to the original full batch. It is removed for an item only once that item's
+        delivery is actually confirmed, immediately before the (idempotent) persistence attempt and settlement
+        that follow, so a confirmed item is never mistaken for a reply still awaiting delivery."""
         path = self.path("inbox", "pending-replies.jsonl")
         items = read_jsonl(path)
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(path)
         ok = True
         for item in items:
-            if not self.deliver({"slack": item.get("slack") or [], "cli": item.get("cli") or []},
-                                item.get("events") or [], item.get("turn")):
+            ids = item.get("events") or []
+            n = item.get("turn")
+            delivered = all(i in handled_ids(self.home) for i in ids) if ids else False
+            if not delivered:
+                delivered = self.deliver({"slack": item.get("slack") or [], "cli": item.get("cli") or [],
+                                          "self": item.get("self") or []}, ids, n)
+            if delivered:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path)
+                self._finish_settlement(n, ids)
+            else:
                 ok = False
+        if ok:
+            self._clear_settlement_journal()
         return ok
 
+    # ---- deferred settlement journal (requirement 21, loops/b7.md: B2): written before delivery is even
+    # attempted, so a crash before, during or after delivery -- never a second engine turn -- can still finish
+    # the persistence attempt and settlement without reposting an already-confirmed reply.
+
+    def settlement_journal_path(self):
+        return self.path("logs", "settlement-pending.json")
+
+    def _save_settlement_journal(self, n, event_ids, deliveries):
+        write_text(self.settlement_journal_path(), json.dumps(
+            {"turn": n, "events": event_ids, "deliveries": deliveries}) + "\n")
+
+    def _clear_settlement_journal(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.settlement_journal_path())
+
+    def _read_settlement_journal(self):
+        try:
+            data = json.loads(read_text(self.settlement_journal_path(), "") or "null")
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) and data.get("events") else None
+
+    def _finish_settlement(self, n, ids):
+        """The persistence attempt and settle_work for a turn whose delivery is already confirmed (requirement
+        21, loops/b7.md: B2): never reruns the engine. `settlement_recovered` marks the actual boundary between
+        the persistence attempt and the idempotent scheduling/settlement that follows."""
+        self.persist(n)
+        self.persistence_checkpoint("settlement_recovered")
+        self.settle_work(n, events_by_ids(self.home, ids))
+
+    def _reconcile_settlement_journal(self):
+        """A turn interrupted before delivery was even attempted, or after delivery was confirmed but before its
+        persistence attempt and settlement completed (requirement 21, loops/b7.md: B2). Never reruns the engine;
+        reposts only when the original delivery truly never completed (in which case `deliver` itself defers to
+        the ordinary pending-replies retry). True when this tick did recovery work."""
+        journal = self._read_settlement_journal()
+        if journal is None:
+            return False
+        n, ids = journal.get("turn"), journal["events"]
+        delivered = all(i in handled_ids(self.home) for i in ids) if ids else False
+        if not delivered:
+            delivered = self.deliver(journal.get("deliveries") or {"slack": [], "cli": [], "self": []}, ids, n)
+        if delivered:
+            self._finish_settlement(n, ids)
+            self._clear_settlement_journal()
+        return True
+
     def post_unavailable(self, events):
+        """The shared all-engines-failed notice sink (requirement 25, loops/b7.md; audit gap correction): a
+        founder CLI event still gets its reply file; every other event's notice goes to its own usable
+        (channel, thread_ts) at most once per note_once window, deduplicated across restarts. A `self` event
+        with no usable channel+thread never falls back to a dev-channel top-level post: it is durably recorded
+        in logs/self-replies.jsonl instead, with zero Slack posts, idempotent by event id (the same sink used
+        for an unroutable self reply)."""
+        msg = "manager unavailable (every engine failed), will retry"
         seen = set()
         for ev in events:
             p = _payload(ev)
-            channel = p.get("channel")
-            if not channel or ev.get("source") == "cli":
-                if ev.get("source") == "cli":
-                    write_text(self.path("inbox", "replies", f"{ev.get('id')}.txt"),
-                               "manager unavailable (every engine failed), will retry\n")
+            channel, thread_ts, source = p.get("channel"), p.get("thread_ts"), ev.get("source")
+            if source == "cli":
+                write_text(self.path("inbox", "replies", f"{ev.get('id')}.txt"), msg + "\n")
                 continue
-            key = (channel, p.get("thread_ts"))
+            if source == "self" and not (channel and thread_ts):
+                self._record_self_reply({"id": ev.get("id"), "text": msg})
+                continue
+            if not channel:
+                continue
+            key = (channel, thread_ts)
             if key in seen:
                 continue
             seen.add(key)
-            if self.note_once(f"unavailable:{channel}:{p.get('thread_ts')}"):
+            if self.note_once(f"unavailable:{channel}:{thread_ts}"):
                 try:
-                    self.poster(channel, p.get("thread_ts"), "manager unavailable (every engine failed), will retry")
+                    self.poster(channel, thread_ts, msg)
                 except Exception as e:
                     log(f"could not post the unavailable note: {e}")
 
@@ -2136,25 +2948,409 @@ class Supervisor:
                                "-c", "user.email=manager@hydra.local", *args],
                               capture_output=True, text=True, timeout=timeout, check=check)
 
-    def sync_repo_before(self):
+    def migrate_tracks(self):
+        """Run the mechanical track migration (requirement 5, loops/b7.md) against this supervisor's home/repo;
+        an unsafe id is logged and skipped rather than aborting the turn."""
+        try:
+            migrate_track_history(self.home, self.repo)
+        except ValueError as e:
+            log(f"track migration skipped: {e}")
+
+    def state_block(self):
+        """`# factory/state.json` plus its (migrated) content, for every engine's prompt, not only Codex's."""
+        text = read_text(state_path(self.home, self.repo), "{}").rstrip()
+        return f"# factory/state.json\n{text}\n" if text and text != "{}" else ""
+
+    # ---- work-status.json: the manager-owned scheduling input (requirement 16, loops/b7.md)
+
+    def _validate_work_status(self, n, events):
+        """The validated work-status record for turn `n` against this turn's `events`, or None when missing,
+        stale, malformed or an unknown mode -- which disables automatic continuation and is logged as an
+        explicit diagnostic. Never trusts a caller-selected reaction target: `_target` is the actual event in
+        `events` whose source, channel and ts match the validated channel/message_ts, else None."""
+        data = read_work_status(self.home)
+        if data is None:
+            return None
+        turn = data.get("turn")
+        if isinstance(turn, bool) or not isinstance(turn, int):
+            log("work-status.json: turn must be an integer; automatic continuation disabled")
+            return None
+        if n is not None and turn != n:
+            log(f"work-status.json: stale turn {turn} (current {n}); automatic continuation disabled")
+            return None
+        mode = data.get("mode")
+        if mode not in WORK_STATUS_MODES:
+            log(f"work-status.json: unknown mode {mode!r}; automatic continuation disabled")
+            return None
+        track, channel = _ws_str(data.get("track")), _ws_str(data.get("channel"))
+        thread_ts, message_ts = _ws_str(data.get("thread_ts")), _ws_str(data.get("message_ts"))
+        if None in (track, channel, thread_ts, message_ts):
+            log("work-status.json: missing/invalid track/channel/thread_ts/message_ts; "
+                "automatic continuation disabled")
+            return None
+        out = {"turn": turn, "mode": mode, "track": track, "channel": channel, "thread_ts": thread_ts,
+               "message_ts": message_ts}
+        if mode == "continue":
+            next_action = _ws_str(data.get("next_action"))
+            if next_action is None:
+                log("work-status.json: continue needs a nonempty next_action; automatic continuation disabled")
+                return None
+            out["next_action"] = next_action
+        if mode in ("idle", "waiting"):
+            deadline = _ws_num(data.get("deadline"))
+            if deadline is None:
+                log(f"work-status.json: {mode} needs a finite deadline; automatic continuation disabled")
+                return None
+            out["deadline"] = deadline
+        if mode == "waiting":
+            who, since = _ws_str(data.get("who")), _ws_num(data.get("since"))
+            if who is None or since is None:
+                log("work-status.json: waiting needs who and since; automatic continuation disabled")
+                return None
+            out["who"], out["since"] = who, since
+        target = None
+        for ev in events or []:
+            p = _payload(ev)
+            if ev.get("source") == "slack" and p.get("channel") == channel and str(p.get("ts")) == str(message_ts):
+                target = ev
+                break
+        out["_target"] = target
+        return out
+
+    def _prepare_waiting_footer(self, n, events):
+        """The `⏲` footer to append before plan_deliveries (requirement 18, loops/b7.md), or None for
+        continue/done/invalid. Idle shows the deadline alone; waiting also names who. Never generated for
+        active work (continue) or when there is no waiting claim (done)."""
+        data = self._validate_work_status(n, events)
+        if data is None:
+            return None
+        if data["mode"] == "idle":
+            return f"⏲ next check {la_time_label(data['deadline'])}"
+        if data["mode"] == "waiting":
+            return f"⏲ waiting on {data['who']}; next check {la_time_label(data['deadline'])}"
+        return None
+
+    def settle_work(self, n, events):
+        """Called after every successful turn's delivery and persistence attempt, including a blank reply
+        (requirement 16, loops/b7.md): reconciles the waiting-clock reaction, then, for mode `continue` only,
+        reserves and enqueues the automatic continuation (requirement 17)."""
+        data = self._validate_work_status(n, events)
+        self._set_desired_work_reaction(self._desired_work_reaction(data))
+        if data is not None and data["mode"] == "continue":
+            self._maybe_continue(data)
+
+    # ---- the waiting-clock reaction (requirement 18, loops/b7.md): persisted target and desired/confirmed
+    # state across restart; a failed add/remove retries once per tick without claiming false success.
+
+    def _desired_work_reaction(self, data):
+        if data is not None and data["mode"] in ("idle", "waiting") and data.get("_target") is not None:
+            p = _payload(data["_target"])
+            return (p.get("channel"), str(p.get("ts")), REACTION_TIMER_CLOCK)
+        return None
+
+    def work_reaction_path(self):
+        return self.path("logs", "work-reaction.json")
+
+    def _read_work_reaction(self):
+        """{"applied": [(channel, ts, name), ...], "desired": (channel, ts, name) or None}. `applied` is every
+        target currently believed to carry the reaction (confirmed added, not yet confirmed removed); a target
+        change retains every one of them until it is actually removed (requirement 18, loops/b7.md: S1), instead
+        of the one-record shape that silently forgot a previous target."""
+        try:
+            data = json.loads(read_text(self.work_reaction_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        return _normalize_work_reaction(data)
+
+    def _save_work_reaction(self, state):
+        state = _normalize_work_reaction(state)  # also accepts a direct pre-S1 single-record write
+        write_text(self.work_reaction_path(), json.dumps(
+            {"applied": [list(a) for a in state["applied"]],
+             "desired": list(state["desired"]) if state["desired"] else None}) + "\n")
+
+    def _set_desired_work_reaction(self, desired):
+        """`desired` is (channel, ts, name) to ensure added, or None to ensure any standing clock is removed
+        (active work resumed). Every previously-applied target besides `desired` is retained for removal
+        (requirement 18, loops/b7.md: S1), so changing waiting targets -- or a failed/restarted removal --
+        never orphans an old clock. Reconciles immediately; a failure retries next tick, never falsely
+        confirmed."""
+        state = self._read_work_reaction()
+        already_settled = [desired] if desired is not None else []
+        if state.get("desired") == desired and (state.get("applied") or []) == already_settled:
+            return  # already exactly as desired, nothing stale or pending
+        state["desired"] = desired
+        self._save_work_reaction(state)
+        self.reconcile_work_reaction()
+
+    def reconcile_work_reaction(self):
+        """Retried on every run_once tick, including one with no events, and after restart (requirement 18/19,
+        loops/b7.md): a failed add/remove is logged and retried next tick, never recorded as confirmed. Every
+        applied target besides the current desired one is removed (requirement 18, S1 repair: active settlement,
+        or a later target change, removes every previously-applied waiting clock, not only the most recent)."""
+        state = self._read_work_reaction()
+        applied, desired = list(state.get("applied") or []), state.get("desired")
+        changed = False
+        for target in list(applied):
+            if target == desired:
+                continue
+            channel, ts, name = target
+            try:
+                self.reactor.remove(channel, ts, name)
+            except Exception as e:  # best effort; retried next tick, never falsely confirmed
+                log(f"work reaction remove failed ({name} on {channel}/{ts}): {e} (retried next tick)")
+                continue
+            applied.remove(target)
+            changed = True
+        if desired is not None and desired not in applied:
+            channel, ts, name = desired
+            try:
+                self.reactor.add(channel, ts, name)
+            except Exception as e:  # best effort; retried next tick, never falsely confirmed
+                log(f"work reaction add failed ({name} on {channel}/{ts}): {e} (retried next tick)")
+            else:
+                applied.append(desired)
+                changed = True
+        if changed:
+            self._save_work_reaction({"applied": applied, "desired": desired})
+
+    # ---- automatic continuation (requirement 17, loops/b7.md): a deterministic id, a rolling-hour reservation
+    # counted across restarts, and a crash-safe two-step intent (reserved, then enqueued).
+
+    def continuation_reservations_path(self):
+        return self.path("logs", "continuation-reservations.jsonl")
+
+    def continuation_intent_path(self):
+        return self.path("logs", "continuation-intent.json")
+
+    def _continuation_cap(self):
+        cfg = self.config.get("continuation")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        if "max_per_hour" not in cfg:
+            return CONTINUATION_DEFAULT_MAX_PER_HOUR
+        limit = cfg.get("max_per_hour")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (0 <= limit <= 60):
+            log(f"continuation.max_per_hour invalid ({limit!r}); automatic continuation disabled")
+            return 0
+        return limit
+
+    def _continuation_count(self, now):
+        total = 0
+        for r in read_jsonl(self.continuation_reservations_path()):
+            at = r.get("at")
+            if isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < CONTINUATION_WINDOW_S:
+                total += 1
+        return total
+
+    def _continuation_blocked_by_queue(self):
+        """No pending reply and no pending external event (requirement 17): any event already queued, or a
+        reply still awaiting delivery, means real work exists and an automatic task must not run ahead of it."""
+        if os.path.exists(self.path("inbox", "pending-replies.jsonl")):
+            return True
+        return bool(pending_events(self.home))
+
+    def _maybe_continue(self, data):
+        if self.paused() or self._continuation_blocked_by_queue():
+            return
+        turn = data["turn"]
+        event_id = f"continue-{turn}"
+        if event_id in handled_ids(self.home) or any(e.get("id") == event_id for e in pending_events(self.home)):
+            return  # already reserved for this turn (idempotent across restart/retries)
+        cap = self._continuation_cap()
+        now = self.clock_epoch()
+        if cap <= 0 or self._continuation_count(now) >= cap:
+            return
+        self._reserve_continuation(turn, data["track"], data["next_action"], data["channel"], data["thread_ts"])
+
+    def _reserve_continuation(self, turn, track, next_action, channel, thread_ts):
+        event_id = f"continue-{turn}"
+        at = self.clock_epoch()
+        intent = {"turn": turn, "id": event_id, "track": track, "next_action": next_action,
+                  "channel": channel, "thread_ts": thread_ts, "at": at}
+        write_text(self.continuation_intent_path(), json.dumps(intent) + "\n")
+        self.persistence_checkpoint("continuation_intent_saved")  # requirement 20, loops/b7.md: B1 -- the
+        # intent (with its original reservation timestamp) is durable before the reservation is counted, so
+        # a crash between the two can never bypass the hourly cap: recovery still has the original `at`.
+        self._reserve_and_enqueue(intent)
+
+    def _reserve_and_enqueue(self, intent):
+        """The single counted reservation for `intent`, using its original timestamp (never a fresh one on
+        recovery), then the idempotent enqueue (requirement 20, loops/b7.md: B1). Safe to repeat: a reservation
+        already recorded for this id is never counted twice."""
+        event_id, at = intent["id"], intent.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            at = self.clock_epoch()
+        if not any(r.get("id") == event_id for r in read_jsonl(self.continuation_reservations_path())):
+            append_jsonl(self.continuation_reservations_path(), {"turn": intent.get("turn"), "at": at, "id": event_id})
+        self.persistence_checkpoint("continuation_reserved")
+        self._enqueue_continuation(intent)
+
+    def _enqueue_continuation(self, intent):
+        """Idempotent: a restart (or a second settle_work for the same turn) never duplicates the event. It
+        carries instructs:false and cannot grant new authority -- the manager still decides whether to act.
+        Source `self` (requirement 25, loops/b7.md): never founder-console, replied to only in its own named
+        track thread."""
+        event_id = intent["id"]
+        if event_id not in handled_ids(self.home) and not any(e.get("id") == event_id for e in pending_events(self.home)):
+            text = f"continue {intent['track']}: {intent['next_action']}"
+            append_event(self.home, new_event(
+                "self", {"text": text, "instructs": False, "channel": intent.get("channel"),
+                         "thread_ts": intent.get("thread_ts"), "continuation": True, "track": intent.get("track")},
+                event_id=event_id))
+        self.persistence_checkpoint("continuation_enqueued")
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.continuation_intent_path())
+
+    def _reconcile_continuation_intent(self):
+        """Restart reconciles an incomplete reservation once (requirement 17/20, loops/b7.md: B1): the intent
+        carries the original reservation timestamp, so recovery never double-counts and never loses it -- it
+        establishes the single reservation (if not already recorded) before enqueueing, exactly like the
+        forward path, and calling this again on an already-enqueued intent (the file is gone) is a no-op."""
+        try:
+            intent = json.loads(read_text(self.continuation_intent_path(), "") or "null")
+        except json.JSONDecodeError:
+            intent = None
+        if isinstance(intent, dict) and intent.get("id"):
+            self._reserve_and_enqueue(intent)
+
+    # ---- durable persistence status (requirement 19, loops/b7.md)
+
+    def persistence_status_path(self):
+        return self.path("logs", "persistence.json")
+
+    def _read_persistence_status(self):
+        try:
+            data = json.loads(read_text(self.persistence_status_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_persistence_status(self, **fields):
+        state = self._read_persistence_status()
+        state.update(fields)
+        write_text(self.persistence_status_path(), json.dumps(state, indent=1) + "\n")
+        return state
+
+    def _repo_unsafe_dirty(self):
+        """True when the working tree or index has anything outside the manager-owned factory/state.json,
+        factory/log/ and manager-memory paths (requirement 19, loops/b7.md): persistence must not stage,
+        commit, unstage or otherwise alter those files/entries, so it refuses to touch git at all."""
+        status = self._git("status", "--porcelain", "-uall")
+        if status.returncode != 0:
+            return True  # cannot verify safety; refuse rather than risk it
+        for line in status.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:].strip().split(" -> ")[-1].strip().strip('"')
+            if path in MANAGED_REPO_PATHS or any(path.startswith(p) for p in MANAGED_REPO_PREFIXES):
+                continue
+            return True
+        return False
+
+    def _persistence_fail(self, step, detail, blocked=False, pending_local_sha=None):
+        prev = self._read_persistence_status()
+        was_failing = prev.get("status") in ("pending", "blocked")
+        episode_id = prev.get("episode_id") if was_failing else str(uuid.uuid4())
+        status = "blocked" if blocked else "pending"
+        error = f"{step}: {detail}"[:2000]
+        fields = {"status": status, "error": error, "episode_id": episode_id,
+                  "retry_after": self.clock_epoch() + PERSISTENCE_RETRY_AFTER_S}
+        if pending_local_sha is not None:
+            fields["pending_local_sha"] = pending_local_sha
+        self._save_persistence_status(**fields)
+        log(f"persistence {status}: {error}")
+        if not was_failing:
+            _queue_notice_once(self.home, self.dev_channel, f"persistence {status} (episode {episode_id}): {error}",
+                               f"persistence-{episode_id}-failed")
+        return False
+
+    def _persistence_recovered(self, last_sha):
+        prev = self._read_persistence_status()
+        was_failing = prev.get("status") in ("pending", "blocked")
+        episode_id = prev.get("episode_id")
+        self._save_persistence_status(status="synced", error=None, pending_local_sha=None,
+                                      last_successful_push_sha=last_sha, retry_after=None)
+        if was_failing and episode_id:
+            _queue_notice_once(self.home, self.dev_channel,
+                               f"persistence recovered (episode {episode_id}): synced at {last_sha[:12]}",
+                               f"persistence-{episode_id}-recovered")
+        return True
+
+    def reconcile_persistence(self):
+        """Retried on every run_once tick, including one with no events, and after restart (requirement 19,
+        loops/b7.md): only a `pending` (retryable) status is retried automatically, and only once its own
+        60-second deadline has passed -- never a tight loop, and a new turn never resets that deadline.
+        `blocked` (a dirty tree or a real merge conflict) needs the founder, not an automatic retry."""
         if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
             return
+        status = self._read_persistence_status()
+        if status.get("status") != "pending":
+            return
+        retry_after = status.get("retry_after")
+        if isinstance(retry_after, (int, float)) and self.clock_epoch() < retry_after:
+            return
+        self.sync_repo_before()
+        self.persist(status.get("last_turn") or 0)
+
+    def sync_repo_before(self):
+        """Fetch and reconcile a clean diverged clone with an ordinary merge, preserving both histories (no
+        force-push, reset or automatic conflict resolution, requirement 19, loops/b7.md). A real conflict
+        aborts the merge, retains local work and marks `blocked`; unmanaged dirt blocks before touching git.
+        Respects the same pending-retry deadline as `persist`/`reconcile_persistence` (requirement 19, S2
+        repair): an incoming turn never resets it, so this is a no-op git-wise until it has passed."""
+        self._sync_blocked = False
+        if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
+            return
+        status = self._read_persistence_status()
+        retry_after = status.get("retry_after")
+        if status.get("status") == "pending" and isinstance(retry_after, (int, float)) \
+                and self.clock_epoch() < retry_after:
+            return
+        if self._repo_unsafe_dirty():
+            self._sync_blocked = True
+            self._persistence_fail("dirty", "repo has unmanaged local changes outside managed paths", blocked=True)
+            return
         try:
-            self._git("pull", "-q", "--ff-only", timeout=120)
+            fetch = self._git("fetch", "-q", "origin", timeout=120)
+            if fetch.returncode != 0:
+                self._persistence_fail("fetch", (fetch.stderr or "").strip()[-500:] or f"exit {fetch.returncode}")
+                return
+            branch = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            upstream = self._git("rev-parse", "--verify", f"origin/{branch}")
+            if upstream.returncode == 0:
+                merge = self._git("merge", "-q", "--no-edit", f"origin/{branch}", timeout=120)
+                if merge.returncode != 0:
+                    self._git("merge", "--abort")
+                    self._sync_blocked = True
+                    self._persistence_fail("merge", (merge.stderr or merge.stdout or "").strip()[-500:], blocked=True)
+                    return
         except (OSError, subprocess.SubprocessError) as e:
-            log(f"pull skipped: {e}")
+            self._persistence_fail("fetch", str(e))
+            return
         repo_state = os.path.join(self.repo, "factory", "state.json")
         if not os.path.exists(self.path("state.json")) and os.path.exists(repo_state):
             shutil.copyfile(repo_state, self.path("state.json"))
 
     def persist(self, n):
         """Copy mirror/ into factory/log/ and state.json into factory/, add the memory folder, commit
-        `manager: turn <n>`, push."""
+        `manager: turn <n>`, push -- checking every Git return code (requirement 19, loops/b7.md): a failed
+        pull/add/commit/push is never reported as synced, and an existing unpushed local commit is retried
+        even with nothing newly staged this turn."""
         if not self.repo:
+            self._save_persistence_status(status="no_repo", error=None)
             return False
         if not os.path.isdir(os.path.join(self.repo, ".git")):
             log(f"repo {self.repo} is not a git clone; persistence skipped")
+            self._save_persistence_status(status="no_repo", error=None)
             return False
+        self._save_persistence_status(last_turn=n)
+        status = self._read_persistence_status()
+        retry_after = status.get("retry_after")
+        if status.get("status") == "pending" and isinstance(retry_after, (int, float)) \
+                and self.clock_epoch() < retry_after:
+            return False  # back off; a new turn does not reset this deadline
+        if getattr(self, "_sync_blocked", False) or self._repo_unsafe_dirty():
+            return self._persistence_fail("dirty", "repo has unmanaged local changes outside managed paths",
+                                          blocked=True)
         log_dir = os.path.join(self.repo, "factory", "log")
         os.makedirs(log_dir, exist_ok=True)
         mirror = self.path("mirror")
@@ -2171,18 +3367,24 @@ class Supervisor:
         paths = ["factory/log"] + (["factory/state.json"] if os.path.exists(repo_state) else []) + \
                 ([MEMORY_DIRNAME] if os.path.isdir(os.path.join(self.repo, MEMORY_DIRNAME)) else [])
         try:
-            self._git("add", "-A", "--", *paths)
-            if self._git("diff", "--cached", "--quiet").returncode == 0:
-                return False
-            self._git("commit", "-q", "-m", f"manager: turn {n}", check=True)
+            add = self._git("add", "-A", "--", *paths)
+            if add.returncode != 0:
+                return self._persistence_fail("add", (add.stderr or "").strip()[-500:] or f"exit {add.returncode}")
+            diff = self._git("diff", "--cached", "--quiet")
+            if diff.returncode not in (0, 1):
+                return self._persistence_fail("diff", (diff.stderr or "").strip()[-500:] or f"exit {diff.returncode}")
+            if diff.returncode == 1:
+                commit = self._git("commit", "-q", "-m", f"manager: turn {n}")
+                if commit.returncode != 0:
+                    return self._persistence_fail("commit", (commit.stderr or commit.stdout or "").strip()[-500:])
+            local_sha = self._git("rev-parse", "HEAD").stdout.strip()
             push = self._git("push", "-q", "origin", "HEAD", timeout=180)
             if push.returncode != 0:
-                log(f"push failed: {push.stderr.strip()[-300:]}")
-                return False
+                return self._persistence_fail("push", (push.stderr or "").strip()[-500:] or f"exit {push.returncode}",
+                                              pending_local_sha=local_sha)
         except (OSError, subprocess.SubprocessError) as e:
-            log(f"persist failed: {e}")
-            return False
-        return True
+            return self._persistence_fail("exception", str(e))
+        return self._persistence_recovered(local_sha)
 
     # ---- the service loop
     def add_timer_event(self, now=None):

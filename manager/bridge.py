@@ -23,6 +23,7 @@ The service's poster returns Slack's answer, so a top-level post (`-`) joins the
 writes `logs/bridge.pid` so `hydra post` knows whether a bridge is there to drain.
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -43,6 +44,102 @@ PRUNE_EVERY_S = 86400
 OUTBOX_POLL_S = 1.0
 SKIPPED_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave", "channel_topic",
                     "channel_purpose", "channel_name", "group_join", "group_leave"}
+FOOTER_RE = re.compile(r"[\n \t]+\*Sent using\*[ \t]*<@[A-Za-z0-9_]+(?:\|[^>\n]*)?>[ \t\n]*$")
+
+
+def strip_attribution_footer(text):
+    """Remove one trailing `*Sent using* <@ID>` or `*Sent using* <@ID|label>` footer (requirement 14, loops/b7.md):
+    it must end the message, separated by a newline or spaces; a footer inside a quoted line (`>`) or an
+    (optionally unclosed) triple-backtick fenced code block is never stripped. The rest of the message, including
+    multiline arguments, is preserved untouched."""
+    if not text:
+        return text
+    m = FOOTER_RE.search(text)
+    if not m:
+        return text
+    prefix = text[:m.start()]
+    if prefix.count("```") % 2 == 1:
+        return text  # inside an unclosed fence
+    line_start = prefix.rfind("\n") + 1
+    if text[line_start:].lstrip().startswith(">"):
+        return text  # a quoted line
+    return prefix
+
+
+def _render_leaves(elements):
+    """Plain text out of a flat list of rich_text leaf elements: text, a user mention, a link (its label else its
+    url), an emoji shortcode. Unknown/malformed elements are safely ignored (requirement 7, loops/b7.md)."""
+    out = []
+    for el in elements or []:
+        if not isinstance(el, dict):
+            continue
+        t = el.get("type")
+        if t == "text":
+            out.append(el.get("text") or "")
+        elif t == "user":
+            uid = el.get("user_id")
+            if uid:
+                out.append(f"<@{uid}>")
+        elif t == "link":
+            out.append(el.get("text") or el.get("url") or "")
+        elif t == "emoji":
+            name = el.get("name")
+            if name:
+                out.append(f":{name}:")
+        elif t in ("channel", "usergroup"):
+            val = el.get("channel_id") or el.get("usergroup_id")
+            if val:
+                out.append(f"<#{val}>" if t == "channel" else f"<!subteam^{val}>")
+    return "".join(out)
+
+
+def _render_rich_text(elements):
+    """One `rich_text` block's elements: sections, lists (each item a section), quotes and preformatted (code)
+    blocks, whose own `elements` are leaves directly. Readable separators between pieces are preserved."""
+    parts = []
+    for item in elements or []:
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type")
+        if t == "rich_text_section":
+            parts.append(_render_leaves(item.get("elements")))
+        elif t == "rich_text_list":
+            items = [_render_leaves(sub.get("elements")) for sub in (item.get("elements") or [])
+                    if isinstance(sub, dict)]
+            parts.append(" ".join(p for p in items if p))
+        elif t in ("rich_text_quote", "rich_text_preformatted"):
+            parts.append(_render_leaves(item.get("elements")))
+        # an unknown container type is safely ignored
+    return " ".join(p for p in parts if p)
+
+
+def normalize_blocks(blocks):
+    """Recursively render Slack `blocks` into readable plain text (requirement 7, loops/b7.md): rich_text
+    sections/lists/quotes/preformatted, text, user mentions, links, emoji, and section/context plain or mrkdwn
+    text. Unknown or malformed elements (including a bare `None`) are safely ignored."""
+    parts = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        t = block.get("type")
+        if t == "rich_text":
+            text = _render_rich_text(block.get("elements"))
+            if text:
+                parts.append(text)
+        elif t == "section":
+            field = block.get("text")
+            if isinstance(field, dict) and field.get("type") in ("plain_text", "mrkdwn"):
+                text = field.get("text") or ""
+                if text:
+                    parts.append(text)
+        elif t == "context":
+            for el in block.get("elements") or []:
+                if isinstance(el, dict) and el.get("type") in ("plain_text", "mrkdwn"):
+                    text = el.get("text") or ""
+                    if text:
+                        parts.append(text)
+        # an unknown block type is safely ignored
+    return "\n".join(parts)
 
 
 def load_allowlist(home):
@@ -234,14 +331,19 @@ class Bridge:
 
     # ---- events
     def handle_message(self, ev):
-        """One Slack `message` event (dict). Mirrors it; queues it for allowlisted senders; answers commands."""
+        """One Slack `message` event (dict). Mirrors it; queues it for allowlisted senders; answers commands.
+        Nonblank top-level text is authoritative; only a blank text falls back to the normalized blocks
+        (requirement 7, loops/b7.md). A trailing `*Sent using*` attribution footer is stripped from the routing
+        copy after that normalization and before command parsing (requirement 14); the mirror may keep it."""
         self._maybe_reload_allowlist()
         self.maybe_prune()  # the 14-day rule, daily
         channel = ev.get("channel")
         subtype = ev.get("subtype")
         if subtype in SKIPPED_SUBTYPES:
             return None
-        text = ev.get("text") or ""
+        raw_text = ev.get("text") or ""
+        text = raw_text if raw_text.strip() else normalize_blocks(ev.get("blocks"))
+        cleaned = strip_attribution_footer(text)
         ts = ev.get("ts")
         files = self.download_files(ev)
         is_bot = bool(ev.get("bot_id")) or subtype == "bot_message"
@@ -253,7 +355,7 @@ class Bridge:
         sender, entry = self.sender_entry(ev)
         if entry is None:
             return None  # a stranger: mirrored, never queued
-        addressed, rest = self.parse_mention(text)
+        addressed, rest = self.parse_mention(cleaned)
         if is_bot and not addressed:
             return None  # another bot talking to the channel, not to us
         thread_ts = ev.get("thread_ts") or ts  # a thread root the manager answers starts its own thread
@@ -263,14 +365,14 @@ class Bridge:
                 if m.group(1).split()[0].lower() != "leave":
                     self.join(channel, thread_ts)  # a mention joins the thread, except the one that leaves it
                 return self.command(m, sender, entry, channel, thread_ts)
-        if addressed or self.assigned_to_manager(text):
+        if addressed or self.assigned_to_manager(cleaned):
             self.join(channel, thread_ts)
         elif self.joined(channel, thread_ts):
             self.join(channel, thread_ts)  # touches last_seen
         else:
             return None  # an unjoined thread, or a top-level post without a mention: mirrored only
         event = S.append_event(self.home, S.new_event(
-            "slack", {"channel": channel, "ts": ts, "thread_ts": thread_ts, "user": sender, "text": text,
+            "slack", {"channel": channel, "ts": ts, "thread_ts": thread_ts, "user": sender, "text": cleaned,
                       "instructs": bool(entry.get("instructs")), "addressed": addressed, "files": files},
             event_id=ts))
         if addressed:
@@ -515,6 +617,115 @@ def check(home, probe=None):
     return ok
 
 
+class SocketHealth:
+    """Bridge service liveness (requirement 1, loops/b7.md): healthy while `client.is_connected()` and either a
+    Socket Mode envelope (`note_envelope`, installed as a raw `socket_mode_request_listener`, before Bolt's own
+    app-level filtering) or a changed `client.current_session.last_ping_pong_time` has been observed within
+    `timeout_s` seconds of monotonic elapsed time. An idle channel with fresh pongs stays healthy; outbound pings
+    and Web API calls never count. A session replacement that happens to carry the same old pong timestamp cannot
+    buy fresh activity repeatedly: only a *changed* value counts."""
+
+    def __init__(self, client, clock=time.monotonic, timeout_s=300):
+        self.client = client
+        self.clock = clock
+        self.timeout_s = timeout_s
+        self._last_activity = clock()
+        self._last_pong_seen = self._current_pong()
+
+    def _current_pong(self):
+        session = getattr(self.client, "current_session", None)
+        return getattr(session, "last_ping_pong_time", None) if session is not None else None
+
+    def note_envelope(self, *args):
+        """A raw Socket Mode receipt listener: `(client, request)`, but any arguments are accepted and ignored."""
+        self._last_activity = self.clock()
+
+    def _note_pong_if_changed(self):
+        current = self._current_pong()
+        if current is not None and current != self._last_pong_seen:
+            self._last_pong_seen = current
+            self._last_activity = self.clock()
+
+    def check(self):
+        """True when healthy. Never reconnects by itself."""
+        if not self.client.is_connected():
+            return False
+        self._note_pong_if_changed()
+        return (self.clock() - self._last_activity) < self.timeout_s
+
+
+def _reconnect_or_die(client, timeout_s):
+    """Force `client.connect_to_new_endpoint(force=True)` bounded to `timeout_s` seconds, in a daemon thread so a
+    hung SDK call cannot block the watchdog past the bound. Exception, timeout, or a still-disconnected result is
+    fatal (requirement 2/23, loops/b7.md: B4): raises so the caller's process exits nonzero. The installed SDK's
+    `connect_to_new_endpoint(force=False)` only reconnects when already disconnected, so an established-but-
+    silent connection (is_connected() still True) needs `force=True` to actually request a new endpoint at all."""
+    outcome = {}
+
+    def attempt():
+        try:
+            client.connect_to_new_endpoint(force=True)
+        except Exception as e:  # noqa: BLE001 - captured across the thread boundary, re-raised below
+            outcome["error"] = e
+    t = threading.Thread(target=attempt, daemon=True, name="socket-reconnect")
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        reason = f"reconnect timed out after {timeout_s}s"
+        S.log(reason)
+        raise TimeoutError(reason)
+    if "error" in outcome:
+        S.log(f"reconnect failed: {outcome['error']}")
+        raise outcome["error"]
+    if not client.is_connected():
+        reason = "reconnect returned but the socket is still disconnected"
+        S.log(reason)
+        raise RuntimeError(reason)
+
+
+def _verify_fresh_activity_or_die(health, clock, grace_s, stop):
+    """A forced reconnect that returns connected is not proof of a working replacement (requirement 23, loops/
+    b7.md: B4): the old session's pong cannot certify it, so this blocks for a genuinely new envelope or pong
+    value before accepting the connection as healthy again, bounded by `grace_s` of the supplied monotonic
+    `clock` -- never the injected `stop.wait`, whose caller-controlled clock jumps must not corrupt this bound.
+    No fresh activity within the grace period is fatal, same as a failed reconnect itself."""
+    baseline_activity, baseline_pong = health._last_activity, health._last_pong_seen
+    deadline = clock() + grace_s
+    while True:
+        health._note_pong_if_changed()
+        if health._last_activity != baseline_activity or health._last_pong_seen != baseline_pong:
+            return
+        if stop.is_set():
+            return
+        if clock() >= deadline:
+            reason = "reconnected endpoint showed no fresh inbound activity within the grace period"
+            S.log(reason)
+            raise RuntimeError(reason)
+        time.sleep(min(0.01, grace_s))
+
+
+def run_socket_mode(handler, stop, clock=time.monotonic, poll_s=10, reconnect_timeout_s=30):
+    """The required testable seam (requirement 2, loops/b7.md): connects once, installs the raw receipt listener,
+    then monitors `SocketHealth` in the calling thread (never a background one: "a background SystemExit alone is
+    insufficient" means the process must actually fail from its own main thread) every `poll_s` seconds, at most
+    `reconnect_timeout_s` seconds per recovery attempt plus the same bound again to verify fresh activity
+    (requirement 23, loops/b7.md: B4). Disables the SDK's own competing auto-reconnect for this managed lifecycle.
+    Raises (an exception, or lets one propagate) on failed recovery; it never calls `handler.start()`, which
+    blocks forever instead of returning control to the caller."""
+    client = handler.client
+    client.auto_reconnect_enabled = False
+    client.default_auto_reconnect_enabled = False
+    health = SocketHealth(client, clock=clock, timeout_s=300)
+    client.socket_mode_request_listeners.append(health.note_envelope)
+    handler.connect()
+    while not stop.is_set():
+        if not health.check():
+            _reconnect_or_die(client, reconnect_timeout_s)
+            _verify_fresh_activity_or_die(health, clock, reconnect_timeout_s, stop)
+        if stop.wait(poll_s):
+            return
+
+
 def serve(home):
     from slack_bolt import App
     from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -550,12 +761,17 @@ def serve(home):
 
     write_bridge_pid(home)
     stop = threading.Event()
-    threading.Thread(target=bridge.pump_outbox, args=(stop,), daemon=True, name="outbox").start()
+    pump = threading.Thread(target=bridge.pump_outbox, args=(stop,), daemon=True, name="outbox")
+    pump.start()
+    handler = SocketModeHandler(app, app_token)
     S.log(f"bridge up as {bot_user_id}, home={home}")
     try:
-        SocketModeHandler(app, app_token).start()
+        run_socket_mode(handler, stop)  # connects once; raises on failed recovery (requirement 2, loops/b7.md)
     finally:
         stop.set()
+        pump.join(5)
+        with contextlib.suppress(Exception):
+            handler.close()
 
 
 def main(argv=None):
@@ -568,6 +784,9 @@ def main(argv=None):
         return 0 if check(home) else 1
     try:
         serve(home)
+    except SystemExit as e:
+        code = e.code
+        return code if isinstance(code, int) and code != 0 else 1
     except Exception as e:
         S.log(f"bridge error: {e}")
         return 1

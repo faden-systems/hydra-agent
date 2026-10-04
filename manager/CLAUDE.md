@@ -11,6 +11,11 @@ Slack as `@manager` and on the box as `hydra`. Each wake-up is one turn: read, d
   `factory/log/<channel>.jsonl` is the mirrored conversation. Session memory is a cache, never required.
 - Before acting, read `state.json`, `MANAGER-HANDOFF.md`, and the track log for every track an event touches.
 - If something should be remembered, write it to a file in the repo. Do not rely on the transcript.
+- Every track carries a short `now` (<=240 characters) in `state.json`; maintain it on every turn that changes the
+  track. Its complete history lives in `factory/log/tracks/<id>.md` (`history_file`): append a dated line there
+  when something durable happens, and read the relevant track's archive before acting on it, rather than trusting
+  a necessarily-short `now` to carry everything. `hydra migrate-tracks` is the one-time mechanical migration for
+  state written before this rule; it is not something you run mid-turn.
 
 ### Shared memory across engines (`$HYDRA_MEMORY_DIR`, `factory/manager-memory/` in the faden clone)
 
@@ -101,6 +106,32 @@ nothing you did not write down survives it.
 When a turn begins with `[flush]` (Codex, every few turns): before handling the events, write everything durable
 since your last flush to `MEMORY.md` and `codex/NOTES.md`, dated and tagged `codex`, then go on with the turn.
 
+## Work status and automatic continuation (loops/b7.md requirements 16-18)
+
+At the end of every turn, write `$HYDRA_HOME/work-status.json` yourself (the supervisor only reads and validates
+it; it never infers this from Slack text). It is the explicit scheduling input for what happens next:
+
+```
+{"turn": <this turn's number>, "mode": "continue"|"idle"|"waiting"|"done",
+ "track": "<id>", "channel": "<C...>", "thread_ts": "<...>", "message_ts": "<the last Slack message you answered>",
+ "next_action": "<for continue: the one concrete next step>",
+ "deadline": <for idle/waiting: a UTC epoch>, "who": "<for waiting: who you're waiting on>", "since": <UTC epoch>}
+```
+
+- `continue`: you own the next action and no external dependency remains; the supervisor reserves and queues a
+  capped, informational `continue <track>: <next_action>` event for you itself (source `self`, `instructs:false`;
+  it carries no new authority). Never queue this yourself with `hydra say` -- that command is for the founder's
+  own input, not for self-scheduled continuation (see the founder override below); just write an accurate
+  `work-status.json` and the scheduler does the rest.
+- `idle`/`waiting`: you are blocked on a deadline or on someone (`who`); the supervisor appends a `⏲ next check
+  HH:MM PDT` (idle) or `⏲ waiting on <who>; next check HH:MM PDT` (waiting) footer to your reply itself and puts a
+  `timer_clock` reaction on the message named by `channel`/`message_ts` -- do not write that footer yourself, and
+  do not claim a reaction was added unless the supervisor's status confirms it.
+- `done`: no waiting claim, nothing scheduled.
+- A stale `turn`, an unknown `mode`, or a missing required field disables automatic continuation for that turn;
+  the supervisor logs why instead of guessing. A `work-status.json` from a previous turn without a fresh write is
+  stale and ignored.
+
 ## Founder operational decisions (2026-10-03)
 
 - b7 builds on the VM in parallel with CW1; R1 is parked behind CW1. Earlier R1-before-b7 ordering is superseded.
@@ -108,3 +139,12 @@ since your last flush to `MEMORY.md` and `codex/NOTES.md`, dated and tagged `cod
 - When waiting, put `timer_clock` on the last handled message and end with `⏲ next check HH:MM PDT`, or the operator name and deadline. Status must distinguish idle-until from waiting-on-since. Never claim a reaction was added unless confirmed.
 - b7 must add waiting visibility and automatic continuation when no external dependency remains, with a per-hour cap.
 - Simba replies in plain text until the bridge fix lands.
+
+## Interim coder policy (2026-10-02/03, issue #37/#38 amendments)
+
+- Every Claude coder, on the VM or the iMac, runs on Sonnet 5 (`claude-sonnet-5`) until the founder changes this;
+  the manager itself deliberately stays on Codex `gpt-6-astra` and is not part of this rule.
+- A coder's long-running build (a loop attempt) is launched detached (e.g. `nohup`/`tmux`/`screen`), not in a
+  session that dies when your own turn or an SSH connection ends, so it keeps running across your restarts.
+- Account labels (which coding account is "L", "Hermes", etc.) remain unverified until the founder observes an
+  actual usage check; do not report a label as confirmed on the strength of a fake test or your own assumption.
