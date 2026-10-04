@@ -35,8 +35,8 @@ PYNOTES
 TMP=$(mktemp -d)
 trap 'git worktree remove --force "$TMP/base" >/dev/null 2>&1 || true; rm -rf "$TMP"' EXIT
 git worktree add --detach "$TMP/base" "$BASE" >/dev/null
-"$PYTHON" -m pytest --collect-only -q "$TMP/base/tests/manager" >"$TMP/base.nodes" || fail 'base collection'
-"$PYTHON" -m pytest --collect-only -q tests/manager >"$TMP/head.nodes" || fail 'head collection'
+(cd "$TMP/base" && "$PYTHON" -m pytest --rootdir=. --collect-only -q tests/manager) >"$TMP/base.nodes" || fail 'base collection'
+"$PYTHON" -m pytest --rootdir=. --collect-only -q tests/manager >"$TMP/head.nodes" || fail 'head collection'
 "$PYTHON" - "$TMP/base.nodes" "$TMP/head.nodes" <<'PY'
 import sys
 from pathlib import Path
