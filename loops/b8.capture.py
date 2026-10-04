@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Draft real capture orchestration. Explicit scratch inputs only; never defaults to production."""
+import argparse,hashlib,json,os,signal,subprocess,sys,tempfile,time,shutil
+from unittest.mock import patch
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/'manager'))
+import supervisor as S
+MODEL='claude-opus-5-5'
+
+def git(*args):return subprocess.check_output(['git','-C',str(ROOT),*args]).decode().strip()
+def save(path,value):path.write_text(json.dumps(value,indent=2)+'\n')
+def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def write_manifest(output,candidate,binary):
+    names={'account_switch':'account_switch.json','attempts':'auth-attempts.json',
+           'status_before':'auth-fallback-runtime.json','status_after':'auth-recovery-runtime.json',
+           'status_text_before':'auth-fallback-status.txt','status_text_after':'auth-recovery-status.txt',
+           'identity_before':'auth-fallback-identity.json','identity_after':'auth-recovery-identity.json',
+           'alerts':'auth-alerts-delivered.json','selection_writes':'auth-selection-writes.json',
+           'ledger':'auth-ledger.json','turns':'auth-turns.json','replies':'auth-replies-delivered.json','credits':'credits.json',
+           'model_audit':'model-audit.json'}
+    summary={**candidate,'binary_path':str(binary),'binary_sha256':digest(binary),
+             'binary_version':subprocess.check_output([str(binary),'--version'],timeout=15).decode().strip(),
+             'modes':{mode:{key:f'{mode}/{name}' for key,name in names.items()}
+                      for mode in ('per-turn','persistent')}}
+    save(output/'summary.json',summary)
+    manifest={str(p.relative_to(output)):digest(p) for p in sorted(output.rglob('*'))
+              if p.is_file() and p.name!='manifest.json'}
+    save(output/'manifest.json',manifest)
+def wire_objects(wire):
+    rows=[]
+    for path in sorted(wire.glob('*.stdout')):
+        for line in path.read_text().splitlines():
+            try:row=json.loads(line)
+            except json.JSONDecodeError:continue
+            rows.append((path.name,row))
+    return rows
+
+def successful_model(wire,expected_results=1,requested_model=MODEL):
+    rows=wire_objects(wire)
+    terminal=[r for _,r in rows if r.get('type')=='result']
+    assert len(terminal)==expected_results and all(r.get('is_error') is False for r in terminal),'missing successful terminal result'
+    models={r['message']['model'] for _,r in rows if r.get('type')=='assistant'
+            and isinstance(r.get('message'),dict) and r['message'].get('model')}
+    assert models=={requested_model},'real assistant model differs from requested model or is unavailable'
+    return requested_model
+
+def discover_retries(config):
+    """Routing observation only, never identity/model-availability evidence."""
+    with tempfile.TemporaryDirectory(prefix='b8-route-only-') as folder:
+        home=Path(folder);save(home/'engine',{'acc':'claude-l','model':'claude-fable-5-1','mode':'per-turn'})
+        sup=S.Supervisor(home=folder,engines={'claude-l':{'kind':'claude','bin':'never-executed'}},
+                         config={**config,'repo':None},poster=lambda *a:None,buildlog_poster=lambda *a:None)
+        seen=[]
+        def reject(name,spec,message,model=None,**kwargs):
+            seen.append(model)
+            return 1,'','Credit balance is too low',None
+        with patch.object(sup,'invoke',reject):
+            try:sup.run_engines('routing observation',[])
+            except S.AllEnginesFailed:pass
+            else:raise AssertionError('routing observation unexpectedly succeeded')
+        assert seen and seen[0]=='claude-fable-5-1'
+        return seen[1:]
+
+def capture_models(sup,home,engines,mode,mode_root):
+    aliases=json.loads((ROOT/'manager/models.json').read_text())['claude']['aliases']
+    routing_config={'engine_fallback':sup.config.get('engine_fallback',{})}
+    retries=discover_retries(routing_config)
+    models=list(dict.fromkeys([aliases['opus5'],aliases['opus5.5'],*retries]))
+    records=[]
+    for index,model in enumerate(models):
+        wire=mode_root/f'model-audit-{index}';wire.mkdir(mode=0o700)
+        os.environ['B8_CAPTURE_WIRE_DIR']=str(wire)
+        save(home/'engine',{'acc':'claude-l','model':model,'mode':mode})
+        try:
+            rc,out,err,usage=sup.invoke('claude-l',engines['claude-l'],
+                                      'Reply only B8_MODEL_OK. Do not use tools.',model=model)
+            reported=sorted({r['message']['model'] for _,r in wire_objects(wire)
+                if r.get('type')=='assistant' and isinstance(r.get('message'),dict) and r['message'].get('model')})
+            records.append({'requested_model':model,'reported_models':reported,'returncode':rc,
+                            'wire':wire.name,'usage':usage})
+            save(mode_root/'model-audit.json',{'aliases':aliases,'routing_config':routing_config,'retry_models':retries,'probes':records})
+            assert rc==0,'real model audit failed; inspect retained wire output'
+            successful_model(wire,requested_model=model)
+        finally:stop_recorded(wire)
+
+def stop_recorded(wire):
+    # Start ticks prevent an old capture from targeting a reused PID. Child tracking
+    # also covers a wrapper killed before it could forward the shutdown signal.
+    owned=[]
+    for path in wire.glob('*.json'):
+        meta=json.loads(path.read_text())
+        for role in ('child','wrapper'):
+            owned.append((meta[role+'_pid'],meta[role+'_start'],role=='child'))
+    def alive(item):
+        pid,start,group=item
+        try:
+            fields=(Path('/proc')/str(pid)/'stat').read_text().rsplit(')',1)[1].split()
+            return fields[19]==start and fields[0]!='Z'
+        except FileNotFoundError:return False
+    def stop(sig):
+        for item in owned:
+            if alive(item):
+                try:
+                    (os.killpg if item[2] else os.kill)(item[0],sig)
+                except ProcessLookupError:pass
+    for sig in (signal.SIGTERM,signal.SIGKILL):
+        stop(sig)
+        deadline=time.monotonic()+3
+        while any(alive(item) for item in owned) and time.monotonic()<deadline:time.sleep(.02)
+        if not any(alive(item) for item in owned):return
+    raise RuntimeError('scratch capture processes survived bounded cleanup')
+
+def capture_auth(source_home, engines, mode, mode_root):
+    with tempfile.TemporaryDirectory(prefix='b8-real-auth-') as folder:
+        home=Path(folder)
+        shutil.copytree(source_home/'credentials',home/'credentials')
+        primary=home/'credentials'/engines['claude-r2d2']['cred']
+        original=primary.read_bytes()
+        sidecar=Path(str(primary)+'.identity.json')
+        original_identity=sidecar.read_bytes() if sidecar.exists() else None
+        primary.write_text('CLAUDE_CODE_OAUTH_TOKEN=b8-deliberately-invalid-token\n')
+        if sidecar.exists():sidecar.unlink()
+        save(home/'engine',{'acc':'claude-r2d2','model':MODEL,'mode':mode})
+        delivered=[];alerts=[]
+        def receive(target):
+            def post(channel,thread_ts,text):
+                target.append({'channel':channel,'thread_ts':thread_ts,'text':text})
+                return {'ts':str(len(target))}
+            return post
+        sup=S.Supervisor(home=folder,engines=engines,poster=receive(delivered),
+                         reactor=S.DryReactor(folder),config={'repo':None},
+                         buildlog_poster=lambda *a:None,engine_timeout=90)
+        wires=[];writes=[]
+        original_set_engine=S.set_engine
+        def observe_selection(*args,**kwargs):
+            result=original_set_engine(*args,**kwargs)
+            writes.append({'cause':'operator' if kwargs.get('explicit',True) else 'fallback',
+                           'selection':json.loads((home/'engine').read_text())})
+            return result
+        observer=patch.object(S,'set_engine',observe_selection)
+        observer.start()
+        try:
+            for phase in ('fallback','recovery'):
+                wire=mode_root/('auth-'+phase);wire.mkdir(mode=0o700);wires.append(wire)
+                os.environ['B8_CAPTURE_WIRE_DIR']=str(wire)
+                if phase=='recovery':
+                    primary.write_bytes(original)
+                    if original_identity is not None:sidecar.write_bytes(original_identity)
+                    S.set_engine(folder,'claude-r2d2',MODEL,engines)
+                event={'id':'b8-auth-'+phase,'source':'slack','payload':{
+                    'channel':'C_B8_SCRATCH','ts':str(len(delivered)+1),'thread_ts':'b8-auth',
+                    'text':'Reply only B8_AUTH_OK. Do not use tools.','instructs':True,'addressed':True}}
+                sup.turn([event])
+                turns=sup.turns()
+                assert len(turns)==(1 if phase=='fallback' else 2) and 'error' not in turns[-1]
+                assert turns[-1]['engine']==('claude-l' if phase=='fallback' else 'claude-r2d2')
+                assert turns[-1]['model']==MODEL
+                S.drain_outbox(folder,receive(alerts))
+                assert S.drain_outbox(folder,receive(alerts))==0,'notice was queued twice'
+                save(mode_root/('auth-'+phase+'-runtime.json'),S.read_engine_runtime(folder))
+                (mode_root/('auth-'+phase+'-status.txt')).write_text(S.status_text(folder))
+                account='claude-l' if phase=='fallback' else 'claude-r2d2'
+                identity=S.credential_identity(folder,account,engines[account])
+                save(mode_root/('auth-'+phase+'-identity.json'),
+                     {k:identity.get(k) for k in ('verified','verified_at','mismatch','account_id')})
+            attempts=[json.loads(line) for line in (home/'logs/attempts.jsonl').read_text().splitlines()]
+            save(mode_root/'auth-attempts.json',attempts)
+            assert len(attempts)==3 and attempts[0]['classification']=='auth'
+            assert not attempts[0]['success'] and attempts[0]['reason'].strip()
+            assert all(a['success'] for a in attempts[1:])
+            ledger=[json.loads(line) for line in (Path(sup.memory_dir)/'LEDGER.jsonl').read_text().splitlines()]
+            save(mode_root/'auth-ledger.json',ledger)
+            save(mode_root/'auth-turns.json',sup.turns())
+            save(mode_root/'auth-alerts-delivered.json',alerts)
+            save(mode_root/'auth-replies-delivered.json',delivered)
+            assert len(ledger)==2 and [r['engine'] for r in ledger]==['claude-l','claude-r2d2']
+            assert [r['turn'] for r in ledger]==[1,2]
+            assert sum('fallback started' in r['text'] for r in alerts)==1
+            assert sum('fallback ended' in r['text'] for r in alerts)==1
+            assert len(delivered)==2
+            save(mode_root/'auth-selection-writes.json',writes)
+            assert len([w for w in writes if w['cause']=='fallback'])==1
+        finally:
+            observer.stop()
+            for wire in wires:stop_recorded(wire)
+
+def capture_credits(sup, home, engines, mode_root):
+    """One L Fable probe through the actual candidate retry path."""
+    wire=mode_root/'credits-wire';wire.mkdir(mode=0o700)
+    # The candidate must restart at the model boundary before reading this destination.
+    os.environ['B8_CAPTURE_WIRE_DIR']=str(wire)
+    selected=json.loads((home/'engine').read_text())
+    selected.update(acc='claude-l',model='claude-fable-5-1')
+    save(home/'engine',selected)
+    sup.engines={'claude-l':engines['claude-l']}
+    sup.config['engine_fallback']={'claude_models':[MODEL]}
+    try:
+        winner,model,out,usage,transition=sup.run_engines('Reply only B8_CREDITS_OK. Do not use tools.',[])
+        attempts=[json.loads(line) for line in (home/'logs/attempts.jsonl').read_text().splitlines()]
+        save(mode_root/'credits-attempts.json',attempts)
+        assert winner=='claude-l' and all(a['engine']=='claude-l' for a in attempts)
+        rows=wire_objects(wire)
+        terminal=[r for _,r in rows if r.get('type')=='result']
+        observed={r['message']['model'] for _,r in rows if r.get('type')=='assistant'
+                  and isinstance(r.get('message'),dict) and r['message'].get('model')}
+        if len(attempts)==1:
+            assert model=='claude-fable-5-1' and attempts[0]['success']
+            assert len(terminal)==1 and terminal[0].get('is_error') is False
+            assert observed=={'claude-fable-5-1'}
+            outcome='reset'
+        else:
+            assert len(attempts)==2 and not attempts[0]['success']
+            assert attempts[0]['model']=='claude-fable-5-1' and attempts[0]['classification']=='credits'
+            assert attempts[0]['reason'].strip()
+            assert attempts[1]['success'] and attempts[1]['model']==model==MODEL
+            assert len(terminal)==2 and sum(t.get('is_error') is True for t in terminal)==1
+            assert MODEL in observed and observed <= {MODEL,'claude-fable-5-1'}
+            outcome='exhausted'
+        save(mode_root/'credits.json',{'outcome':outcome,'observed_at':sup.now(),
+             'attempts':attempts,'wire':'credits-wire','usage':usage,
+             'explanation':'Fable succeeded; exhaustion no longer reproduced.' if outcome=='reset'
+                 else 'Fable credits error followed by same-account Opus5.5 success.'})
+    finally:stop_recorded(wire)
+
+def capture_switches(binary, sources, output, retry_config=None):
+    assert not git('status','--porcelain','--untracked-files=all'),'commit a clean candidate first'
+    candidate={'candidate_sha':git('rev-parse','HEAD'),'candidate_tree':git('rev-parse','HEAD^{tree}'),
+               'capture_harness_sha256':digest(Path(__file__)),
+               'wire_harness_sha256':digest(ROOT/'loops/b8.capture-wire.py')}
+    output.mkdir(mode=0o700,parents=False,exist_ok=False)
+    save(output/'candidate.json',candidate)
+    for mode in ('per-turn','persistent'):
+        mode_root=output/mode;mode_root.mkdir(mode=0o700)
+        with tempfile.TemporaryDirectory(prefix='b8-real-switch-') as folder:
+            home=Path(folder);(home/'credentials').mkdir(mode=0o700)
+            engines={}
+            for account,source in sources.items():
+                cred=home/'credentials'/(account+'.env')
+                # Credential bytes and verification stay only in the private scratch home.
+                cred.write_bytes(source.read_bytes());cred.chmod(0o600)
+                sidecar=Path(str(source)+'.identity.json')
+                if sidecar.exists():Path(str(cred)+'.identity.json').write_bytes(sidecar.read_bytes())
+                engines[account]={'kind':'claude','bin':str(ROOT/'loops/b8.capture-wire.py'),'cred':cred.name}
+                identity=S.credential_identity(folder,account,engines[account])
+                assert identity['verified'] and not identity['mismatch'],'credential identity is unverified'
+            save(home/'engine',{'acc':'claude-r2d2','model':MODEL,'mode':mode})
+            sup=S.Supervisor(home=folder,engines=engines,poster=lambda *a:None,
+                             buildlog_poster=lambda *a:None,engine_timeout=90)
+            if retry_config is not None:sup.config['engine_fallback']=retry_config['engine_fallback']
+            switches=[];sid=None;wires=[]
+            try:
+                for account in ('claude-r2d2','claude-l'):
+                    wire=mode_root/account;wire.mkdir(mode=0o700);wires.append(wire)
+                    os.environ['B8_REAL_CLAUDE']=str(binary)
+                    os.environ['B8_CAPTURE_WIRE_DIR']=str(wire)
+                    save(home/'engine',{'acc':account,'model':MODEL,'mode':mode})
+                    usages=[]
+                    for request in range(2):
+                        rc,out,err,usage=sup.invoke(account,engines[account],
+                            f'Reply only B8_ACCOUNT_SWITCH_OK_{request}. Do not use tools.',model=MODEL)
+                        assert rc==0,'real account-switch invocation failed; inspect private wire evidence'
+                        assert out.strip()==f'B8_ACCOUNT_SWITCH_OK_{request}','reply belongs to another request'
+                        assert usage and isinstance(usage.get('input_tokens'),int),'per-request usage missing'
+                        usages.append(usage)
+                    effective=successful_model(wire,2)
+                    processes=list(wire.glob('*.json'))
+                    assert len(processes)==(1 if mode=='persistent' else 2),'unexpected process reuse'
+                    current=sup.session_id()
+                    assert current and (sid is None or sid==current),'account switch changed conversation'
+                    sid=current
+                    switches.append({'engine':account,'requested_model':MODEL,'effective_model':effective,
+                                     'success':True,'session_id':sid,'usage':usages,'wire':account})
+                save(mode_root/'account_switch.json',switches)
+                capture_auth(home,dict(engines),mode,mode_root)
+                capture_models(sup,home,engines,mode,mode_root)
+                os.environ['B8_CAPTURE_WIRE_DIR']=str(mode_root/'claude-l')
+                capture_credits(sup,home,engines,mode_root)
+            finally:
+                for wire in wires:stop_recorded(wire)
+    assert candidate['candidate_sha']==git('rev-parse','HEAD')
+    assert not git('status','--porcelain','--untracked-files=all'),'candidate changed during capture'
+    write_manifest(output,candidate,binary)
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--binary',type=Path,required=True)
+    parser.add_argument('--r2d2-credential',type=Path,required=True)
+    parser.add_argument('--l-credential',type=Path,required=True)
+    parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--retry-config',type=Path,help='Sanitized JSON containing only engine_fallback.claude_models')
+    args=parser.parse_args()
+    os.umask(0o077)
+    retry_config=None
+    if args.retry_config:
+        retry_config=json.loads(args.retry_config.read_text())
+        assert set(retry_config)=={'engine_fallback'}
+        assert set(retry_config['engine_fallback'])=={'claude_models'}
+        models=retry_config['engine_fallback']['claude_models']
+        assert isinstance(models,list) and all(isinstance(m,str) and m.startswith('claude-') for m in models)
+    capture_switches(args.binary.resolve(strict=True),
+                     {'claude-r2d2':args.r2d2_credential.resolve(strict=True),
+                      'claude-l':args.l_credential.resolve(strict=True)},args.output.resolve(),retry_config)
+    import runpy
+    runpy.run_path(str(ROOT/'loops/b8.live.py'))['validate'](args.output.resolve())
+    print('b8 capture complete: candidate evidence validated')
