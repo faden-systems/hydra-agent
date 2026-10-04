@@ -12,7 +12,7 @@ fence() {
   changed=$( (git diff --name-only "$BASE"...HEAD; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
   bad=$(printf '%s\n' "$changed" | grep -Ev '^$|^manager/(bridge\.py|supervisor\.py|hydra|README\.md|CLAUDE\.md)$|^tests/manager/|^docs/notes/b7\.md$' || true)
   test -z "$bad" || fail "outside fence: $bad"
-  for f in loops/b7.md loops/b7.exit.sh loops/b7.acceptance.py loops/b4.acceptance.py; do
+  for f in loops/b7.md loops/b7.exit.sh loops/b7.acceptance.py loops/b4.acceptance.py loops/b7.repair.py; do
     git show "$BASE:$f" | cmp -s - "$f" || fail "exit-owned file changed: $f"
   done
 }
@@ -48,8 +48,8 @@ PY
 # Watchdog bounds all exit-owned subprocess cases, including a broken reconnect.
 "$PYTHON" - "$PYTHON" <<'PY'
 import subprocess,sys
-for loop in ('b7','b6','b5','b4','b3','b2','b1'):
-    try: result=subprocess.run([sys.argv[1],f'loops/{loop}.acceptance.py'],timeout=180)
+for loop in ('b7','b6','b5','b4','b3','b2','b1','b7-repair'):
+    try: result=subprocess.run([sys.argv[1], 'loops/b7.repair.py' if loop=='b7-repair' else f'loops/{loop}.acceptance.py'],timeout=180)
     except subprocess.TimeoutExpired: raise SystemExit(f'[b7] FAIL: {loop} acceptance timeout')
     if result.returncode: raise SystemExit(f'[b7] FAIL: {loop} acceptance exit {result.returncode}')
 PY
