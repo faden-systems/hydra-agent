@@ -247,7 +247,6 @@ def partial_delivery_recovery():
     make().run_once()
     assert posted==['first'],'PARTIAL fixture did not confirm first only'
     assert Path(h,'inbox/pending-replies.jsonl').exists(),'PARTIAL missing durable remainder'
-    original=S.Supervisor.deliver
     def crash_before_post(self,deliveries,ids,n):
         hits.append('before_post');raise Crash()
     # Twice restart before another request; confirmed first must remain excluded.
@@ -269,13 +268,28 @@ def unavailable_self_routing():
         sup=S.Supervisor(home=h,poster=lambda *a:posted.append(a))
         ev=S.new_event('self',{'text':'continue b','channel':channel,'thread_ts':thread,'instructs':False},event_id='self-unavailable')
         # This is the actual shared all-engines-failed notice sink, not normal reply routing.
-        sup.post_unavailable([ev]);sup.post_unavailable([ev])
+        sup.post_unavailable([ev]);S.Supervisor(home=h,poster=lambda *a:posted.append(a)).post_unavailable([ev])
         if channel and thread:
             assert len(posted)==1 and posted[0][:2]==('C','track'),'SELF_FAILURE wrong thread or duplicate'
         else:
             assert not posted,'SELF_FAILURE unroutable notice posted to Slack'
             rows=S.read_jsonl(sup.path('logs','self-replies.jsonl'))
             assert len(rows)==1 and rows[0].get('id')=='self-unavailable' and rows[0].get('text'),'SELF_FAILURE missing durable local notice'
+    # Mixed failure batches must not short-circuit after the first self event.
+    h=home();posted=[]
+    events=[S.new_event('self',{'text':'continue','channel':'C','instructs':False},event_id='local-self'),
+            S.new_event('self',{'text':'continue','channel':'C','thread_ts':'track','instructs':False},event_id='thread-self'),
+            S.new_event('cli',{'text':'founder task','channel':'C','user':'founder-console','instructs':True},event_id='founder-cli'),
+            S.new_event('slack',{'text':'external','channel':'C','thread_ts':'external','instructs':True},event_id='external-slack')]
+    for _ in range(2):
+        S.Supervisor(home=h,poster=lambda *a:posted.append(a)).post_unavailable(events)
+    assert sorted((p[0],p[1]) for p in posted)==[('C','external'),('C','track')],'SELF_FAILURE mixed notice dropped or escaped thread'
+    assert all(p[2] and 'via console' not in p[2] for p in posted),'SELF_FAILURE console impersonation'
+    rows=S.read_jsonl(str(Path(h,'logs/self-replies.jsonl')))
+    assert len(rows)==1 and rows[0].get('id')=='local-self' and rows[0].get('text'),'SELF_FAILURE mixed local record wrong'
+    replies=Path(h,'inbox/replies')
+    assert (replies/'founder-cli.txt').read_text().strip(),'SELF_FAILURE founder reply missing'
+    assert not (replies/'local-self.txt').exists() and not (replies/'thread-self.txt').exists(),'SELF_FAILURE self became console reply'
 
 if __name__=='__main__':
     failures=[]
