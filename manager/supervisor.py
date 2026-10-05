@@ -77,7 +77,9 @@ HANDOFF_MARK = "---HANDOFF---"
 NO_SESSION_RE = re.compile(r"no conversation found|session.*not found|could not find session", re.IGNORECASE)
 CREDITS_RE = re.compile(r"\bcredits?\b", re.IGNORECASE)
 USAGE_LIMIT_RE = re.compile(r"\busage limit\b", re.IGNORECASE)
-AUTH_RE = re.compile(r"\b(?:http|status)\D{0,6}(401|403)\b|\b(?:unauthorized|forbidden)\b", re.IGNORECASE)
+AUTH_RE = re.compile(r"\b(?:http|status)\D{0,6}(401|403)\b|\b401\b|\b(?:unauthorized|forbidden)\b"
+                     r"|\bfailed to authenticate\b|\binvalid bearer token\b|\binvalid authentication token\b"
+                     r"|\bnot logged in\b", re.IGNORECASE)
 RATE_LIMIT_RE = re.compile(r"\brate[\s-]?limit(?:ed)?\b|\b429\b", re.IGNORECASE)
 PROMPT_TOO_LONG_RE = re.compile(r"\bprompt\s+(?:is\s+)?too long\b", re.IGNORECASE)
 FAILURE_REASON_MAX = 4000
@@ -852,9 +854,12 @@ def migrate_track_history(home, repo):
 
 def classify_engine_error(text):
     """credits|usage_limit|rate_limit|auth|prompt_too_long|other, from an engine failure's combined reason text.
-    Matches phrases/tokens, not substrings (`rate` inside `generate`/`separate` is not a rate limit); recognizes
-    429 and an explicit HTTP/status 401/403, not arbitrary embedded digits. In a combined prompt-too-long /
-    compaction-credit error, `credits` takes precedence (requirement 11, loops/b7.md)."""
+    Matches phrases/tokens, not substrings (`rate` inside `generate`/`separate` is not a rate limit, nor is a
+    bare `401`/`403` inside a longer digit run like `14013`); recognizes 429, a bare `401`, an explicit
+    HTTP/status 401/403, and the real CLI's own auth diagnostics (`failed to authenticate`, `invalid bearer
+    token`, `invalid authentication token`, `not logged in`, `unauthorized`, `forbidden`) as `auth` (b8 real
+    capture, 2026-10-05: "Failed to authenticate. API Error: 401 Invalid bearer token"). In a combined
+    prompt-too-long / compaction-credit error, `credits` takes precedence (requirement 11, loops/b7.md)."""
     text = text or ""
     if CREDITS_RE.search(text):
         return "credits"

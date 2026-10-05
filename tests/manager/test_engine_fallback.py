@@ -41,6 +41,27 @@ def test_classify_handles_none_and_empty():
     assert S.classify_engine_error("") == "other"
 
 
+def test_classify_real_capture_auth_diagnostic():
+    """b8 real capture, 2026-10-05: the installed CLI's actual invalid-bearer-token wire text was classified
+    `other`, not `auth`, because it never matched the `http|status`-prefixed 401/403 pattern. Exact text from
+    `docs/notes/b8.md` / the capture log."""
+    assert S.classify_engine_error("Failed to authenticate. API Error: 401 Invalid bearer token") == "auth"
+
+
+def test_classify_auth_diagnostic_variants():
+    for text in ("Failed to authenticate", "Invalid bearer token", "Invalid authentication token",
+                "not logged in", "Unauthorized", "Forbidden", "a bare 401 code", "HTTP 403"):
+        assert S.classify_engine_error(text) == "auth", text
+    # Retained classes and the no-false-positive-on-embedded-digits guarantee stay intact alongside the
+    # broadened auth pattern.
+    for text, expected in (("Out of usage credits", "credits"), ("usage limit reached", "usage_limit"),
+                           ("Rate limit exceeded", "rate_limit"), ("429 Too Many Requests", "rate_limit"),
+                           ("Prompt is too long for this model", "prompt_too_long"),
+                           ("Connection timed out", "other"), ("record 14013 failed", "other"),
+                           ("a 4013 record", "other")):
+        assert S.classify_engine_error(text) == expected, text
+
+
 # ----------------------------------------------------------------------------------------------- stdout parsing on every rc
 
 def test_nonzero_rc_is_failure_even_with_successful_looking_json(home, tmp_path):
