@@ -10,8 +10,8 @@ import sys
 import time
 from pathlib import Path
 
-REQUIRED = ('pid', 'process_started_at', 'connected', 'envelope_count', 'reconnect_count', 'pong_count',
-            'last_activity_age_s', 'at', 'poll_s')
+REQUIRED = ('at', 'monotonic', 'pid', 'process_started_at', 'connected', 'pong_count', 'envelope_count',
+            'reconnect_count', 'last_activity_age_s', 'poll_s')  # the exact snapshot schema (requirement 3)
 MIN_SPAN_S = 300.0
 FRESH_S = 300.0
 GAP_FACTOR = 3.0  # a sampling gap longer than GAP_FACTOR x the sampling interval breaks a run (round 1: 2.4)
@@ -33,6 +33,11 @@ def validate_sample(data):
     missing = [k for k in REQUIRED if k not in data]
     if missing:
         return 'missing keys: ' + ','.join(missing)
+    extra = sorted(set(data) - set(REQUIRED))
+    if extra:
+        return 'unexpected keys: ' + ','.join(extra)  # round 2 2.3: exactly the ten snapshot keys, nothing else
+    if not _number(data['monotonic'], minimum=float('-inf')):
+        return 'invalid monotonic'
     if isinstance(data['pid'], bool) or not isinstance(data['pid'], int) or data['pid'] <= 0:
         return 'invalid pid'
     for key in ('process_started_at', 'at'):
@@ -60,7 +65,6 @@ def read_sample(path):
             sample['error'] = 'malformed: ' + reason
         else:
             sample.update({k: data[k] for k in REQUIRED})
-            sample['monotonic'] = data.get('monotonic')
     except (OSError, ValueError) as exc:
         sample['error'] = f'{type(exc).__name__}: {exc}'
     return sample
@@ -170,16 +174,20 @@ def collect(path, minutes, interval, out, deployed_sha):
             if time.monotonic() + interval > deadline:
                 break
             time.sleep(interval)
-    verdict = evaluate(samples, interval)
-    verdict.update(path=str(path), minutes=minutes, interval_s=interval, deployed_sha=deployed_sha,
-                   samples_sha256=hashlib.sha256((out / 'samples.jsonl').read_bytes()).hexdigest(),
-                   observer_host_pid=os.getpid())
+    # Round 2 5.1: `evaluation` is exactly evaluate()'s output and `samples_sha256` the digest of the retained
+    # file; recompute() returns exactly these two fields, so closure compares them field for field. Deployment
+    # and collection metadata live beside them and are validated separately.
+    evaluation = evaluate(samples, interval)
+    verdict = {'verdict': evaluation['verdict'], 'evaluation': evaluation,
+               'samples_sha256': hashlib.sha256((out / 'samples.jsonl').read_bytes()).hexdigest(),
+               'metadata': {'path': str(path), 'minutes': minutes, 'interval_s': interval, 'deployed_sha': deployed_sha,
+                            'observer_host_pid': os.getpid(), 'systemd': None}}
     try:
         unit = subprocess.run(['systemctl', 'show', 'hydra-bridge', '-p', 'MainPID,ExecMainStartTimestamp,NRestarts'],
                               capture_output=True, text=True, timeout=10)
-        verdict['systemd'] = unit.stdout.strip().splitlines() if unit.returncode == 0 else None
+        verdict['metadata']['systemd'] = unit.stdout.strip().splitlines() if unit.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
-        verdict['systemd'] = None
+        pass
     (out / 'verdict.json').write_text(json.dumps(verdict, indent=2) + '\n')
     print(verdict['verdict'])
     return verdict
@@ -202,9 +210,14 @@ def synthetic(n, interval=10.0, pid=4242, start='2026-10-05T01:00:00Z', mutate=N
     return samples
 
 
+def snapshot_of(s):
+    """The on-disk snapshot a synthetic sample stands for: exactly the ten snapshot keys."""
+    return {k: s[k] for k in REQUIRED}
+
+
 def malform(s, **fields):
     """Turn synthetic sample `s` in place into what read_sample records for malformed metadata."""
-    data = {k: s[k] for k in REQUIRED}
+    data = snapshot_of(s)
     data.update(fields)
     reason = validate_sample(data)
     assert reason, 'fixture meant to be malformed is well-formed'
@@ -214,6 +227,7 @@ def malform(s, **fields):
 
 
 def self_test():
+    import tempfile
     assert evaluate(synthetic(40))['verdict'] == 'observed'
     assert evaluate(synthetic(30))['verdict'] == 'not observed', 'exactly 290s must not qualify'
     assert evaluate(synthetic(32))['verdict'] == 'observed', '310s qualifies'
@@ -294,43 +308,87 @@ def self_test():
     def nan_age(i, s):
         if i == 20: malform(s, last_activity_age_s=float('nan'))
     assert evaluate(synthetic(40, mutate=nan_age))['verdict'] == 'not observed'
-    for bad in ({'pid': 0}, {'poll_s': 0}, {'connected': 'yes'}, {'envelope_count': -1}, {'at': ''}, {'process_started_at': 7}):
-        assert validate_sample(dict({k: synthetic(1)[0][k] for k in REQUIRED}, **bad)), bad
+    for bad in ({'pid': 0}, {'poll_s': 0}, {'connected': 'yes'}, {'envelope_count': -1}, {'at': ''}, {'process_started_at': 7},
+                {'monotonic': 'x'}, {'monotonic': float('nan')}, {'monotonic': None}):
+        assert validate_sample(dict(snapshot_of(synthetic(1)[0]), **bad)), bad
     assert validate_sample([]) == 'not an object' and validate_sample({}).startswith('missing keys')
+    # Round 2 2.3: exactly the snapshot schema. An extra key (a payload, an id, anything) is malformed metadata,
+    # and so is a missing or invalid monotonic; read_sample records the violation instead of discarding it.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='b9-schema-') as tmp:
+        p = Path(tmp) / 'bridge-health.json'
+        good = snapshot_of(synthetic(1)[0])
+        p.write_text(json.dumps(good))
+        assert 'error' not in read_sample(str(p)) and set(read_sample(str(p))) == set(REQUIRED) | {'sampled_at', 'sampled_mono'}
+        p.write_text(json.dumps(dict(good, channel='C0123')))
+        assert read_sample(str(p))['error'] == 'malformed: unexpected keys: channel'
+        p.write_text(json.dumps({k: v for k, v in good.items() if k != 'monotonic'}))
+        assert read_sample(str(p))['error'] == 'malformed: missing keys: monotonic'
+        p.write_text(json.dumps(dict(good, monotonic='soon')))
+        assert read_sample(str(p))['error'] == 'malformed: invalid monotonic'
+        p.write_text('[1, 2]')
+        assert read_sample(str(p))['error'] == 'malformed: not an object'
+        p.write_text('{not json')
+        assert read_sample(str(p))['error'].startswith('JSONDecodeError')
+        p.unlink()
+        assert read_sample(str(p))['error'].startswith('FileNotFoundError')
     # Round 1 5.2: explicit reasons when the longest run does not qualify.
     assert evaluate(synthetic(40, mutate=flat_pongs))['longest_run']['qualification_failure'] == ['flat pongs']
     assert evaluate(synthetic(40, mutate=frozen_file))['longest_run']['qualification_failure'] == ['insufficient rewrites']
     assert evaluate(synthetic(30))['longest_run']['qualification_failure'] == ['span too short']
-    # Round 1 F1: recomputation from a retained samples file reproduces the verdict and digests the bytes.
-    import tempfile
+    # Round 1 F1: recomputation from a retained samples file reproduces the evaluation and digests the bytes.
     with tempfile.TemporaryDirectory(prefix='b9-eval-') as tmp:
         p = Path(tmp) / 'samples.jsonl'
         p.write_bytes(''.join(json.dumps(x) + '\n' for x in synthetic(40)).encode())
         again = recompute(str(p), 10.0)
-        assert again['verdict'] == 'observed' and again['samples_sha256'] == hashlib.sha256(p.read_bytes()).hexdigest()
-    # Collection plumbing on a real file: short run, two samples, verdict written.
-    import tempfile
+        assert set(again) == {'evaluation', 'samples_sha256'}
+        assert again['evaluation'] == evaluate(synthetic(40), 10.0) and again['evaluation']['verdict'] == 'observed'
+        assert again['samples_sha256'] == hashlib.sha256(p.read_bytes()).hexdigest()
+    # Collection plumbing on a real file: short run, verdict written; round 2 5.1: collect -> recompute round trip
+    # is an exact field-for-field match (evaluation and digest), from the files on disk, with the recorded interval.
     with tempfile.TemporaryDirectory(prefix='b9-observe-') as tmp:
         path = Path(tmp) / 'bridge-health.json'
-        path.write_text(json.dumps({k: v for k, v in synthetic(1)[0].items() if k != 'sampled_at'}))
-        verdict = collect(str(path), minutes=0.0005, interval=0.01, out=Path(tmp) / 'out', deployed_sha='0' * 40)
-        assert verdict['verdict'] == 'not observed' and verdict['samples'] >= 1
-        assert (Path(tmp) / 'out' / 'verdict.json').is_file() and (Path(tmp) / 'out' / 'samples.jsonl').is_file()
+        path.write_text(json.dumps(snapshot_of(synthetic(1)[0])))
+        out = Path(tmp) / 'out'
+        verdict = collect(str(path), minutes=0.0005, interval=0.01, out=out, deployed_sha='0' * 40)
+        assert verdict['verdict'] == 'not observed' and verdict['evaluation']['samples'] >= 2
+        assert set(verdict) == {'verdict', 'evaluation', 'samples_sha256', 'metadata'}
+        assert set(verdict['metadata']) == {'path', 'minutes', 'interval_s', 'deployed_sha', 'observer_host_pid', 'systemd'}
+        recorded = json.loads((out / 'verdict.json').read_text())
+        again = recompute(str(out / 'samples.jsonl'), recorded['metadata']['interval_s'])
+        assert again == {'evaluation': recorded['evaluation'], 'samples_sha256': recorded['samples_sha256']}, (again, recorded)
+        assert closure_check(out) is None
+        (out / 'samples.jsonl').write_text('')
+        assert closure_check(out) == 'samples digest differs'
     print('[b9.observe] self-test PASS')
 
 
 def recompute(samples_path, interval=None):
-    """Round 1 F1: recompute the verdict and the samples digest from a retained samples.jsonl."""
+    """Round 1 F1 / round 2 5.1: recompute exactly the comparable fields from a retained samples.jsonl."""
     raw = Path(samples_path).read_bytes()
     samples = [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
-    verdict = evaluate(samples, interval)
-    verdict['samples_sha256'] = hashlib.sha256(raw).hexdigest()
-    return verdict
+    return {'evaluation': evaluate(samples, interval), 'samples_sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def closure_check(evidence_dir):
+    """Requirement 9: None when the recorded verdict.json matches a recomputation from samples.jsonl field for
+    field (evaluation and digest, using the recorded interval); otherwise the first difference."""
+    evidence_dir = Path(evidence_dir)
+    recorded = json.loads((evidence_dir / 'verdict.json').read_text())
+    again = recompute(str(evidence_dir / 'samples.jsonl'), recorded['metadata']['interval_s'])
+    if again['samples_sha256'] != recorded.get('samples_sha256'):
+        return 'samples digest differs'
+    if again['evaluation'] != recorded.get('evaluation'):
+        return 'evaluation differs'
+    if recorded.get('verdict') != again['evaluation']['verdict']:
+        return 'verdict field differs from evaluation'
+    return None
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--evaluate', metavar='SAMPLES_JSONL', help='recompute the verdict from retained samples (closure)')
+    parser.add_argument('--evaluate', metavar='SAMPLES_JSONL', help='recompute evaluation and digest from retained samples')
+    parser.add_argument('--closure-check', metavar='EVIDENCE_DIR', help='compare verdict.json with a recomputation; exit 1 on difference')
     parser.add_argument('--path')
     parser.add_argument('--minutes', type=float, default=15)
     parser.add_argument('--interval', type=float, default=10)
@@ -344,6 +402,10 @@ def main():
     if args.evaluate:
         print(json.dumps(recompute(args.evaluate, args.interval), indent=2, sort_keys=True))
         return
+    if args.closure_check:
+        difference = closure_check(args.closure_check)
+        print(difference or 'closure check: recorded verdict matches recomputation')
+        raise SystemExit(1 if difference else 0)
     if not (args.path and args.out and args.deployed_sha):
         raise SystemExit('--path, --out and --deployed-sha are required')
     collect(args.path, args.minutes, args.interval, args.out, args.deployed_sha)

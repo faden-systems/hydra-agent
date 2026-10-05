@@ -158,74 +158,186 @@ def atomic_write_contract():
 
 
 def per_poll_contract():
-    """Round 1 2.3: exactly one snapshot per poll, written by the monitor through the module-level writer, and
-    last_activity_age_s grows by the injected clock's advance when nothing arrives."""
+    """Round 1 2.3 / round 2 2.2: polls are counted independently through the health check; the stop comes from
+    the check, not the writer; exactly one snapshot follows each check in order, including the poll with a fatal
+    recovery, and none follows a normal stop. last_activity_age_s grows by the injected clock's advance."""
     now = [1000.0]
-    client = make_client(pong=1)
-    calls = []
+    events = []
     stop = threading.Event()
-    real_writer = B.write_health_observation
+    real_check, real_writer = B.SocketHealth.check, B.write_health_observation
+
+    def counting_check(self):
+        events.append('check')
+        if len([e for e in events if e == 'check']) >= 5:
+            stop.set()
+        result = real_check(self)
+        now[0] += 7.0  # the clock advances after every check; nothing arrives
+        return result
 
     def recording_writer(path, snapshot):
-        calls.append(dict(snapshot))
-        now[0] += 7.0
-        if len(calls) >= 5:
-            stop.set()
+        events.append(dict(snapshot))
         return real_writer(path, snapshot)
     with tempfile.TemporaryDirectory(prefix='b9-') as tmp:
         path = Path(tmp) / 'bridge-health.json'
-        with patch.object(B, 'write_health_observation', side_effect=recording_writer):
+        client = make_client(pong=1)
+        with patch.object(B.SocketHealth, 'check', counting_check), patch.object(B, 'write_health_observation', side_effect=recording_writer):
             B.run_socket_mode(Handler(client), stop, clock=lambda: now[0], poll_s=0.001, reconnect_timeout_s=0.05,
                               observation_path=str(path))
-        assert len(calls) == 5, ('exactly one snapshot per poll', len(calls))
+        kinds = ['check' if e == 'check' else 'write' for e in events]
+        assert kinds == ['check', 'write'] * 5, ('one ordered snapshot per poll, none after the stop', kinds)
+        calls = [e for e in events if e != 'check']
         ages = [c['last_activity_age_s'] for c in calls]
-        assert ages[0] == 0.0 and all(b - a == 7.0 for a, b in zip(ages, ages[1:])), ('age must grow by the injected clock', ages)
-        monotonics = [c['monotonic'] for c in calls]
-        assert monotonics == [1000.0 + 7.0 * i for i in range(5)], monotonics
-        assert all(c['pong_count'] == 0 and c['poll_s'] == 0.001 for c in calls), 'the initial pong timestamp is not a counted change'
+        assert ages == [7.0 * (i + 1) for i in range(5)], ('age must grow by exactly the injected advance', ages)
+        assert [c['monotonic'] for c in calls] == [1000.0 + 7.0 * (i + 1) for i in range(5)]
+        assert all(c['pong_count'] == 0 and c['poll_s'] == 0.001 and c['reconnect_count'] == 0 for c in calls), \
+            'the initial pong timestamp is not a counted change'
         assert json.loads(path.read_text())['last_activity_age_s'] == ages[-1]
+        # The poll whose recovery is fatal: one check, one recovery, one snapshot, nothing more.
+        events.clear()
+        stop = threading.Event()
+        client = make_client(connected=False)
+        with patch.object(B.SocketHealth, 'check', counting_check), patch.object(B, 'write_health_observation', side_effect=recording_writer):
+            try:
+                B.run_socket_mode(Handler(client), stop, clock=lambda: now[0], poll_s=0.001, reconnect_timeout_s=0.05,
+                                  observation_path=str(path))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('fatal recovery must escape')
+        kinds = ['check' if e == 'check' else 'write' for e in events]
+        assert kinds == ['check', 'write'] and client.reconnects == 1, kinds
+        assert events[1]['reconnect_count'] == 1 and events[1]['connected'] is False
     print('per-poll contract: ok')
 
 
+def scheduled_polls(schedule, on_poll, observation_path, logs):
+    """Run ONE run_socket_mode invocation for len(schedule) polls; `on_poll(index, flag)` arms the failure
+    layer for that poll before its snapshot is built. Returns the `health observation` diagnostics logged."""
+    stop = threading.Event()
+    polls = []
+    real_check = B.SocketHealth.check
+
+    def counting_check(self):
+        polls.append(len(polls))
+        if len(polls) >= len(schedule):
+            stop.set()
+        on_poll(len(polls) - 1, schedule[len(polls) - 1])
+        return real_check(self)
+    before = len(logs)
+    with patch.object(B.SocketHealth, 'check', counting_check):
+        B.run_socket_mode(Handler(make_client(pong=1)), stop, clock=time.monotonic, poll_s=0.001, reconnect_timeout_s=0.05,
+                          observation_path=observation_path)
+    assert len(polls) == len(schedule)
+    return [m for m in logs[before:] if 'health observation' in m]
+
+
 def telemetry_boundary():
-    """Round 1 1.2 / 5.1: snapshot construction failures are caught by one telemetry boundary in the monitor,
-    logged once per failure streak (a success ends the streak), and never alter health or recovery outcomes."""
+    """Round 1 1.2 / 5.1, round 2 2.1: within ONE monitor invocation, the deterministic poll sequence
+    fail, fail, ok, fail, fail produces exactly two `health observation` diagnostics across every logging layer,
+    for each failure layer separately: snapshot construction raising, the writer returning False, and the real
+    writer failing on the filesystem. Telemetry failures never alter health or recovery outcomes."""
     logs = []
-    failing = [True]
-    real_snapshot = B.health_snapshot
+    schedule = [True, True, False, True, True]
+    with tempfile.TemporaryDirectory(prefix='b9-') as tmp, \
+            patch.object(B.S, 'log', side_effect=lambda message: logs.append(str(message))):
+        # Layer 1: health_snapshot raises on the scheduled polls.
+        arm = [False]
+        real_snapshot = B.health_snapshot
 
-    def flaky_snapshot(*args, **kwargs):
-        if failing[0]:
-            raise RuntimeError('fixture snapshot failure')
-        return real_snapshot(*args, **kwargs)
+        def flaky_snapshot(*args, **kwargs):
+            if arm[0]:
+                raise RuntimeError('fixture snapshot failure')
+            return real_snapshot(*args, **kwargs)
+        path = Path(tmp) / 'snapshot-layer.json'
+        with patch.object(B, 'health_snapshot', side_effect=flaky_snapshot):
+            diagnostics = scheduled_polls(schedule, lambda i, flag: arm.__setitem__(0, flag), str(path), logs)
+        assert len(diagnostics) == 2, ('snapshot layer: exactly two diagnostics for two streaks', diagnostics, logs)
+        assert path.is_file(), 'the ok poll wrote the file'
+        # Layer 2: the writer returns False on the scheduled polls (no exception anywhere).
+        real_writer = B.write_health_observation
 
-    def streak_logs():
-        return [m for m in logs if 'health observation' in m]
-    with tempfile.TemporaryDirectory(prefix='b9-') as tmp:
-        path = Path(tmp) / 'bridge-health.json'
-        with patch.object(B, 'health_snapshot', side_effect=flaky_snapshot), \
-                patch.object(B.S, 'log', side_effect=lambda message: logs.append(str(message))):
-            client = make_client(pong=1)
-            run_monitor(client, str(path), stop_after=0.05, pong_at=0.01)
-            assert client.reconnects == 0 and client.connected
-            assert not path.exists(), 'nothing may be written when the snapshot cannot be built'
-            assert len(streak_logs()) == 1, ('one diagnostic per failure streak', logs)
-            failing[0] = False
-            run_monitor(make_client(pong=1), str(path), stop_after=0.03)
-            assert path.exists()
-            assert len(streak_logs()) == 1
-            failing[0] = True
-            run_monitor(make_client(pong=1), str(path), stop_after=0.03)
-            assert len(streak_logs()) == 2, ('a failure after a successful write is a new streak', logs)
-            client = make_client(connected=False)
+        def refusing_writer(p, snapshot):
+            return False if arm[0] else real_writer(p, snapshot)
+        logs.clear()
+        path = Path(tmp) / 'writer-false-layer.json'
+        with patch.object(B, 'write_health_observation', side_effect=refusing_writer):
+            diagnostics = scheduled_polls(schedule, lambda i, flag: arm.__setitem__(0, flag), str(path), logs)
+        assert len(diagnostics) == 2, ('writer-False layer: exactly two diagnostics', diagnostics, logs)
+        # Layer 3: the real writer fails on the real filesystem (directory made unwritable on scheduled polls).
+        directory = Path(tmp) / 'fs-layer'
+        directory.mkdir()
+        path = directory / 'bridge-health.json'
+
+        def set_mode(i, flag):
+            os.chmod(directory, 0o500 if flag else 0o700)
+        logs.clear()
+        try:
+            diagnostics = scheduled_polls(schedule, set_mode, str(path), logs)
+        finally:
+            os.chmod(directory, 0o700)
+        assert len(diagnostics) == 2, ('filesystem layer: exactly two diagnostics across all layers', diagnostics, logs)
+        assert path.is_file() and [p.name for p in directory.iterdir()] == ['bridge-health.json']
+        # A long failing run logs once; no flooding.
+        blocked = Path(tmp) / 'blocked'
+        blocked.write_text('a regular file where a directory is expected')
+        logs.clear()
+        diagnostics = scheduled_polls([True] * 25, lambda i, flag: None, str(blocked / 'bridge-health.json'), logs)
+        assert len(diagnostics) == 1, ('25 failing polls, one diagnostic', len(diagnostics))
+        # Recovery outcomes unchanged while snapshots fail; the recovery exception is the one that escapes.
+        arm[0] = True
+        client = make_client(connected=False)
+        with patch.object(B, 'health_snapshot', side_effect=flaky_snapshot):
             try:
-                run_monitor(client, str(path), stop_after=1.0)
+                run_monitor(client, str(Path(tmp) / 'fatal.json'), stop_after=1.0)
             except (RuntimeError, SystemExit, TimeoutError) as exc:
                 assert 'fixture snapshot failure' not in str(exc), 'the telemetry failure replaced the recovery failure'
             else:
                 raise AssertionError('telemetry failure must not swallow the recovery failure')
-            assert client.reconnects == 1
+        assert client.reconnects == 1
     print('telemetry boundary: ok')
+
+
+def b4_protections():
+    """Round 2 8.1: frozen regressions for the two B4 defects of loops/b7.md. (a) A connected but stale client
+    (no envelope, no changed pong for 300 s) is recovered with connect_to_new_endpoint(force=True). (b) A reconnect
+    that returns connected but shows only the old pong and no new envelope is fatal within the bound."""
+    now, step = [0.0], [0.0]
+
+    def clock():
+        now[0] += step[0]
+        return now[0]
+    client = make_client(pong=1)
+    forces = []
+
+    def reconnect(force=False):
+        client.reconnects += 1
+        forces.append(force)
+        step[0] = 1.0  # the monitor clock now advances on every read: the grace bound must expire by the clock
+    client.connect_to_new_endpoint = reconnect
+    polls = [0]
+    real_connected = client.is_connected
+
+    def connected():
+        polls[0] += 1
+        if polls[0] == 2:
+            now[0] = 400.0  # second poll: 400 s since the only activity, still connected
+        return real_connected()
+    client.is_connected = connected
+    stop = threading.Event()
+    threading.Timer(2.0, stop.set).start()
+    with tempfile.TemporaryDirectory(prefix='b9-') as tmp:
+        path = Path(tmp) / 'bridge-health.json'
+        try:
+            B.run_socket_mode(Handler(client), stop, clock=clock, poll_s=0.001, reconnect_timeout_s=0.05, observation_path=str(path))
+        except RuntimeError as exc:
+            assert 'no fresh inbound activity' in str(exc), exc
+        else:
+            raise AssertionError('a reconnect with no fresh inbound activity must be fatal (B4)')
+        assert forces == [True], ('a stale-but-connected client is recovered with force=True (B4)', forces)
+        assert client.reconnects == 1
+        snap = json.loads(path.read_text())
+        assert snap['reconnect_count'] == 1 and snap['connected'] is True and snap['envelope_count'] == 0 and snap['pong_count'] == 0
+    print('b4 protections: ok')
 
 
 def serve_telemetry():
@@ -414,6 +526,7 @@ if __name__ == '__main__':
     per_poll_contract()
     write_failure_isolated()
     telemetry_boundary()
+    b4_protections()
     serve_telemetry()
     recovery_unchanged()
     print('[b9.acceptance] PASS')
