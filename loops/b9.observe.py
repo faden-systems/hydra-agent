@@ -56,17 +56,24 @@ def validate_sample(data):
     return None
 
 
-def read_sample(path):
-    # Round 1 2.4: observer monotonic time drives spans, gaps and deadlines; wall time is the human record only.
-    sample = {'sampled_at': time.time(), 'sampled_mono': time.monotonic()}
+def read_sample(path, clock=time.monotonic, wall=time.time, read=None):
+    """Round 1 2.4: observer monotonic time drives spans, gaps and deadlines; wall time is the human record only.
+    Round 4 5.1: `sampled_mono` is the monotonic time immediately AFTER the snapshot bytes were read, so an atomic
+    replacement that lands while the observer is about to read can never make a live snapshot look like it came
+    from the future; a snapshot stamped after the completed read is still `telemetry clock skew`."""
+    read = read or (lambda p: Path(p).read_bytes())
+    sample = {'sampled_at': wall()}
     try:
-        data = json.loads(Path(path).read_text())
+        raw = read(path)
+        sample['sampled_mono'] = clock()
+        data = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
         reason = validate_sample(data)
         if reason:
             sample['error'] = 'malformed: ' + reason
         else:
             sample.update({k: data[k] for k in REQUIRED})
     except (OSError, ValueError) as exc:
+        sample.setdefault('sampled_mono', clock())
         sample['error'] = f'{type(exc).__name__}: {exc}'
     return sample
 
@@ -317,6 +324,25 @@ def self_test():
         if i == 20: s['monotonic'] = s['sampled_mono'] + 1
     v = evaluate(synthetic(40, mutate=future_snapshot))
     assert v['runs'][0]['broken_by'] == 'telemetry clock skew', v['runs']
+    # Round 4 5.1: the monitor replaces the file between the observer's clock read and its file read. sampled_mono
+    # is taken after the bytes are read, so the fresh snapshot (monotonic 1001.5) is live, not clock skew; a
+    # snapshot stamped after the completed read (1003) is still skew.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='b9-race-') as tmp:
+        p = Path(tmp) / 'bridge-health.json'
+        ticks = iter([1002.0, 1004.0])
+        def racing_read(path):
+            p.write_text(json.dumps(dict(snapshot_of(synthetic(1)[0]), monotonic=1001.5)))  # replacement lands now
+            return Path(path).read_bytes()
+        p.write_text(json.dumps(dict(snapshot_of(synthetic(1)[0]), monotonic=990.0)))
+        raced = read_sample(str(p), clock=lambda: next(ticks), read=racing_read)
+        assert raced['sampled_mono'] == 1002.0 and raced['monotonic'] == 1001.5 and eligible(raced) is None, raced
+        p.write_text(json.dumps(dict(snapshot_of(synthetic(1)[0]), monotonic=1004.5)))
+        skewed = read_sample(str(p), clock=lambda: next(ticks))
+        assert skewed['sampled_mono'] == 1004.0 and eligible(skewed) == 'telemetry clock skew', skewed
+        p.unlink()
+        gone = read_sample(str(p), clock=lambda: 7.0)
+        assert gone['sampled_mono'] == 7.0 and gone['error'].startswith('FileNotFoundError')
     # Round 1 2.4: wall-clock jumps do not inflate spans; an observer stall breaks the run as a sampling gap.
     def wall_jump(i, s):
         if i >= 10: s['sampled_at'] += 10000

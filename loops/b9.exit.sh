@@ -8,10 +8,13 @@ git merge-base --is-ancestor "$BASE" HEAD || fail 'candidate does not descend fr
 git merge-base --is-ancestor 579f444 "$BASE" || fail 'base predates merged b7'
 FROZEN="loops/b9.md loops/b9.exit.sh loops/b9.acceptance.py loops/b9.observe.py loops/b7.acceptance.py"
 fence() {
-  local changed bad f
-  test -z "$(git diff --name-only "$BASE" -- tests/manager/fixtures/)" || fail 'recorded fixtures changed'
-  test -z "$(git ls-files --others --exclude-standard -- tests/manager/fixtures/)" || fail 'recorded fixtures added'
-  changed=$( (git diff --name-only "$BASE"...HEAD; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
+  local changed fixtures bad f
+  # Round 4 B1: the changed-path set is the union of committed (BASE..HEAD), staged, unstaged and untracked paths;
+  # recorded fixtures are rejected from that whole set BEFORE the general tests/manager allowance, so a fixture
+  # change hidden in the commit or the index behind a restored working tree cannot pass.
+  changed=$( (git diff --name-only "$BASE" HEAD; git diff --name-only "$BASE"; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
+  fixtures=$(printf '%s\n' "$changed" | grep -E '^tests/manager/fixtures/' || true)
+  test -z "$fixtures" || fail "recorded fixtures changed (committed, staged, unstaged or untracked): $fixtures"
   bad=$(printf '%s\n' "$changed" | grep -Ev '^$|^manager/(bridge\.py|README\.md)$|^tests/manager/|^docs/notes/b9\.md$' || true)
   test -z "$bad" || fail "outside fence: $bad"
   for f in $FROZEN; do git show "$BASE:$f" | cmp -s - "$f" || fail "exit-owned file changed: $f"; done

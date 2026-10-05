@@ -333,6 +333,57 @@ def telemetry_boundary():
     print('telemetry boundary: ok')
 
 
+def repeated_recovery():
+    """Round 4 2.1: within ONE monitor invocation, two successful recoveries and a fatal third attempt report
+    reconnect_count 1, 2 and 3 in successive snapshots, while envelope and pong counts accumulated earlier are
+    preserved across recoveries."""
+    client = make_client(connected=False)
+    attempts = [0]
+    stop = threading.Event()
+
+    def recover(force=False):
+        attempts[0] += 1
+        client.reconnects += 1
+        if attempts[0] == 3:
+            raise RuntimeError('offline-fixture')
+        client.connected = True
+        client.current_session = SimpleNamespace(last_ping_pong_time=1000 + attempts[0])  # a fresh, changed pong
+    client.connect_to_new_endpoint = recover
+    checks = [0]
+    real_check = B.SocketHealth.check
+
+    def driving_check(self):
+        checks[0] += 1
+        if checks[0] == 2:
+            client.socket_mode_request_listeners[0](client, object())  # one envelope while healthy
+        if checks[0] in (3, 5):
+            client.connected = False  # the connection drops again
+        return real_check(self)
+    snapshots = []
+    real_writer = B.write_health_observation
+
+    def recording_writer(path, snapshot):
+        snapshots.append(dict(snapshot))
+        return real_writer(path, snapshot)
+    threading.Timer(2.0, stop.set).start()
+    with tempfile.TemporaryDirectory(prefix='b9-') as tmp:
+        with patch.object(B.SocketHealth, 'check', driving_check), patch.object(B, 'write_health_observation', side_effect=recording_writer):
+            try:
+                B.run_socket_mode(Handler(client), stop, clock=time.monotonic, poll_s=0.001, reconnect_timeout_s=0.05,
+                                  observation_path=str(Path(tmp) / 'bridge-health.json'))
+            except RuntimeError as exc:
+                assert str(exc) == 'offline-fixture', exc
+            else:
+                raise AssertionError('the third attempt must be fatal')
+    assert client.reconnects == 3 and checks[0] == 5, (client.reconnects, checks)
+    counts = [s['reconnect_count'] for s in snapshots]
+    assert counts == [1, 1, 2, 2, 3], ('successive snapshots count every attempt', counts)
+    assert [s['envelope_count'] for s in snapshots] == [0, 1, 1, 1, 1], 'the envelope survives later recoveries'
+    assert [s['pong_count'] for s in snapshots] == [1, 1, 2, 2, 2], 'pongs accumulate across recoveries'
+    assert snapshots[-1]['connected'] is False and snapshots[2]['connected'] is True
+    print('repeated recovery: ok')
+
+
 def b4_protections():
     """Round 2 8.1: frozen regressions for the two B4 defects of loops/b7.md. (a) A connected but stale client
     (no envelope, no changed pong for 300 s) is recovered with connect_to_new_endpoint(force=True). (b) A reconnect
@@ -562,6 +613,7 @@ if __name__ == '__main__':
     per_poll_contract()
     write_failure_isolated()
     telemetry_boundary()
+    repeated_recovery()
     b4_protections()
     serve_telemetry()
     recovery_unchanged()
