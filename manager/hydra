@@ -119,15 +119,16 @@ def cmd_tail(home, args):
 def cmd_engine(home, args):
     current = S.read_engine(home)
     if not args:
-        print(f"engine: {S.engine_label(current)}")
+        print(f"engine: {S.engine_label(current)} [{current['mode']}]")
         return 0
     try:
         pair = S.parse_engine_command(" ".join(args), current=current)
     except S.BadEngine as e:
-        print(f"{e}; nothing changed (engine: {S.engine_label(current)})", file=sys.stderr)
+        print(f"{e}; nothing changed (engine: {S.engine_label(current)} [{current['mode']}])", file=sys.stderr)
         return 2
-    S.set_engine(home, pair["acc"], pair["model"])
-    print(f"engine: {S.engine_label(pair)}")
+    S.set_engine(home, pair["acc"], pair["model"], mode=pair.get("mode"))
+    updated = S.read_engine(home)
+    print(f"engine: {S.engine_label(updated)} [{updated['mode']}]")
     return 0
 
 

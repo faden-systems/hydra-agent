@@ -53,6 +53,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -64,14 +65,15 @@ import zoneinfo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transcript import (claude_project_dirs, find_claude_transcript, find_codex_rollout, flatten_claude,  # noqa: E402,F401
                         flatten_codex, iso as _iso, parse_ts as parse_iso, render, window)
+import persistent as _persistent  # noqa: E402  (loops/b8.md: the vendor child-process plumbing)
 
 ENGINE_ORDER = ("claude-r2d2", "claude-l", "codex")
+ENGINE_MODES = ("per-turn", "persistent")  # loops/b8.md requirement 7; per-turn is the default, including missing
 MODEL = "claude-fable-5-1"  # the Claude family default; kept for callers that predate models.json
 FAMILIES = ("claude", "codex")
 MEMORY_DIRNAME = os.path.join("factory", "manager-memory")
 MEMORY_SKELETON = "# Manager memory (shared by every engine)\n\n## Facts\n\n## Decisions\n\n## Conflicts\n"
 HANDOFF_MARK = "---HANDOFF---"
-QUOTA_RE = re.compile(r"quota|usage limit|rate|\b40[13]\b", re.IGNORECASE)
 NO_SESSION_RE = re.compile(r"no conversation found|session.*not found|could not find session", re.IGNORECASE)
 CREDITS_RE = re.compile(r"\bcredits?\b", re.IGNORECASE)
 USAGE_LIMIT_RE = re.compile(r"\busage limit\b", re.IGNORECASE)
@@ -867,6 +869,71 @@ def classify_engine_error(text):
     return "other"
 
 
+IDENTITY_SCHEMA_VERSION = 1
+IDENTITY_REQUIRED = ("schema_version", "label", "account_id", "token_sha256", "verified_at", "method", "evidence")
+
+
+def _identity_sidecar_path(home, spec):
+    cred = spec.get("cred")
+    if not cred:
+        return None
+    cred_path = cred if os.path.isabs(cred) else os.path.join(home, "credentials", cred)
+    return cred_path, cred_path + ".identity.json"
+
+
+def credential_identity(home, name, spec, observed=None):
+    """Resolve whether `name`'s credential is verified and automatically usable, without logging the secret
+    (Identity contract interface, loops/b8.md). An engine without a configured credential (`spec["cred"]`
+    falsy -- most test fixtures, and Codex) has nothing to verify and is always automatic_allowed. Otherwise
+    a manual sidecar `<credential.env>.identity.json` (schema1: label, account_id, token_sha256 bound to the
+    *current* token content, verified_at, method, evidence) must match this credential's label and current
+    token exactly; missing, malformed, wrong-label, stale-token or unparseable-date metadata is unverified.
+    `observed`, when supplied by the real CLI adapter (`observe_identity`), carries {"account_id",
+    "token_bound"}: only an authoritative (`token_bound: True`) observation can reject a mismatched observed
+    account; a cached-login observation (`token_bound: False`) never overrides manual verification."""
+    deny = {"verified": False, "automatic_allowed": False, "account_id": None, "verified_at": None, "mismatch": False}
+    paths = _identity_sidecar_path(home, spec)
+    if paths is None:
+        return {"verified": True, "automatic_allowed": True, "account_id": None, "verified_at": None, "mismatch": False}
+    cred_path, sidecar = paths
+    token = read_env_file(cred_path).get("CLAUDE_CODE_OAUTH_TOKEN")
+    if not token:
+        return deny
+    try:
+        raw = read_text(sidecar, "")
+        doc = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        return deny
+    if not isinstance(doc, dict) or any(not str(doc.get(k) or "").strip() for k in IDENTITY_REQUIRED):
+        return deny
+    if doc.get("schema_version") != IDENTITY_SCHEMA_VERSION or doc.get("label") != name:
+        return deny
+    if doc.get("token_sha256") != hashlib.sha256(token.encode("utf-8")).hexdigest():
+        return deny  # verification is bound to the credential version; a replaced token is unverified
+    try:
+        _dt.datetime.strptime(str(doc["verified_at"]), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return deny
+    result = {"verified": True, "automatic_allowed": True, "account_id": doc.get("account_id"),
+              "verified_at": doc.get("verified_at"), "mismatch": False, "source": "manual-sidecar",
+              "method": doc.get("method")}
+    if isinstance(observed, dict) and observed.get("token_bound") is True:
+        seen = observed.get("account_id")
+        if seen and seen != doc.get("account_id"):
+            return {"verified": False, "automatic_allowed": False, "account_id": doc.get("account_id"),
+                    "verified_at": doc.get("verified_at"), "mismatch": True, "source": "manual-sidecar",
+                    "method": doc.get("method")}
+    return result
+
+
+def observe_identity(home, name, spec):
+    """Adapter seam (Identity contract interface, loops/b8.md): a real CLI-derived observed identity for
+    `name`'s credential, {"account_id", "token_bound"}. No CLI-authoritative account discovery has been
+    established yet (the founder's 2026-10-05 finding, recorded in loops/b8.md); the default never asserts
+    token binding unconditionally, so it returns None (no observation) until a real adapter is wired here."""
+    return None
+
+
 class BadEngine(Exception):
     """An `engine ...` command that names an unknown account, an unknown alias or a model of the wrong family."""
 
@@ -947,10 +1014,12 @@ def carry_model(model, from_family, to_family, models=None):
 
 
 def parse_engine_command(text, current=None, known=ENGINE_ORDER, engines=None, models=None):
-    """`acc=<account> [model=<alias|id>]`, or the legacy `<account>`, or `model=<alias>` alone when `current` gives the
-    account. Returns {"acc", "model"} with the full model id; raises BadEngine (nothing is changed by parsing)."""
+    """`acc=<account> [model=<alias|id>] [mode=<persistent|per-turn>]`, or the legacy `<account>`, or
+    `model=<alias>`/`mode=<...>` alone when `current` gives the account. Returns {"acc", "model"} with the
+    full model id, plus "mode" only when explicitly given (requirement 7, loops/b8.md: a bare mode change
+    must not reset the account or the model). Raises BadEngine; nothing is changed by parsing."""
     models = models or load_models()
-    acc = model = None
+    acc = model = mode = None
     words = (text or "").split()
     for w in words:
         if "=" in w:
@@ -960,12 +1029,16 @@ def parse_engine_command(text, current=None, known=ENGINE_ORDER, engines=None, m
                 acc = v.strip()
             elif k == "model":
                 model = v.strip()
+            elif k == "mode":
+                mode = v.strip().lower()
             else:
-                raise BadEngine(f"unknown parameter {k!r}; use acc=<{'|'.join(known)}> [model=<alias>]")
+                raise BadEngine(f"unknown parameter {k!r}; use acc=<{'|'.join(known)}> [model=<alias>] [mode=<persistent|per-turn>]")
         elif acc is None:
             acc = w.strip()
         else:
-            raise BadEngine(f"unexpected word {w!r}; use acc=<{'|'.join(known)}> [model=<alias>]")
+            raise BadEngine(f"unexpected word {w!r}; use acc=<{'|'.join(known)}> [model=<alias>] [mode=<persistent|per-turn>]")
+    if mode is not None and mode not in ENGINE_MODES:
+        raise BadEngine(f"unknown mode {mode!r}; use mode=persistent or mode=per-turn")
     if acc is None:
         if current and current.get("acc"):
             acc = current["acc"]
@@ -975,13 +1048,34 @@ def parse_engine_command(text, current=None, known=ENGINE_ORDER, engines=None, m
     if acc not in known:
         raise BadEngine(f"unknown engine {acc!r}; one of {', '.join(known)}")
     family = family_of(acc, engines)
-    return {"acc": acc, "model": resolve_model(family, model, models)}
+    if model is None and current and current.get("acc") == acc and current.get("model"):
+        resolved_model = current["model"]  # unchanged account, no explicit model: never silently reset it
+    else:
+        resolved_model = resolve_model(family, model, models)
+    result = {"acc": acc, "model": resolved_model}
+    if mode is not None:
+        result["mode"] = mode
+    return result
+
+
+class _EnginePair(dict):
+    """{"acc", "model"} plus a lazily-defaulted "mode" (requirement 7, loops/b8.md: default per-turn,
+    including missing settings). `pair["mode"]`/`pair.get("mode", ...)` behave identically once a mode has
+    ever been explicitly set (a real stored key then); before that, `pair["mode"]` still answers "per-turn"
+    without materializing the key, so old call sites that never ask about mode keep the historical two-key
+    `{"acc", "model"}` shape (equality, serialization) exactly as before this feature existed."""
+
+    def __missing__(self, key):
+        if key == "mode":
+            return "per-turn"
+        raise KeyError(key)
 
 
 def read_engine(home, engines=None):
-    """The engine file as {"acc", "model"}; a legacy one-word file (or none) gets the family default model."""
+    """The engine file as {"acc", "model"[, "mode"]}; a legacy one-word file (or none) gets the family
+    default model and the default mode."""
     raw = read_text(os.path.join(home, "engine")).strip()
-    acc, model = "", ""
+    acc, model, mode = "", "", None
     if raw.startswith("{"):
         try:
             data = json.loads(raw)
@@ -990,10 +1084,16 @@ def read_engine(home, engines=None):
         if isinstance(data, dict):
             acc = str(data.get("acc") or "").strip()
             model = str(data.get("model") or "").strip()
+            raw_mode = data.get("mode")
+            if isinstance(raw_mode, str) and raw_mode in ENGINE_MODES:
+                mode = raw_mode
     else:
         acc = raw.split()[0] if raw else ""
     acc = acc or ENGINE_ORDER[0]
-    return {"acc": acc, "model": model or family_default_model(family_of(acc, engines))}
+    pair = _EnginePair(acc=acc, model=model or family_default_model(family_of(acc, engines)))
+    if mode is not None:
+        pair["mode"] = mode
+    return pair
 
 
 def engine_file_is_legacy(home):
@@ -1006,12 +1106,18 @@ def current_engine(home):
     return read_engine(home)["acc"]
 
 
-def set_engine(home, name, model=None, engines=None, explicit=True):
+def set_engine(home, name, model=None, engines=None, explicit=True, mode=None):
     """Write the JSON engine file; `model` defaults to the family default. Returns the pair written. `explicit`
     (default True) means this is an operator selection: it updates engine-runtime.json's `configured` pair
     (requirement 12, loops/b7.md). Automatic fallback persistence calls this with `explicit=False` so it never
-    overwrites the operator's recorded preference."""
+    overwrites the operator's recorded preference. `mode`, when `persistent`/`per-turn`, is persisted; when
+    None the previously *stored* mode (if any was ever explicitly set) carries over unchanged (requirement 7,
+    loops/b8.md: an account/model-only change must not reset mode, and vice versa)."""
+    current = read_engine(home, engines)
     pair = {"acc": name, "model": model or family_default_model(family_of(name, engines))}
+    effective_mode = mode if mode in ENGINE_MODES else current.get("mode")  # .get(): never the lazy default
+    if effective_mode is not None:
+        pair["mode"] = effective_mode
     write_text(os.path.join(home, "engine"), json.dumps(pair) + "\n")
     if explicit:
         runtime = read_engine_runtime(home)
@@ -1022,6 +1128,13 @@ def set_engine(home, name, model=None, engines=None, explicit=True):
 
 def engine_label(pair):
     return f"{pair['acc']} ({pair['model']})"
+
+
+def mode_suffix(pair):
+    """` [persistent]`/` [per-turn]` only once a mode has ever been explicitly set for this engine file (a
+    real stored key, checked with `in` so the lazy per-turn default in `_EnginePair.__missing__` is never
+    materialized); legacy/untouched engine files keep the exact historical `engine_label` text."""
+    return f" [{pair['mode']}]" if "mode" in pair else ""
 
 
 # ----------------------------------------------------------------------------------------------- engine fallback (requirement 12, loops/b7.md)
@@ -1042,6 +1155,67 @@ def save_engine_runtime(home, data):
     write_text(engine_runtime_path(home), json.dumps(data, indent=1) + "\n")
 
 
+# ----------------------------------------------------------------------------------------------- persistent engine (loops/b8.md)
+
+def persistent_status_path(home):
+    return os.path.join(home, "persistent-status.json")
+
+
+def _read_persistent_status(home):
+    try:
+        data = json.loads(read_text(persistent_status_path(home), "{}") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_persistent_status(home, **fields):
+    data = _read_persistent_status(home)
+    data.update(fields)
+    write_text(persistent_status_path(home), json.dumps(data, indent=1) + "\n")
+    return data
+
+
+def _bump_restart(home, category, reason):
+    """Count a planned (an intentional account/model/vendor/mode switch, or the daily restart) or unexpected
+    (crash, timeout, orphan retirement) restart (requirement 9/1.2, loops/b8.md)."""
+    data = _read_persistent_status(home)
+    restarts = data.get("restarts")
+    restarts = dict(restarts) if isinstance(restarts, dict) else {"planned": 0, "unexpected": 0, "last": None}
+    key = "planned" if category == "planned" else "unexpected"
+    restarts[key] = int(restarts.get(key) or 0) + 1
+    restarts["last"] = {"category": category, "reason": (reason or "")[:500]}
+    data["restarts"] = restarts
+    write_text(persistent_status_path(home), json.dumps(data, indent=1) + "\n")
+    return restarts
+
+
+def persistent_status(home):
+    """state (`running`, `parked` or `stopped`), pid, account, model, uptime_s, turns_served, restarts: the
+    *current* process's own metrics, re-derived from persisted metadata plus a live liveness check -- a dead
+    process's stale metadata is never reported as healthy (requirement 9, loops/b8.md). `parked` while an
+    interactive writer (attach) holds WRITER; metrics reset to the live process's own history after restart."""
+    data = _read_persistent_status(home)
+    restarts = data.get("restarts")
+    restarts = restarts if isinstance(restarts, dict) else {"planned": 0, "unexpected": 0, "last": None}
+    ws = writer_status(home)
+    parked = bool(ws) and ws[0] != "stale" and len(ws) > 1 and ws[1] and not str(ws[1]).startswith("supervisor")
+    pid = data.get("pid")
+    alive = bool(pid) and pid_alive(pid)
+    if parked:
+        state = "parked"
+    elif alive:
+        state = "running"
+    else:
+        state = "stopped"
+    started_at = data.get("started_at")
+    uptime = max(0.0, time.time() - float(started_at)) if (state == "running" and started_at is not None) else \
+        (0.0 if state in ("running", "parked") else None)
+    return {"state": state, "pid": pid if alive else None, "account": data.get("account"),
+            "model": data.get("model"), "uptime_s": uptime, "turns_served": int(data.get("turns_served") or 0),
+            "restarts": restarts, "parked_pid": data.get("parked_pid")}
+
+
 def last_turn(home):
     turns = read_jsonl(os.path.join(home, "logs", "turns.jsonl"))
     return turns[-1] if turns else None
@@ -1057,12 +1231,35 @@ def status_text(home, repo=None):
     ws = writer_status(home)
     if ws and ws[0] != "stale" and ws[1] and not ws[1].startswith("supervisor"):
         lines.append(f"manager in console session ({ws[1]})")
-    lines.append(f"engine: {engine_label(read_engine(home))}")
+    cur_engines = default_engines(home, cfg)
+    cur_pair = read_engine(home, cur_engines)
+    lines.append(f"engine: {engine_label(cur_pair)}{mode_suffix(cur_pair)}")
+    cur_spec = cur_engines.get(cur_pair["acc"]) or {}
+    attempts_tail = read_jsonl(os.path.join(home, "logs", "attempts.jsonl"))
+    mismatched = next((a for a in reversed(attempts_tail) if a.get("engine") == cur_pair["acc"]
+                       and "mismatch" in (a.get("reason") or "").lower()), None)
+    if mismatched:
+        lines.append(f"identity: mismatch ({(mismatched.get('reason') or '').strip()[:200]})")
+    else:
+        idn = credential_identity(home, cur_pair["acc"], cur_spec)
+        if idn.get("verified"):
+            lines.append(f"identity: verified {str(idn.get('verified_at') or '')[:10]}")
+        else:
+            lines.append("identity: unverified")
     runtime = read_engine_runtime(home)
     if runtime.get("episode_id") and runtime.get("active"):
         lines.append(f"engine fallback: configured {engine_label(runtime.get('configured') or {})}, "
                      f"effective {engine_label(runtime.get('effective') or {})} (since {runtime.get('since')}, "
                      f"{(runtime.get('reason') or '').strip()[:200]})")
+    pstat = persistent_status(home)
+    if cur_pair["mode"] == "persistent" or pstat.get("pid") or pstat.get("state") != "stopped":
+        lines.append(f"persistent: {pstat['state']} pid={pstat.get('pid')} "
+                     f"uptime={pstat.get('uptime_s') or 0:.0f}s turns_served={pstat['turns_served']}")
+    mode_runtime = runtime.get("configured", {}) if isinstance(runtime.get("configured"), dict) else {}
+    if mode_runtime.get("mode") and runtime.get("effective", {}).get("mode") and \
+            mode_runtime.get("mode") != runtime.get("effective", {}).get("mode"):
+        lines.append(f"persistent fallback: configured {mode_runtime['mode']}, "
+                     f"effective {runtime['effective']['mode']} ({(runtime.get('reason') or '').strip()[:200]})")
     lt = last_turn(home)
     if lt:
         when = now_iso(lt.get("at")) if isinstance(lt.get("at"), (int, float)) else str(lt.get("at"))
@@ -1521,6 +1718,9 @@ class Supervisor:
         self.engine_timeout = engine_timeout
         self.models = load_models(self.home)
         self.memory_dir = memory_dir_for(self.home, self.repo)
+        self._persistent = None  # loops/b8.md: this instance's own live persistent child, never shared across
+        # a real process boundary; a pid recorded on disk that this instance never spawned owns no pipe here
+        # and is retired as an orphan the next time something needs to invoke (requirement 9, loops/b8.md).
         for d in ("inbox", "inbox/files", "inbox/replies", "logs", "mirror", "credentials", ".claude"):
             os.makedirs(os.path.join(self.home, d), exist_ok=True)
         self._reconcile_rollover_intent()  # requirement 13, loops/b7.md: before any Claude invocation
@@ -1595,6 +1795,7 @@ class Supervisor:
         self._reconcile_continuation_intent()
         self.reconcile_work_reaction()
         self.reconcile_persistence()
+        self.maybe_daily_restart()  # requirement 4, loops/b8.md: checked on every tick, including no events
         events = pending_events(self.home)
         non_continuation = [e for e in events if not _payload(e).get("continuation")]
         if non_continuation and len(non_continuation) != len(events):
@@ -1608,7 +1809,10 @@ class Supervisor:
         try:
             with acquire_writer(self.home, "supervisor"):
                 if due:
-                    self.run_compaction(reason)
+                    if reason == "emergency":
+                        self.run_emergency_rollover(reason)
+                    else:
+                        self.run_compaction(reason)
                 if events:
                     return self.turn(events)
                 return True
@@ -1866,6 +2070,23 @@ class Supervisor:
             family = family_of(name, self.engines)
             if skip_claude and family == "claude":
                 continue
+            if family == "claude":
+                observed = None
+                with contextlib.suppress(Exception):
+                    observed = observe_identity(self.home, name, spec)
+                identity = credential_identity(self.home, name, spec, observed=observed)
+                if identity.get("mismatch"):
+                    reason = f"token identity mismatch (observed account {observed.get('account_id') if observed else '?'})"
+                    record_attempt(self.home, name, carry_model(pair["model"], family_of(current, self.engines), family,
+                                                                 self.models), None, "auth", reason, False)
+                    errors.append((name, reason))
+                    continue
+                if name != current and not identity.get("automatic_allowed"):
+                    # requirement 11, loops/b8.md: run_engines checks automatic_allowed before invoking a
+                    # fallback credential; the originally selected account still runs (production relies on
+                    # that today), only switching TO another credential requires it to be verified first.
+                    errors.append((name, "credential unverified; automatic fallback refused"))
+                    continue
             if self.over_budget(name):
                 notes.append(f"budget: {name} over budget, trying the next engine")
                 errors.append((name, "over budget"))
@@ -1887,6 +2108,8 @@ class Supervisor:
                 rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
                 if rc == 0:
                     record_attempt(self.home, name, model, rc, None, "", True)
+                    if family == "claude":
+                        self._mark_working(name, model, spec)
                     if transition and transition.get("source_path"):
                         self.save_transition(transition, block, switch_at)
                     if name != current:
@@ -1902,6 +2125,8 @@ class Supervisor:
                 last_reason = err
                 if classification == "prompt_too_long":
                     skip_claude = True
+                    if family == "claude" and self._is_working(name, model, spec):
+                        self._set_emergency_pending(name, model, err)
                     break
                 if classification in ("credits", "usage_limit", "auth"):
                     persist_switch = True
@@ -1930,20 +2155,211 @@ class Supervisor:
     def session_id(self):
         return read_text(self.path("session-id")).strip()
 
+    # ---- emergency-only rollover eligibility (requirement 6, loops/b8.md): "the account has been shown
+    # working" is scoped to the exact account/model/credential-content triple; replacing the credential (even
+    # with freshly verified metadata) can never inherit the old credential's successful probe.
+    def working_accounts_path(self):
+        return self.path("logs", "working-accounts.json")
+
+    def _working_key(self, name, model, spec):
+        token = ""
+        cred = spec.get("cred")
+        if cred:
+            cred_path = cred if os.path.isabs(cred) else self.path("credentials", cred)
+            token = read_env_file(cred_path).get("CLAUDE_CODE_OAUTH_TOKEN") or ""
+        return f"{name}:{model}:{hashlib.sha256(token.encode('utf-8')).hexdigest() if token else 'notoken'}"
+
+    def _mark_working(self, name, model, spec):
+        try:
+            data = json.loads(read_text(self.working_accounts_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[self._working_key(name, model, spec)] = time.time()  # bookkeeping only; never the test clock
+        write_text(self.working_accounts_path(), json.dumps(data))
+
+    def _is_working(self, name, model, spec):
+        try:
+            data = json.loads(read_text(self.working_accounts_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return False
+        return isinstance(data, dict) and self._working_key(name, model, spec) in data
+
+    def _set_emergency_pending(self, name, model, reason):
+        """Record the qualified emergency trigger (requirement 6, loops/b8.md): an actual resumed request
+        failed specifically because the conversation is too long, on an account/model/credential already
+        shown working. Consumed once by `run_emergency_rollover`; never re-armed by an ordinary token/byte
+        threshold (`schedule_compaction` no longer feeds `compaction_due`)."""
+        state = self.compaction_state()
+        if state.get("emergency_pending"):
+            return  # already armed; do not clobber its original old_id/reason while backoff is in effect
+        state["emergency_pending"] = {"reason": "prompt_too_long", "account": name, "model": model,
+                                      "at": self.now(), "before_tokens": self.last_claude_context_tokens(),
+                                      "diagnostic": (reason or "")[:500]}
+        self.save_compaction_state(state)
+
     def invoke(self, name, spec, message, model=None, preamble=""):
         """Run one engine on the batched message behind its preamble (the `[memory]` lines and, at a switch, the
         `[transition]` block). Returns (rc, stdout, stderr, usage) with usage {"tokens", "input_tokens",
         "context_tokens"} or None. Parses stdout on every return code (requirement 11, loops/b7.md): a nonzero
         process return is a failure even when the JSON looks successful, and a failed result never saves a
-        session id. A pending rollover's new id is never resumed before it has started once (requirement 13)."""
+        session id. A pending rollover's new id is never resumed before it has started once (requirement 13).
+        This is the manager's single vendor boundary (loops/b8.md, F1): persistent-mode lifecycle and framing
+        are dispatched from here and nowhere else. Account, model, vendor or mode changes apply at THIS turn
+        boundary: the previous live writer is always stopped before the newly selected one starts."""
         model = model or family_default_model(family_of(name, self.engines), self.models)
         if name == "codex" or spec.get("kind") == "codex":
+            self._retire_persistent("planned", "vendor switch to codex")
             return self.invoke_codex(spec, message, model, preamble)
         if preamble:
             handoff_text = self.read_handoff()
             if handoff_text:
                 preamble = preamble + "\n\n# MANAGER-HANDOFF.md\n" + handoff_text.rstrip()
             message = preamble + "\n\n" + message
+        if read_engine(self.home, self.engines)["mode"] == "persistent":
+            result = self._invoke_persistent(name, spec, message, model)
+            if result is not None:
+                self._clear_mode_fallback()
+                return result
+            # requirement 8, loops/b8.md: two consecutive failed starts fall back to per-turn for THIS turn
+            # only, with one alert; the configured mode is untouched and the next turn tries persistent again.
+            reason = getattr(self, "_last_startup_failure", "") or "persistent start failed twice"
+            self._set_mode_fallback(name, model, reason)
+            self.buildlog(f"persistent engine start failed twice: {reason[:200]}; using per-turn for this turn")
+        else:
+            self._retire_persistent("planned", "mode rollback to per-turn")
+        return self._invoke_per_turn(name, spec, message, model)
+
+    # ---- the persistent Claude process (loops/b8.md): one long-lived `-p --input-format stream-json` child
+    # per home, reused across successive turns until an account/model/mode/vendor change, a crash, a timeout
+    # or a planned daily restart retires it. `_PERSISTENT_CHILDREN` is an in-process registry: the process
+    # that actually spawned the child is the only one that can write to its stdin; `persistent-status.json`
+    # is the durable, cross-process view (`persistent_status`, status rendering, restart accounting).
+    def _persistent_child(self):
+        return self._persistent
+
+    def _set_persistent_child(self, child):
+        self._persistent = child
+
+    def shutdown_persistent(self):
+        """End a live persistent CLI process orderly (PR45 B3): close its input and wait (bounded) for exit
+        and finalized metadata; forced TERM/KILL only when that fails. `{"orderly": bool, "returncode"}`."""
+        child = self._persistent_child()
+        if child is None:
+            return {"orderly": True, "returncode": None}
+        result = child.close_orderly(timeout=2.0)
+        if not result["orderly"]:
+            child.kill_tree()
+            result = {"orderly": False, "returncode": child.popen.poll()}
+        self._set_persistent_child(None)
+        return result
+
+    def _retire_persistent(self, category, reason):
+        """Stop whatever persistent child is currently live, counting a planned restart; a no-op when none
+        is running (most turns, and every non-Claude or per-turn-only invocation)."""
+        if self._persistent_child() is not None:
+            self.shutdown_persistent()
+            _bump_restart(self.home, category, reason)
+            _save_persistent_status(self.home, pid=None)
+
+    def _invoke_persistent(self, name, spec, message, model):
+        """Reuse the live child when it still matches this account/model/conversation; otherwise retire it
+        (a planned restart) and start a fresh one, trying twice before signalling a startup fallback (None)
+        to the caller. A started child's send() failure (crash/timeout) is reported to the caller directly;
+        it is never retried here, so a submitted request can never be silently duplicated (requirement 8)."""
+        sid = self.session_id()
+        resume = bool(sid) and self._resume_allowed(sid)
+        if not sid:
+            sid = str(uuid.uuid4())
+        child = self._persistent_child()
+        status = _read_persistent_status(self.home)
+        need_new = (child is None or not child.alive() or status.get("account") != name
+                    or status.get("model") != model or status.get("sid") != sid)
+        if need_new:
+            if child is not None:
+                if child.alive():
+                    self.shutdown_persistent()
+                    _bump_restart(self.home, "planned", f"switch to {name}/{model}")
+                else:
+                    self._set_persistent_child(None)
+                    _bump_restart(self.home, "unexpected", "process found dead before reuse")
+            else:
+                # This instance never spawned the recorded pid (a genuine process restart: a fresh Python
+                # process owns no pipe to it and can never reuse it safely), but it may still be alive and
+                # serving the same conversation; retire it before starting a trustworthy one (PR45 8.1).
+                orphan = status.get("pid")
+                if orphan and pid_alive(orphan):
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(orphan, signal.SIGKILL)
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.kill(orphan, signal.SIGKILL)
+                    with contextlib.suppress(ChildProcessError, OSError):
+                        os.waitpid(orphan, 0)  # reap directly: no Popen object survived to do it (same OS
+                        # process as a real restart would be a different one; ECHILD there is expected/safe)
+                    _bump_restart(self.home, "unexpected", "orphan persistent process retired")
+            argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
+                   ["--model", model, "--dangerously-skip-permissions",
+                    "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+            child, last_reason = None, ""
+            for _ in range(2):
+                try:
+                    child = _persistent.spawn(argv, self.engine_env(spec), self.home, self.engine_timeout)
+                    break
+                except _persistent.StartupFailed as e:
+                    last_reason = str(e)
+                    record_attempt(self.home, name, model, 23, "other", last_reason, False)
+            if child is None:
+                self._last_startup_failure = last_reason or "persistent start failed twice"
+                return None
+            self._set_persistent_child(child)
+            _save_persistent_status(self.home, pid=child.pid, account=name, model=model, sid=sid,
+                                    started_at=time.time(), turns_served=0)
+        lines, timed_out, crashed = child.send(message, self.engine_timeout)
+        text = "\n".join(lines)
+        if timed_out:
+            child.kill_tree()
+            self._set_persistent_child(None)
+            _bump_restart(self.home, "unexpected", f"turn timed out after {self.engine_timeout}s")
+            _save_persistent_status(self.home, pid=None)
+            return 124, "", f"timeout after {self.engine_timeout}s", None
+        if crashed:
+            diagnostic = child.diagnostic()
+            self._set_persistent_child(None)
+            _bump_restart(self.home, "unexpected", "crash" + (f": {diagnostic}" if diagnostic else ""))
+            _save_persistent_status(self.home, pid=None)
+            return 17, "", self._failure_reason(diagnostic, text, ""), None
+        reply, usage, error_text, new_sid = self._parse_claude_output(text)
+        status = _read_persistent_status(self.home)
+        status["turns_served"] = int(status.get("turns_served") or 0) + 1
+        write_text(persistent_status_path(self.home), json.dumps(status, indent=1) + "\n")
+        if error_text:
+            return 1, "", self._failure_reason(error_text, text, ""), None
+        self._mark_session_started(sid)
+        write_text(self.path("session-id"), (new_sid or sid) + "\n")
+        return 0, reply, "", usage
+
+    def _set_mode_fallback(self, name, model, reason):
+        runtime = read_engine_runtime(self.home)
+        configured_pair = read_engine(self.home, self.engines)
+        runtime["configured"] = dict(runtime.get("configured") or {}, acc=configured_pair["acc"],
+                                     model=configured_pair["model"], mode=configured_pair["mode"])
+        runtime["effective"] = dict(runtime.get("effective") or {}, acc=name, model=model, mode="per-turn")
+        runtime["reason"] = f"persistent start failed twice: {reason}"[:300]
+        save_engine_runtime(self.home, runtime)
+
+    def _clear_mode_fallback(self):
+        runtime = read_engine_runtime(self.home)
+        configured = runtime.get("configured") if isinstance(runtime.get("configured"), dict) else {}
+        effective = runtime.get("effective") if isinstance(runtime.get("effective"), dict) else {}
+        if configured.get("mode") == "persistent" and effective.get("mode") == "per-turn":
+            runtime["effective"] = dict(effective, mode="persistent")
+            runtime["reason"] = ""
+            save_engine_runtime(self.home, runtime)
+
+    def _invoke_per_turn(self, name, spec, message, model):
+        """The default, always-available path (requirement 7, loops/b8.md): one process per turn. Unchanged
+        from before persistent mode existed, aside from its name."""
         sid = self.session_id()
         resume = bool(sid) and self._resume_allowed(sid)
         if not sid:
@@ -2175,6 +2591,41 @@ class Supervisor:
             return False
         return start <= h < end if start < end else (h >= start or h < end)
 
+    # ---- daily restart (requirement 4, loops/b8.md): one planned restart at the configured quiet hour,
+    # deferred until no turn or attach owns the session; the completed date is durable so a supervisor
+    # restart never repeats it, and only the next quiet-hour date permits a new one.
+    def daily_restart_enabled(self):
+        cfg = self.config.get("persistent")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        return bool(cfg["daily_restart"]) if "daily_restart" in cfg else True
+
+    def _daily_restart_path(self):
+        return self.path("logs", "daily-restart.json")
+
+    def _daily_restart_done(self):
+        try:
+            data = json.loads(read_text(self._daily_restart_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def maybe_daily_restart(self):
+        if not self.daily_restart_enabled() or read_engine(self.home, self.engines)["mode"] != "persistent":
+            return
+        if not self.quiet_hours_now():
+            return
+        if writer_status(self.home) is not None:
+            return  # an existing writer (a busy turn, or hydra attach) owns the session; defer
+        today = self.clock_dt().date().isoformat()
+        if self._daily_restart_done().get("date") == today:
+            return
+        if self._persistent_child() is not None:
+            self.shutdown_persistent()
+            _bump_restart(self.home, "planned", "daily restart (quiet hours)")
+            _save_persistent_status(self.home, pid=None)
+            self.buildlog("hydra-manager: planned daily restart of the persistent Claude process")
+        write_text(self._daily_restart_path(), json.dumps({"date": today}))
+
     def session_file_size(self):
         path = find_claude_transcript(self.path(".claude"), self.home, self.session_id() or None)
         try:
@@ -2196,26 +2647,21 @@ class Supervisor:
         return bool(self.compaction_state().get("pending")) or os.path.exists(self.path("COMPACT"))
 
     def compaction_due(self):
-        """(due, reason): forced always; a scheduled one when the limit is crossed by `over_ratio` (25%) or more,
-        else inside quiet hours; never twice without a verifying Claude turn in between, nor inside the back-off
-        after a failure."""
+        """(due, reason): forced (`hydra compact`/`COMPACT`) always; otherwise due only for a qualified
+        emergency rollover (requirement 6, loops/b8.md: automatic rollover is emergency-only -- an ordinary
+        token/byte threshold, however far over, no longer schedules one by itself); never twice without
+        consuming the trigger, nor inside the back-off after a failed attempt."""
         if os.path.exists(self.path("COMPACT")):
             return True, "forced"
         state = self.compaction_state()
-        pending = state.get("pending")
-        if not pending or state.get("verify"):
+        emergency = state.get("emergency_pending")
+        if not emergency or state.get("verify"):
             return False, None
         cfg = self.compaction_config()
         failed = parse_iso(state.get("failed_at"))
         if failed and (self.clock_dt() - failed).total_seconds() < cfg["retry_after_s"]:
             return False, None
-        try:
-            ratio = float(pending.get("value") or 0) / float(pending.get("limit") or 1)
-        except (TypeError, ValueError):
-            ratio = 0.0
-        if ratio >= cfg["over_ratio"] or self.quiet_hours_now():
-            return True, pending.get("reason") or "tokens"
-        return False, None
+        return True, "emergency"
 
     def schedule_compaction(self, context_tokens):
         """After a Claude turn: context tokens over `threshold_tokens`, or the session file grown by more than
@@ -2473,6 +2919,56 @@ class Supervisor:
             if reason:
                 runtime["reason"] = reason
             save_engine_runtime(self.home, runtime)
+
+    def run_emergency_rollover(self, reason="emergency"):
+        """Emergency-only automatic rollover (requirement 6, loops/b8.md): the triggering request already
+        failed to resume the old conversation (it is too long), so there is no live engine to run a memory-
+        writing turn with -- unlike manual/scheduled compaction, this only replaces the session id atomically
+        and records bookkeeping, never touching the old transcript or memory. A live persistent writer for
+        the old conversation is retired first, so it can never serve another request after the boundary.
+        Failure retains the old id and backs off; success consumes the trigger exactly once."""
+        self._reconcile_rollover_intent()
+        state = self.compaction_state()
+        pending = state.get("emergency_pending") or {}
+        if not pending:
+            return None
+        at = self.now()
+        n = len(self.turns()) + 1
+        old_id = self.session_id()
+        before_tokens = pending.get("before_tokens")
+        if before_tokens is None:
+            before_tokens = self.last_claude_context_tokens()
+        name, model = pending.get("account"), pending.get("model")
+        self._retire_persistent("planned", "emergency rollover: old conversation retired")
+        new_id = str(uuid.uuid4())
+        intent = {"old_id": old_id, "new_id": new_id, "started": False, "turn": n, "reason": "emergency",
+                  "before_tokens": before_tokens, "at": at, "engine": name, "model": model}
+        self._write_rollover_intent(intent)
+        self.persistence_checkpoint("rollover_intent_saved")
+        try:
+            self.replace_session_id(new_id)
+        except OSError as e:
+            self._cancel_rollover_intent()
+            error = f"emergency session replacement failed: {e}"
+            state["failed_at"] = at
+            if not state.get("fail_posted"):
+                self.buildlog(f"hydra-manager emergency rollover failed: {error}; session {old_id or '-'} kept "
+                              f"({before_tokens} context tokens)")
+                state["fail_posted"] = True
+            self.save_compaction_state(state)
+            log(f"emergency rollover failed: {error}; session {old_id or '-'} kept")
+            return None
+        self.persistence_checkpoint("rollover_id_replaced")
+        self._finish_rollover_bookkeeping(intent)
+        self.persistence_checkpoint("rollover_state_saved")
+        self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": False})
+        state = self.compaction_state()
+        state["emergency_pending"] = None
+        state["failed_at"] = None
+        state["fail_posted"] = False
+        self.save_compaction_state(state)
+        log(f"emergency rollover done: session {old_id} -> {new_id}; the next request starts it fresh")
+        return self.compaction_state()["last"]
 
     def run_compaction(self, reason="tokens"):
         """The rollover (requirement 13, loops/b7.md): a `[compaction]` turn writes durable memory on the same

@@ -433,15 +433,16 @@ class Bridge:
             target = (m.group(2) or "").strip()
             current = S.read_engine(self.home)
             if not target:
-                self.reply(channel, thread_ts, f"engine: {S.engine_label(current)}")
+                self.reply(channel, thread_ts, f"engine: {S.engine_label(current)} [{current['mode']}]")
             else:
                 try:
                     pair = S.parse_engine_command(target, current=current)
                 except S.BadEngine as e:
-                    self.reply(channel, thread_ts, f"{e}; nothing changed (engine: {S.engine_label(current)})")
+                    self.reply(channel, thread_ts, f"{e}; nothing changed (engine: {S.engine_label(current)} [{current['mode']}])")
                     return {"command": word, "ok": False}
-                S.set_engine(self.home, pair["acc"], pair["model"])
-                self.reply(channel, thread_ts, f"engine: {S.engine_label(pair)}")
+                S.set_engine(self.home, pair["acc"], pair["model"], mode=pair.get("mode"))
+                updated = S.read_engine(self.home)
+                self.reply(channel, thread_ts, f"engine: {S.engine_label(updated)} [{updated['mode']}]")
         elif name == "digest":
             S.append_event(self.home, S.new_event(
                 "timer", {"text": "digest now: write the digest (what ran, what it found, what it cost, what needs a "
