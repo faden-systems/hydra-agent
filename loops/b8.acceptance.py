@@ -43,22 +43,51 @@ def descendant_ready(wire_rows, seconds=5):
         time.sleep(.02)
     raise AssertionError('descendant did not become signal-ready in time')
 
-def fresh_completed(home, event_id, marker, wire_rows, poster_texts=None):
-    """2.3: a fresh recovery event is COMPLETED, not merely marked handled: exactly one fixture request carried
-    it, one successful attempt and one error-free turn/ledger entry are tied to it, and (when the poster is
-    observable) its reply was delivered."""
+def expected_usage(text):
+    """The fixture's accounting for one request: context = first assistant usage input side (7+extra, 2, 11),
+    input_tokens the same, tokens adds the 3 output tokens; `extra` varies with the request text."""
+    extra=len(text)%3
+    return {'context_tokens':20+extra,'input_tokens':20+extra,'tokens':23+extra}
+
+def ledger_rows(home):
+    path=Path(S.memory_dir_for(str(home)))/'LEDGER.jsonl'
+    return S.read_jsonl(str(path)) if path.exists() else None
+
+def before_fresh(home):
+    """Snapshot attempts and ledger before a fresh recovery event is enqueued (round 4, 2.2)."""
+    ledger=ledger_rows(home)
+    return {'attempts':len(S.read_jsonl(str(Path(home)/'logs'/'attempts.jsonl'))),'ledger':len(ledger or [])}
+
+def fresh_completed(home, event_id, marker, wire_rows, before, poster_texts=None):
+    """2.3/2.2: a fresh recovery event is COMPLETED, not merely marked handled: exactly one fixture request
+    carried it, exactly one NEW successful attempt and exactly one NEW ledger row match its error-free turn
+    (turn number, engine, model), and (when the poster is observable) its reply was delivered."""
     home=Path(home)
     requests=[r for r in wire_rows() if r['kind']=='request' and marker in r.get('text','')]
     assert len(requests)==1,('fresh event must be served exactly once',marker,len(requests))
     turns=[t for t in S.read_jsonl(str(home/'logs'/'turns.jsonl')) if event_id in (t.get('events') or [])]
     assert len(turns)==1 and 'error' not in turns[0],('fresh event needs exactly one error-free turn',turns)
-    attempts=S.read_jsonl(str(home/'logs'/'attempts.jsonl'))
-    assert any(a.get('success') for a in attempts),'no successful attempt recorded for the fresh event'
-    ledger=S.read_jsonl(str(home/'manager-memory'/'LEDGER.jsonl')) if (home/'manager-memory'/'LEDGER.jsonl').exists() else []
-    assert any(l.get('turn')==turns[0].get('n') for l in ledger) or not ledger,'ledger entry for the fresh turn missing'
+    turn=turns[0]
+    attempts=S.read_jsonl(str(home/'logs'/'attempts.jsonl'))[before['attempts']:]
+    assert len([a for a in attempts if a.get('success')])==1,('exactly one new successful attempt required',attempts)
+    ledger=ledger_rows(home)
+    assert ledger is not None,'ledger missing after the fresh event'
+    new_rows=ledger[before['ledger']:]
+    matching=[l for l in new_rows if l.get('turn')==turn.get('n')]
+    assert len(new_rows)==1 and len(matching)==1,('exactly one new ledger row for the fresh turn required',new_rows)
+    assert matching[0].get('engine')==turn.get('engine') and matching[0].get('model')==turn.get('model'),('ledger row disagrees with the turn',matching[0],turn)
     if poster_texts is not None:
-        assert any('reply:'+marker in t for t in poster_texts),'fresh event reply was not delivered'
+        # The fixture echoes the whole wrapped prompt after 'reply:'; the delivered text must carry the request
+        # marker and the fixture's reply prefix, whatever the production prompt wrapping and formatting add.
+        assert any(marker in t and 'reply:' in t for t in poster_texts),'fresh event reply was not delivered'
     assert event_id in S.handled_ids(str(home))
+
+def restarts(folder):
+    """1.2: planned and unexpected restart accounting from persistent_status."""
+    status=S.persistent_status(folder)
+    acc=status.get('restarts')
+    assert isinstance(acc,dict) and isinstance(acc.get('planned'),int) and isinstance(acc.get('unexpected'),int),('restart accounting missing from persistent_status',status)
+    return acc
 
 def lifecycle():
     with tempfile.TemporaryDirectory(prefix='b8-offline-') as folder:
@@ -90,7 +119,10 @@ def lifecycle():
             for i in range(12):
                 rc,out,err,usage=call('turn-'+str(i))
                 assert rc==0 and out=='reply:turn-'+str(i),(rc,out,err)
-                assert usage['context_tokens']==20,usage
+                want=expected_usage('turn-'+str(i))
+                # 2.3: full accounting, varying between requests, duplicates and terminal aggregates never re-added.
+                assert {k:usage.get(k) for k in want}==want,(usage,want)
+            assert expected_usage('turn-9')!=expected_usage('turn-10'),'fixture usage must vary between requests'
             starts=[r for r in wire() if r['kind']=='start']
             assert len(starts)==1, 'successive turns must share one process'
             assert len([r for r in wire() if r['kind']=='request'])==12
@@ -105,21 +137,37 @@ def lifecycle():
             assert rc!=0 and 'fixture real error' in err,(rc,out,err)
             assert call('after-error')[0]==0
             assert len([r for r in wire() if r['kind']=='start'])==1
+            # 1.1 (round 4): native compaction inside the conversation is normal; the adapter keeps the same
+            # process and the next request on the same conversation succeeds.
+            assert call('B8_NATIVE_COMPACT')[0]==0
+            assert any(r['kind']=='native_compaction' for r in wire()),'fixture did not record native compaction'
+            assert call('after-compact')[0]==0
+            assert len([r for r in wire() if r['kind']=='start'])==1,'native compaction must not restart the process'
+            assert [r for r in wire() if r['kind']=='start'][0]['sid']==sid
+            baseline_restarts=restarts(folder)
             assert call('switch','claude-l')[0]==0
             starts=[r for r in wire() if r['kind']=='start']
             assert len(starts)==2 and starts[-1]['sid']==sid
+            after_switch=restarts(folder)
+            assert after_switch['planned']==baseline_restarts['planned']+1 and after_switch['unexpected']==baseline_restarts['unexpected'],('account switch is a planned restart',after_switch)
             try:os.kill(old,0)
             except ProcessLookupError:pass
             else:raise AssertionError('old account process not reaped before switch')
             assert call('CRASH','claude-l')[0]!=0
             assert S.persistent_status(folder)['state']!='running','dead process reported healthy'
             assert call('after-crash','claude-l')[0]==0
+            after_crash=restarts(folder)
+            assert after_crash['unexpected']==after_switch['unexpected']+1 and after_crash['planned']==after_switch['planned'],('crash recovery is an unexpected restart',after_crash)
+            assert (after_crash.get('last') or {}).get('category')=='crash' and (after_crash.get('last') or {}).get('reason'),after_crash
             begin=time.monotonic();assert call('HANG','claude-l')[0]!=0
             assert time.monotonic()-begin<4, 'hang cleanup exceeded timeout plus grace'
             hung=tree_gone(wire(),'lifecycle hang')
             assert call('after-hang','claude-l')[0]==0
             restarted=[r for r in wire() if r['kind']=='start'][-1]
             assert restarted['pid']!=hung['pid'],'hang recovery must start a fresh process'
+            after_hang=restarts(folder)
+            assert after_hang['unexpected']==after_crash['unexpected']+1 and after_hang['planned']==after_crash['planned'],('timeout recovery is an unexpected restart',after_hang)
+            assert (after_hang.get('last') or {}).get('category')=='timeout',after_hang
             # Model changes and explicit rollback also close the previous writer.
             before=[r for r in wire() if r['kind']=='start']
             assert call('model-switch','claude-l','claude-fable-5-1')[0]==0
@@ -127,6 +175,8 @@ def lifecycle():
             assert len(after)==len(before)+1 and after[-1]['sid']==sid
             model_args=after[-1]['argv']
             assert model_args[model_args.index('--model')+1]=='claude-fable-5-1'
+            after_model=restarts(folder)
+            assert after_model['planned']==after_hang['planned']+1 and after_model['unexpected']==after_hang['unexpected'],('model switch is a planned restart',after_model)
             try:os.kill(before[-1]['pid'],0)
             except ProcessLookupError:pass
             else:raise AssertionError('model switch retained old writer')
@@ -287,13 +337,14 @@ def queued_recovery(fault):
             assert len(effects())==1,('backoff/restart replayed submitted event',fault,effects())
             # A new event is still serviceable; quarantining an uncertain result must not
             # disable all future work or batch the failed event into this request.
+            snapshot=before_fresh(folder)
             fresh=S.new_event('slack',{'channel':'C_B8','thread_ts':'1.0','ts':'1.1','user':'U_FOUNDER','text':'B8_FRESH_EVENT',
                                        'instructs':True,'addressed':True},event_id='fresh-'+fault)
             S.append_event(folder,fresh)
             with patch.object(S.time,'time',return_value=future+86400):
                 for _ in range(3):sup.run_once()
             assert len(effects())==1,('fresh event replayed failed event',fault,effects())
-            fresh_completed(folder,fresh['id'],'B8_FRESH_EVENT',rows,alerts)
+            fresh_completed(folder,fresh['id'],'B8_FRESH_EVENT',rows,snapshot,alerts)
         finally:
             kill_fixture_tree(rows(),binary)
 
@@ -352,12 +403,15 @@ def supervisor_death():
             assert not any(r.get('success') for r in S.read_jsonl(str(home/'logs/attempts.jsonl'))),'orphaned event claimed success'
             status=S.status_text(folder).lower()
             assert 'running' not in status.split('persistent')[-1][:80] or S.persistent_status(folder)['state']!='running' or S.persistent_status(folder)['pid']!=hung['pid'],'dead supervisor child reported healthy'
+            orphan=restarts(folder)
+            assert orphan['unexpected']>=1 and (orphan.get('last') or {}).get('category')=='orphan',('orphan retirement is an unexpected restart',orphan)
+            snapshot=before_fresh(folder)
             fresh=S.new_event('slack',{'channel':'C_B8','thread_ts':'1.0','ts':'1.2','user':'U_FOUNDER','text':'B8_FRESH_AFTER_DEATH',
                                        'instructs':True,'addressed':True},event_id='supdeath-fresh')
             S.append_event(folder,fresh)
             with patch.object(S.time,'time',return_value=time.time()+86400):
                 for _ in range(3):sup.run_once()
-            fresh_completed(folder,fresh['id'],'B8_FRESH_AFTER_DEATH',rows,posted)
+            fresh_completed(folder,fresh['id'],'B8_FRESH_AFTER_DEATH',rows,snapshot,posted)
             assert len(effects())==1
         finally:
             (home/'stop-worker').write_text('1')
@@ -417,6 +471,7 @@ def separate_attach(exit_code=None):
             competing=launch([sys.executable,'-c',
                 'import supervisor as S,sys\ntry:\n with S.acquire_writer(sys.argv[1],"competitor"): sys.exit(9)\nexcept S.WriterHeld: sys.exit(0)',folder])
             assert competing.wait(timeout=3)==0,'competing writer acquired attach lock'
+            snapshot=before_fresh(folder)
             enqueue('AFTER_ATTACH','fresh')
             time.sleep(.2)
             assert not any('AFTER_ATTACH' in r.get('text','') for r in rows()),'supervisor wrote during attach'
@@ -432,7 +487,7 @@ def separate_attach(exit_code=None):
                 (home/'attach-release').write_text(str(exit_code))
                 assert attached.wait(timeout=3)==exit_code,'attach exit status changed'
             wait_for(lambda:'fresh' in S.handled_ids(folder),'orphan attach prevented recovery')
-            fresh_completed(folder,'fresh','AFTER_ATTACH',rows)  # 2.3: completed, not merely handled
+            fresh_completed(folder,'fresh','AFTER_ATTACH',rows,snapshot)  # 2.3/2.2: completed, not merely handled
             running=S.persistent_status(folder)
             assert running['state']=='running' and running['pid']==[r for r in rows() if r['kind']=='start'][-1]['pid'],running
             assert running['turns_served']>=1 and running['uptime_s']>=0 and 'parked' not in S.status_text(folder).lower()

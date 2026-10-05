@@ -77,17 +77,22 @@ def serve(text):
     if text == 'CRASH': os._exit(17)
     if text == 'HANG':
         hang_with_descendant()
+    if 'B8_NATIVE_COMPACT' in text:
+        # Native compaction inside the same process and conversation (PR45 round 4, 1.1).
+        record('native_compaction')
+        emit(dict(type='system', subtype='compact_boundary', session_id=sid))
     error = text == 'ERROR'
+    # Usage varies with the request so stale reuse of a previous request's usage is detectable (2.3).
+    extra = len(text) % 3
+    usage = dict(input_tokens=7 + extra, output_tokens=3, cache_creation_input_tokens=2, cache_read_input_tokens=11)
     message = dict(id=f'{os.getpid()}-{time.monotonic_ns()}', type='message', role='assistant',
-                   content=[dict(type='text', text='reply:'+text)],
-                   usage=dict(input_tokens=7, output_tokens=3, cache_creation_input_tokens=2, cache_read_input_tokens=11))
+                   content=[dict(type='text', text='reply:'+text)], usage=dict(usage))
     emit(dict(type='assistant', message=message, session_id=sid))
     # A duplicate must not double accounting; terminal aggregate is not another request.
     emit(dict(type='assistant', message=message, session_id=sid))
     emit(dict(type='result', subtype='error_during_execution' if error else 'success',
               is_error=error, result='fixture real error' if error else 'reply:'+text,
-              session_id=sid, usage=dict(input_tokens=7, output_tokens=3,
-              cache_creation_input_tokens=2, cache_read_input_tokens=11)))
+              session_id=sid, usage=dict(usage)))
 if arg('--input-format') == 'stream-json':
     for line in sys.stdin:
         obj=json.loads(line)

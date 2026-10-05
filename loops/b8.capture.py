@@ -270,13 +270,28 @@ def capture_identity_discovery(binary, sources, output):
                 if source is not None:
                     env.update({k:v for k,v in S.read_env_file(str(source)).items() if k.startswith(('CLAUDE','ANTHROPIC'))})
                 try:
-                    proc=subprocess.run([sys.executable,str(ROOT/'loops/b8.capture-wire.py'),*argv],env=env,
-                                        capture_output=True,text=True,timeout=60,stdin=subprocess.DEVNULL)
-                    rc=proc.returncode;timeout=False
-                except subprocess.TimeoutExpired:
-                    rc=None;timeout=True
+                    try:
+                        proc=subprocess.run([sys.executable,str(ROOT/'loops/b8.capture-wire.py'),*argv],env=env,
+                                            capture_output=True,text=True,timeout=60,stdin=subprocess.DEVNULL)
+                        rc=proc.returncode;timeout=False
+                    except subprocess.TimeoutExpired:
+                        rc=None;timeout=True
+                finally:
+                    # 2.4: bounded cleanup on every path, including timeouts; the CLI child runs in its own session.
+                    stop_recorded(wire)
+                gone={'child_gone':True,'wrapper_gone':True}
+                for meta_path in wire.glob('*.json'):
+                    meta=json.loads(meta_path.read_text())
+                    for role in ('child','wrapper'):
+                        pid=meta.get(role+'_pid')
+                        if pid and Path('/proc',str(pid)).exists():
+                            try:
+                                stat=(Path('/proc')/str(pid)/'stat').read_text().rsplit(')',1)[1].split()
+                                if stat[19]==meta.get(role+'_start') and stat[0]!='Z':gone[role+'_gone']=False
+                            except (FileNotFoundError,IndexError):pass
                 records.append({'credential':label,'probe':probe,'argv':argv,'returncode':rc,'timed_out':timeout,
-                                'wire':f'identity-discovery/{label}/{probe}','isolated':['HOME','CLAUDE_CONFIG_DIR','XDG_CONFIG_HOME']})
+                                'wire':f'identity-discovery/{label}/{probe}','isolated':['HOME','CLAUDE_CONFIG_DIR','XDG_CONFIG_HOME'],
+                                'cleanup':gone})
     save(output/'identity-discovery.json',{'records':records,
          'rule':'token_bound only if both credential probes print account-identifying lines that differ from each other and the no-credential control prints none; otherwise not_reported'})
 

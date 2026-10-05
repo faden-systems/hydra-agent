@@ -86,6 +86,21 @@ def preserve_regressions():
             return found
         new=overrides(after)-overrides(before)
         assert not new,f'new skip/collection override in {file}: {sorted(new)}'
+    # 2.5: candidate files that did not exist at the baseline (new tests, new conftest.py anywhere under tests/manager)
+    # may add tests but never hooks, plugins, skip marks or collection overrides that could bypass retained tests.
+    baseline_files=set(files)
+    for path in sorted((ROOT/'tests'/'manager').rglob('*.py')):
+        rel=str(path.relative_to(ROOT))
+        if rel in baseline_files:continue
+        tree=ast.parse(path.read_text())
+        bad=set()
+        for node in tree.body:
+            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name.startswith('pytest_'):bad.add(node.name)
+            if isinstance(node,(ast.Assign,ast.AnnAssign)):
+                targets=node.targets if isinstance(node,ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target,ast.Name) and target.id in ('pytestmark','collect_ignore','collect_ignore_glob','pytest_plugins'):bad.add(target.id)
+        assert not bad,f'new candidate file defines pytest hooks/overrides: {rel}: {sorted(bad)}'
         retained=[ast.dump(node,include_attributes=False) for node in after.body]
         for node in before.body:
             if isinstance(node,ast.FunctionDef) and node.name in exempt:

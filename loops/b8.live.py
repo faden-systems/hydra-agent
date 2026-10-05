@@ -126,6 +126,8 @@ def identity_discovery(root, manifest, pin_sha):
         assert meta['binary_sha256']==pin_sha and meta['argv']==r['argv'],'discovery provenance mismatch'
         assert isinstance(meta.get('returncode'),int) or r.get('timed_out') is True,'discovery process not finalized'
         assert set(r.get('isolated') or [])>={'HOME','CLAUDE_CONFIG_DIR'},'discovery ran without cached-login isolation'
+        cleanup=r.get('cleanup') or {}
+        assert cleanup.get('child_gone') is True and cleanup.get('wrapper_gone') is True,'discovery probe processes not proven gone (2.4)'
         stem=metas[0][:-5]
         assert stem+'.stdout' in manifest and stem+'.stderr' in manifest
         outputs[(r['credential'],r['probe'])]=(root/(stem+'.stdout')).read_text()+'\n'+(root/(stem+'.stderr')).read_text()
