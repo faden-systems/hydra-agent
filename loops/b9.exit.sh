@@ -39,6 +39,26 @@ for file in files:
 print('[b9] baseline test statements preserved')
 PY
 "$PYTHON" -m pytest -q tests/manager || fail pytest
+# Round 1 2.6: the BASELINE suite (tests/manager exactly as at BASE_REF, conftest included) runs against the
+# CANDIDATE manager code; every baseline node id must execute and pass, none skipped.
+MIX=$(mktemp -d /tmp/b9-baseline-XXXXXX)
+trap 'rm -rf "$MIX"' EXIT
+tar --exclude=.git --exclude=.venv --exclude=__pycache__ --exclude=.pytest_cache -cf - . | tar -xf - -C "$MIX"
+rm -rf "$MIX/tests/manager"
+git archive "$BASE" tests/manager | tar -x -C "$MIX" || fail 'baseline tests not extracted'
+(cd "$MIX" && "$PYTHON" -m pytest --rootdir=. -q --collect-only -p no:cacheprovider tests/manager) >"$MIX/nodes.txt" || fail 'baseline collection'
+(cd "$MIX" && "$PYTHON" -m pytest --rootdir=. -q -rA -p no:cacheprovider tests/manager) >"$MIX/run.txt" 2>&1 || { tail -n 40 "$MIX/run.txt"; fail 'baseline suite fails against candidate code'; }
+"$PYTHON" - "$MIX/nodes.txt" "$MIX/run.txt" <<'PY'
+import sys
+from pathlib import Path
+nodes={l.strip() for l in Path(sys.argv[1]).read_text().splitlines() if l.startswith('tests/manager/') and '::' in l}
+assert nodes,'empty baseline node set'
+lines=Path(sys.argv[2]).read_text().splitlines()
+passed={l.split(' ',1)[1].strip() for l in lines if l.startswith('PASSED ')}
+for n in sorted(nodes):
+    assert n in passed,f'baseline test did not pass unskipped against candidate code: {n}'
+print(f'[b9] baseline suite: {len(nodes)} node ids executed and passed against candidate code')
+PY
 "$PYTHON" - "$PYTHON" <<'PY'
 import subprocess,sys
 for argv,seconds in ((['loops/b7.acceptance.py'],180),(['loops/b9.acceptance.py'],120),(['loops/b9.observe.py','--self-test'],60)):
