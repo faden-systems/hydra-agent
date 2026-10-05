@@ -98,6 +98,7 @@ def check_trace(calls):
             assert args == ('fetch', 'origin'), f'fetch must be plain: {call}'
         elif name == 'rebase':
             assert args == ('rebase', '--abort') or (len(args) == 2 and args[1].startswith('origin/')), f'rebase shape: {call}'
+    fetch_right_before_push(calls, require_push=False)
 
 
 def tick(sup, git_allowed=True):
@@ -132,17 +133,23 @@ def trace(sup, fn):
     return result, calls
 
 
-def fetch_right_before_push(calls):
+def fetch_right_before_push(calls, require_push=True):
+    """Every push in the trace has its own fetch after the previous push and after any intervening commit, with
+    only rev-parse / merge-base / rebase / status between that fetch and the push (requirement 7i)."""
     names = [c[0] for c in calls]
-    assert 'push' in names, names
-    push = names.index('push')
-    fetches = [i for i, n in enumerate(names[:push]) if n == 'fetch']
-    assert fetches, f'no fetch before the push: {names}'
-    last_fetch = fetches[-1]
-    commits = [i for i, n in enumerate(names[:push]) if n == 'commit']
-    assert not commits or commits[-1] < last_fetch, f'the fetch must follow the commit: {names}'
-    between = set(names[last_fetch + 1:push])
-    assert between <= {'rev-parse', 'merge-base', 'rebase', 'status'}, f'between fetch and push: {names}'
+    pushes = [i for i, n in enumerate(names) if n == 'push']
+    assert pushes or not require_push, names
+    start = 0
+    for push in pushes:
+        window = names[start:push]
+        fetches = [start + i for i, n in enumerate(window) if n == 'fetch']
+        assert fetches, f'push without a fresh fetch since the previous push: {names}'
+        last_fetch = fetches[-1]
+        commits = [start + i for i, n in enumerate(window) if n == 'commit']
+        assert not commits or commits[-1] < last_fetch, f'the fetch must follow the commit: {names}'
+        between = set(names[last_fetch + 1:push])
+        assert between <= {'rev-parse', 'merge-base', 'rebase', 'status'}, f'between fetch and push: {names}'
+        start = push + 1
 
 
 def head(path):
@@ -491,6 +498,39 @@ def legacy_records():
         now[0] = 6600.0
         tick(restarted)
         assert len(S.read_outbox(h)) == baseline + 1
+    # (d) pending before its retry deadline and (e) blocked: observation-only adoption, zero git calls.
+    for variant, legacy_status, retry_after in (('pending-early', 'pending', 9_999_999.0), ('blocked', 'blocked', 0)):
+        remote, repo, other = make_repo()
+        h = home()
+        write_state(h, {'tracks': []})
+        legacy = {'status': legacy_status, 'error': 'push: error: legacy failure', 'episode_id': f'legacy-{variant}',
+                  'retry_after': retry_after, 'last_turn': 3}
+        Path(h, 'logs', 'persistence.json').write_text(json.dumps(legacy))
+        now = [9000.0]
+        sup = make_sup(h, repo, now)
+        tick(sup, git_allowed=False)
+        st = status(h)
+        assert st['status'] == legacy_status and st['episode_id'] == f'legacy-{variant}', st
+        assert st['error'] == 'push: error: legacy failure' and st['since'] == 9000.0 and st['failures'] == 1 and st['notice_at'] is None, st
+        assert S.read_outbox(h) == []
+        now[0] = 9300.0
+        tick(sup, git_allowed=False)
+        notices = S.read_outbox(h)
+        assert len(notices) == 1 and notices[0]['text'] == f'persistence {legacy_status} for 5 min: push: legacy failure', notices
+    # (f) adoption by a direct failed attempt: failures 2.
+    remote, repo, other = make_repo()
+    h = home()
+    write_state(h, {'tracks': []})
+    hook = reject(remote)
+    legacy = {'status': 'pending', 'error': 'push: error: legacy failure', 'episode_id': 'legacy-direct',
+              'retry_after': 0, 'last_turn': 3}
+    Path(h, 'logs', 'persistence.json').write_text(json.dumps(legacy))
+    now = [9500.0]
+    sup = make_sup(h, repo, now)
+    assert sup.persist(4) is False
+    st = status(h)
+    assert st['episode_id'] == 'legacy-direct' and st['since'] == 9500.0 and st['failures'] == 2, st
+    assert st['error'].startswith('push: ') and 'legacy failure' not in st['error'] and S.read_outbox(h) == []
     print('legacy records: ok')
 
 
@@ -575,6 +615,8 @@ def summary_contract():
         "push: failed to push some refs to 'https://<redacted>@github.com/x/y.git'"
     assert f("push: remote: nope\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nhint: x") == 'push: remote: nope'
     assert f('push: ') == 'push: unknown error'
+    assert f('push: error: failed; hint: retry later') == 'push: failed;'
+    assert f('push: error: hint: only a hint') == 'push: unknown error'
     assert f('push: hint: only hints\nhint: more hints') == 'push: unknown error'
     assert f('push: error:   many   spaces\there \n') == 'push: many spaces here'
     long = f('commit: error: ' + 'x' * 500)

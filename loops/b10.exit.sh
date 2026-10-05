@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="${BASE_REF:?set BASE_REF to the merged b10 spec commit SHA}"
+BASE="${BASE_REF:?set BASE_REF to the full SHA of main at launch (contains the merged b10 spec)}"
+SPEC="${SPEC_REF:-$BASE}"
 fail() { echo "[b10] FAIL: $*"; exit 1; }
 [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] || fail 'BASE_REF must be a full immutable commit SHA'
+[[ "$SPEC" =~ ^[0-9a-f]{40}$ ]] || fail 'SPEC_REF must be a full immutable commit SHA'
 git rev-parse --verify "$BASE" >/dev/null || fail "missing base $BASE"
-git merge-base --is-ancestor "$BASE" HEAD || fail 'candidate does not descend from the spec base'
+git rev-parse --verify "$SPEC" >/dev/null || fail "missing spec commit $SPEC"
+git merge-base --is-ancestor "$BASE" HEAD || fail 'candidate does not descend from the launch base'
+git merge-base --is-ancestor "$SPEC" "$BASE" || fail 'the merged spec is not an ancestor of the launch base'
 git merge-base --is-ancestor 579f444 "$BASE" || fail 'base predates merged b7'
 FROZEN="loops/b10.md loops/b10.exit.sh loops/b10.acceptance.py loops/b7.acceptance.py"
+for f in $FROZEN; do git show "$SPEC:$f" | cmp -s - <(git show "$BASE:$f") || fail "exit-owned file differs between SPEC_REF and BASE_REF: $f"; done
 EXEMPT="test_failure_then_recovery_sends_exactly_two_deduplicated_notices test_diverged_histories_reconcile_with_an_ordinary_merge"
 fence() {
   local changed fixtures bad f
@@ -20,6 +25,8 @@ fence() {
 fence
 test -f docs/notes/b10.md || fail 'docs/notes/b10.md missing'
 PYTHON="${PYTHON:-python3}"
+PYTHON=$("$PYTHON" -c 'import sys; print(sys.executable)') || fail 'cannot resolve the Python interpreter'
+[[ "$PYTHON" = /* ]] || fail "interpreter path is not absolute: $PYTHON"
 # Notes gate (requirement 8): real headings with bodies, evidence content, no Slack ids / tokens / hostnames.
 "$PYTHON" - <<'PY' || fail 'notes gate'
 import re,sys
