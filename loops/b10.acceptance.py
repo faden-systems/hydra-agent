@@ -94,6 +94,32 @@ def status(h):
     return json.loads(Path(h, 'logs', 'persistence.json').read_text())
 
 
+def trace(sup, fn):
+    """Run fn() and return the list of git argument tuples the supervisor issued meanwhile."""
+    calls = []
+    real = sup._git
+
+    def wrapped(*args, **kw):
+        calls.append(tuple(args))
+        return real(*args, **kw)
+    with patch.object(sup, '_git', wrapped):
+        result = fn()
+    return result, calls
+
+
+def fetch_right_before_push(calls):
+    names = [c[0] for c in calls]
+    assert 'push' in names, names
+    push = names.index('push')
+    fetches = [i for i, n in enumerate(names[:push]) if n == 'fetch']
+    assert fetches, f'no fetch before the push: {names}'
+    last_fetch = fetches[-1]
+    commits = [i for i, n in enumerate(names[:push]) if n == 'commit']
+    assert not commits or commits[-1] < last_fetch, f'the fetch must follow the commit: {names}'
+    between = set(names[last_fetch + 1:push])
+    assert between <= {'rev-parse', 'merge-base', 'rebase', 'status'}, f'between fetch and push: {names}'
+
+
 def head(path):
     return git(path, 'rev-parse', 'HEAD').stdout.strip()
 
@@ -212,7 +238,9 @@ def rebase_before_push():
     now = [3000.0]
     sup = make_sup(h, repo, now)
     push_other(other, 'external', 'keep')  # the remote moves after the supervisor's turn began
-    assert sup.persist(1) is True, 'a remote that moved during the turn must not fail the push'
+    ok, calls = trace(sup, lambda: sup.persist(1))
+    assert ok is True, 'a remote that moved during the turn must not fail the push'
+    fetch_right_before_push(calls)  # requirement 7i: first attempt
     st = status(h)
     assert st['status'] == 'synced' and st.get('since') is None and st.get('failures') in (None, 0), st
     assert head(repo) == head(remote)
@@ -229,7 +257,8 @@ def rebase_before_push():
     hook.unlink()
     push_other(other, 'external2', 'keep2')  # the remote moves before the retry
     now[0] += 61
-    sup.reconcile_persistence()
+    _, calls = trace(sup, sup.reconcile_persistence)
+    fetch_right_before_push(calls)  # requirement 7i: retry
     st = status(h)
     assert st['status'] == 'synced' and st['pending_local_sha'] is None and st['last_successful_push_sha'] == head(repo), st
     assert head(repo) == head(remote) and head(repo) != pending, 'the retried commit must be rebased, not merged'
@@ -292,6 +321,11 @@ def conflict_blocks():
     assert json.loads((repo / 'factory' / 'state.json').read_text())['owner'] == 'local'
     assert git(repo, 'status', '--porcelain').stdout.strip() == ''
     assert S.read_outbox(h) == []
+    blocked_error = st['error']
+    ok, calls = trace(sup, lambda: sup.persist(2))  # requirement 7h: persist after a blocked sync
+    assert ok is False and calls == [], f'persist after a blocked sync must not touch git: {calls}'
+    st = status(h)
+    assert st['status'] == 'blocked' and st['error'] == blocked_error and st['since'] == 2000.0, st
     for t in (2122.0, 2200.0, 2299.0):
         now[0] = t
         tick(sup, git_allowed=False)  # blocked is never retried by a tick
@@ -311,7 +345,7 @@ def conflict_blocks():
     git(other, 'push', '--force', 'origin', 'HEAD')
     now[0] = 2400.0
     sup.sync_repo_before()
-    assert sup.persist(2) is True
+    assert sup.persist(3) is True
     st = status(h)
     assert st['status'] == 'synced' and head(repo) == head(remote), st
     no_merges(remote)
@@ -319,6 +353,120 @@ def conflict_blocks():
     assert len(notices) == 2, notices
     assert notices[1]['text'] == f'persistence recovered: synced at {head(repo)[:12]} after 6 min', notices[1]['text']
     print('conflict blocks: ok')
+
+
+def dirty_sync_then_persist():
+    """Requirement 7h: unmanaged dirt blocks the sync; the following persist touches nothing."""
+    remote, repo, other = make_repo()
+    h = home()
+    write_state(h, {'tracks': []})
+    (repo / 'unrelated').write_text('dirty')
+    now = [4000.0]
+    sup = make_sup(h, repo, now)
+    initial = head(repo)
+    sup.sync_repo_before()
+    st = status(h)
+    assert st['status'] == 'blocked' and st['error'].startswith('dirty: ') and st['since'] == 4000.0, st
+    ok, calls = trace(sup, lambda: sup.persist(1))
+    assert ok is False and calls == [], calls
+    assert status(h)['error'] == st['error'] and head(repo) == initial and (repo / 'unrelated').read_text() == 'dirty'
+    assert S.read_outbox(h) == []
+    print('dirty sync then persist: ok')
+
+
+def rebase_in_progress():
+    """Requirements 1 and 7j: an unfinished rebase blocks before any git call."""
+    remote, repo, other = make_repo()
+    h = home()
+    write_state(h, {'tracks': []})
+    now = [4500.0]
+    sup = make_sup(h, repo, now)
+    (repo / '.git' / 'rebase-merge').mkdir()
+    _, calls = trace(sup, sup.sync_repo_before)
+    st = status(h)
+    assert calls == [], f'sync must not touch git during a rebase: {calls}'
+    assert st['status'] == 'blocked' and st['error'].startswith('rebase: rebase in progress'), st
+    ok, calls = trace(sup, lambda: sup.persist(1))
+    assert ok is False and calls == [], calls
+    assert status(h)['error'].startswith('rebase: rebase in progress')
+    assert S.read_outbox(h) == []
+    (repo / '.git' / 'rebase-merge').rmdir()
+    now[0] = 4600.0
+    sup.sync_repo_before()
+    assert sup.persist(2) is True and status(h)['status'] == 'synced'
+    assert S.read_outbox(h) == []
+    print('rebase in progress: ok')
+
+
+def legacy_records():
+    """Requirements 2 and 7g: b7-era pending records are adopted, never crashed on or double-noticed."""
+    # (a) no legacy notice: adopted, noticed five minutes after adoption, recovered line once.
+    remote, repo, other = make_repo()
+    h = home()
+    write_state(h, {'tracks': []})
+    hook = reject(remote)
+    legacy = {'status': 'pending', 'error': "push: error: failed to push some refs to 'x'", 'episode_id': 'legacy-a',
+              'retry_after': 0, 'last_turn': 3, 'pending_local_sha': None}
+    Path(h, 'logs', 'persistence.json').write_text(json.dumps(legacy))
+    now = [5000.0]
+    sup = make_sup(h, repo, now)
+    tick(sup)  # retries (deadline passed), fails again on the hook; must not crash
+    st = status(h)
+    assert st['status'] == 'pending' and st['episode_id'] == 'legacy-a' and st['since'] == 5000.0, st
+    assert st['notice_at'] is None and S.read_outbox(h) == []
+    for t in (5061.0, 5200.0, 5299.0):
+        now[0] = t
+        tick(sup)
+        assert S.read_outbox(h) == []
+    now[0] = 5300.0
+    tick(sup)
+    notices = S.read_outbox(h)
+    assert len(notices) == 1 and notices[0]['id'] == 'persistence-legacy-a-notice', notices
+    assert notices[0]['text'].startswith('persistence pending for 5 min: push: '), notices[0]['text']
+    one_line(notices[0]['text'])
+    hook.unlink()
+    now[0] = 5400.0
+    tick(sup)
+    notices = S.read_outbox(h)
+    assert status(h)['status'] == 'synced' and len(notices) == 2 and notices[1]['id'] == 'persistence-legacy-a-recovered', notices
+    # (b) legacy notice already queued, (c) legacy notice already delivered (receipt only): one recovered line, no notice.
+    for variant in ('queued', 'receipted'):
+        remote, repo, other = make_repo()
+        h = home()
+        write_state(h, {'tracks': []})
+        hook = reject(remote)
+        ep = f'legacy-{variant}'
+        legacy = {'status': 'pending', 'error': 'push: error: failed to push some refs', 'episode_id': ep,
+                  'retry_after': 0, 'last_turn': 3}
+        Path(h, 'logs', 'persistence.json').write_text(json.dumps(legacy))
+        if variant == 'queued':
+            S._queue_notice_once(h, 'C_FIXTURE', f'persistence pending (episode {ep}): push: x', f'persistence-{ep}-failed')
+            baseline = 1
+        else:
+            S._write_receipt(h, f'persistence-{ep}-failed', {'status': 'posted', 'ts': '1.0'})
+            baseline = 0
+        now = [6000.0]
+        sup = make_sup(h, repo, now)
+        tick(sup)
+        st = status(h)
+        assert st['episode_id'] == ep and st['since'] == 6000.0 and st['notice_at'] == 6000.0, st
+        assert len(S.read_outbox(h)) == baseline
+        for t in (6061.0, 6300.0, 6400.0):
+            now[0] = t
+            tick(sup)
+            assert len(S.read_outbox(h)) == baseline, f'{variant}: no second notice'
+        hook.unlink()
+        now[0] = 6461.0
+        restarted = make_sup(h, repo, now)
+        tick(restarted)
+        notices = S.read_outbox(h)
+        assert status(h)['status'] == 'synced' and len(notices) == baseline + 1, (variant, notices)
+        assert notices[-1]['id'] == f'persistence-{ep}-recovered', notices[-1]
+        assert notices[-1]['text'] == f'persistence recovered: synced at {head(repo)[:12]} after 7 min', notices[-1]['text']
+        now[0] = 6600.0
+        tick(restarted)
+        assert len(S.read_outbox(h)) == baseline + 1
+    print('legacy records: ok')
 
 
 def summary_contract():
@@ -382,4 +530,7 @@ if __name__ == '__main__':
     deadline_notice()
     rebase_before_push()
     conflict_blocks()
+    dirty_sync_then_persist()
+    rebase_in_progress()
+    legacy_records()
     print('[b10.acceptance] PASS')
