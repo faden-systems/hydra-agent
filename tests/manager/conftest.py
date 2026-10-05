@@ -1,4 +1,5 @@
 """Shared fixtures for the manager tests: a temporary HYDRA_HOME, recording fake engines, a fake poster."""
+import hashlib
 import json
 import os
 import stat
@@ -29,8 +30,17 @@ def make_home(root=None):
     for d in ("inbox", "inbox/files", "logs", "credentials", ".claude", "mirror"):
         os.makedirs(os.path.join(h, d), exist_ok=True)
     for name in ("claude-r2d2", "claude-l"):
+        token = f"fake-{name}"
         with open(os.path.join(h, "credentials", f"{name}.env"), "w") as f:
-            f.write(f"CLAUDE_CODE_OAUTH_TOKEN=fake-{name}\n")
+            f.write(f"CLAUDE_CODE_OAUTH_TOKEN={token}\n")
+        # Pre-verified identity sidecar (loops/b8.md Identity contract interface): every existing test that
+        # builds its credentials through make_home() exercises the SAME automatic-fallback/rotation behavior
+        # as before b8's identity gate; dummy values only, never a real token or a live verification.
+        with open(os.path.join(h, "credentials", f"{name}.env.identity.json"), "w") as f:
+            json.dump({"schema_version": 1, "label": name, "account_id": f"fixture-{name}",
+                       "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                       "verified_at": "2026-10-04T20:00:00Z", "method": "private-window-and-usage-bar",
+                       "evidence": "https://app.slack.com/archives/Cfixture/p123"}, f)
     with open(os.path.join(h, "engine"), "w") as f:
         f.write("claude-r2d2\n")
     with open(os.path.join(h, "session-id"), "w") as f:

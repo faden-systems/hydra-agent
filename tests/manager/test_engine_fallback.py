@@ -41,6 +41,27 @@ def test_classify_handles_none_and_empty():
     assert S.classify_engine_error("") == "other"
 
 
+def test_classify_real_capture_auth_diagnostic():
+    """b8 real capture, 2026-10-05: the installed CLI's actual invalid-bearer-token wire text was classified
+    `other`, not `auth`, because it never matched the `http|status`-prefixed 401/403 pattern. Exact text from
+    `docs/notes/b8.md` / the capture log."""
+    assert S.classify_engine_error("Failed to authenticate. API Error: 401 Invalid bearer token") == "auth"
+
+
+def test_classify_auth_diagnostic_variants():
+    for text in ("Failed to authenticate", "Invalid bearer token", "Invalid authentication token",
+                "not logged in", "Unauthorized", "Forbidden", "a bare 401 code", "HTTP 403"):
+        assert S.classify_engine_error(text) == "auth", text
+    # Retained classes and the no-false-positive-on-embedded-digits guarantee stay intact alongside the
+    # broadened auth pattern.
+    for text, expected in (("Out of usage credits", "credits"), ("usage limit reached", "usage_limit"),
+                           ("Rate limit exceeded", "rate_limit"), ("429 Too Many Requests", "rate_limit"),
+                           ("Prompt is too long for this model", "prompt_too_long"),
+                           ("Connection timed out", "other"), ("record 14013 failed", "other"),
+                           ("a 4013 record", "other")):
+        assert S.classify_engine_error(text) == expected, text
+
+
 # ----------------------------------------------------------------------------------------------- stdout parsing on every rc
 
 def test_nonzero_rc_is_failure_even_with_successful_looking_json(home, tmp_path):
@@ -168,6 +189,37 @@ def test_fallback_notice_persists_across_restart_without_duplication(home):
     with patch.object(sup2, "invoke", side_effect=invoke):
         sup2.run_engines("second", [])
     assert len(S.read_outbox(home)) == 1
+
+
+def test_fallback_episode_closes_when_mode_was_ever_explicitly_set(home):
+    """b8 attempt 4, real capture (attempt 3): once an operator has ever set `mode=` (requirement 7,
+    loops/b8.md), `engine-runtime.json`'s persisted "configured" pair carries a `mode` key alongside acc/model.
+    When the restored primary (re-selected explicitly, exactly as the real capture's recovery phase does)
+    completes a turn, `_note_fallback_transition`'s winning-vs-configured comparison must still recognize it
+    and close the episode -- not only announce it starting (requirement 12/13, loops/b8.md)."""
+    eng_map = {"claude-r2d2": {"bin": "fixture"}, "codex": {"bin": "fixture", "kind": "codex"}}
+    S.set_engine(home, "claude-r2d2", "claude-sonnet-5", eng_map, mode="per-turn")
+    cfg = {"dev_channel": "C_DEV_FIXTURE", "engine_fallback": {"claude_models": []}}
+    sup = S.Supervisor(home=home, engines=eng_map, config=cfg, poster=lambda *a: None)
+    failing = True
+
+    def invoke(name, spec, message, model=None, preamble=""):
+        if name == "claude-r2d2" and failing:
+            return 1, "", "Out of usage credits", None
+        return 0, "ok", "", None
+    with patch.object(sup, "invoke", side_effect=invoke):
+        sup.run_engines("first", [])
+    notices = S.read_outbox(home)
+    assert len(notices) == 1 and "fallback started" in notices[0]["text"].lower()
+    # The operator (or the real capture's recovery phase) explicitly restores the primary; this re-selection
+    # is exactly what stamps `mode` onto engine-runtime.json's "configured" pair.
+    S.set_engine(home, "claude-r2d2", "claude-sonnet-5", eng_map, mode="per-turn")
+    failing = False
+    with patch.object(sup, "invoke", side_effect=invoke):
+        sup.run_engines("second", [])
+    notices = S.read_outbox(home)
+    assert len(notices) == 2, notices
+    assert "fallback ended" in notices[1]["text"].lower(), notices
 
 
 def test_deliberately_selecting_codex_is_not_a_fallback_episode(home):

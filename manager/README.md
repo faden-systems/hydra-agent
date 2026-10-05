@@ -10,6 +10,7 @@ up in a thread; operators use Slack only; tokens never leave `credentials/`.
 | File | What it is |
 |---|---|
 | `supervisor.py` | the turn loop: queue, wake, engine choice and rotation, reply delivery, handoff, bookkeeping, persistence, PAUSE, budgets, the WRITER lock, the dead-man, the compaction policy, thread participation records |
+| `persistent.py` | the persistent Claude child process plumbing (spawn, stream-json framing, startup-failure detection, orderly/forced teardown); known only to `Supervisor.invoke`, the one vendor boundary (loops/b8.md) |
 | `bridge.py` | the Slack bridge (`slack_bolt` Socket Mode): allowlist, mirror, file download, the commands, thread participation and routing |
 | `hydra` | the console CLI: `status`, `say`, `logs`, `tail`, `engine`, `pause`, `resume`, `attach`, `compact`, `post`, `update` |
 | `models.json` | model aliases per family (`claude`, `codex`) with the family default; extendable by `$HYDRA_HOME/models.json` |
@@ -41,7 +42,7 @@ logs/bridge-health.json     the bridge's own idle-pong telemetry, rewritten ever
 logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/posts.jsonl and logs/reactions.jsonl (dry mode)
 threads.json                {channel: {thread_ts: {joined_at, last_seen}}}: the threads the manager is part of (bridge and supervisor both write it, under threads.json.lock)
 COMPACT                     present: a compaction runs before the next turn (hydra compact, @manager compact); content is who asked
-engine                      JSON {"acc": claude-r2d2 | claude-l | codex, "model": <full id>}; a legacy one-word file is upgraded on the next turn
+engine                      JSON {"acc": claude-r2d2 | claude-l | codex, "model": <full id>, "mode"?: persistent | per-turn}; a legacy one-word file is upgraded on the next turn; mode defaults to per-turn, including when absent
 session-id                  the manager's Claude session id (created on the first turn)
 codex-session               marker: a Codex session exists, later Codex turns `exec resume --last`
 logs/codex-rollout          the rollout file `codex exec` last reported (when it printed one); the transition read prefers it
@@ -125,10 +126,45 @@ unknown alias is rejected with the list of valid ones and nothing changes. `stat
 
 Each turn starts at the current engine and tries the remaining engines in cyclic order. A budget limit
 or a nonzero exit whose stderr matches quota, usage limit, rate, 401, or 403 causes fallback and persists
-the next successful engine. Other nonzero exits (including launch failures and timeouts) also try the
-next engine, but do not persist a switch by themselves. A successful fallback adds `engine: <name>` to
-the reply; `hydra logs 3` records the actual engine per turn even when no switch occurred. If every engine
-fails, events remain pending and the supervisor waits five minutes before retrying.
+the next successful engine. Other classifiable nonzero exits (including launch failures) also try the next
+engine, but do not persist a switch by themselves. A crash or a turn timeout is different: its disposition is
+uncertain (the request may already have had a real side effect), so the turn stops there instead of trying
+another account, and the triggering event is marked handled with a truthful failure rather than left pending
+for a retry. A successful fallback adds `engine: <name>` to the reply; `hydra logs 3` records the actual engine
+per turn even when no switch occurred. If every engine fails with a classifiable error, events remain pending
+and the supervisor waits five minutes before retrying.
+
+A fallback to a different Claude account is refused unless that account's credential carries a verified
+identity sidecar (`<credential.env>.identity.json`; see "Credential identity" below) — the originally selected
+account is unaffected by this gate.
+
+### Persistent mode (loops/b8.md)
+
+`engine mode=persistent|per-turn` (same places as `acc=`/`model=`, same authority rules) selects whether Claude
+runs as one long-lived `-p --input-format stream-json` process reused across turns, or the default one-process-
+per-turn. Codex always stays per-turn regardless of this setting. Account, model, vendor or mode changes stop
+the previous writer before starting the next one. Two consecutive failed starts fall back to per-turn for that
+one turn only (one alert; the next turn tries persistent again); a crash or a timeout mid-turn is an unexpected
+restart, closes the process and is served fresh next time. One planned restart happens at the configured quiet
+hour (`config.json persistent.daily_restart`, default true), deferred while a turn or `hydra attach` owns the
+session. `hydra status`/`status_text` show the configured/effective mode, uptime, turns served and restart
+counts (`Supervisor.persistent_status`). `hydra attach` waits for a busy turn (`HYDRA_ATTACH_WAIT_TIMEOUT`,
+default 10s), parks (stops) any live persistent writer so it never shares the conversation with the interactive
+session, and resumes normal service on exit, including an abnormal one.
+
+Automatic rollover is emergency-only: it fires only when an actual resumed request fails because the
+conversation is too long **and** that exact account/model/credential has already completed a successful turn.
+An ordinary token or byte threshold no longer triggers it by itself (`hydra compact`/`COMPACT` is still the
+manual/forced path, unchanged).
+
+### Credential identity
+
+Production accounts (`cred` set in `default_engines()`) need a sidecar next to the credential,
+`<credential.env>.identity.json`: `{"schema_version": 1, "label", "account_id", "token_sha256" (of the current
+token content), "verified_at", "method", "evidence"}`. Missing, malformed, wrong-label or stale-token metadata
+is unverified. `supervisor.credential_identity(home, name, spec, observed=None)` never logs the token;
+`observe_identity(home, name, spec)` is the seam for a real CLI-derived observation (`{"account_id",
+"token_bound"}`) — its production default returns `None` until that adapter exists.
 
 Force the next turn without exhausting any account (this does not interrupt a turn already running):
 
