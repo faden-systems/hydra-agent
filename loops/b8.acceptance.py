@@ -123,7 +123,15 @@ def lifecycle():
             notices=[str(x).lower() for x in alerts[alert_count:]]
             assert len(notices)==1 and 'per-turn' in notices[0], notices
             assert json.loads((home/'engine').read_text())['mode']=='persistent'
+            # 1.1: configured and effective modes plus the startup-failure reason are exposed truthfully.
+            runtime=S.read_engine_runtime(folder)
+            assert runtime['configured'].get('mode')=='persistent' and runtime['effective'].get('mode')=='per-turn',runtime
+            assert 'start' in str(runtime.get('reason','')).lower(),('startup fallback reason missing',runtime)
+            rendered=S.status_text(folder).lower()
+            assert 'persistent' in rendered and 'per-turn' in rendered and str(runtime['reason']).strip().lower()[:60] in rendered,rendered
             assert call('startup-recovered','claude-l')[0]==0
+            runtime=S.read_engine_runtime(folder)
+            assert runtime['effective'].get('mode')=='persistent' and not runtime.get('reason'),('recovery must clear the transient fallback',runtime)
             recovered=[r for r in wire() if r['kind']=='start']
             assert len(recovered)==start_count+4
             assert '--input-format' in recovered[-1]['argv']
@@ -263,6 +271,69 @@ def queued_recovery(fault):
         finally:
             kill_fixture_tree(rows(),binary)
 
+def recovery_worker(folder, binary):
+    """A supervisor in its own process; the parent kills it after the fixture's side effect (8.1)."""
+    engines={name:{'bin':str(binary),'kind':'claude','cred':name+'.env'} for name in ('claude-r2d2','claude-l')}
+    sup=S.Supervisor(home=folder,engines=engines,config={'engine_fallback':{'claude_models':[]}},
+                     poster=lambda *a:{'ok':True,'ts':'1.0'},buildlog_poster=lambda *a:None,reactor=S.DryReactor(folder),
+                     engine_timeout=30,codex_home=str(Path(folder)/'codex'))
+    while not (Path(folder)/'stop-worker').exists():
+        sup.run_once();time.sleep(.02)
+
+def supervisor_death():
+    """8.1: the supervisor dies after the child performed its side effect but before failure handling;
+    a restart against the same home retires the orphan, never re-executes, reports the event truthfully
+    and still serves a fresh event."""
+    import multiprocessing
+    with tempfile.TemporaryDirectory(prefix='b8-supdeath-') as folder:
+        home=Path(folder);binary=home/'fake-claude'
+        shutil.copyfile(ROOT/'loops/b8.fake.py',binary);binary.chmod(0o755)
+        engines={name:{'bin':str(binary),'kind':'claude','cred':name+'.env'} for name in ('claude-r2d2','claude-l')}
+        (home/'credentials').mkdir()
+        for name,spec in engines.items():
+            token='dummy-'+name;cred=home/'credentials'/spec['cred']
+            cred.write_text('CLAUDE_CODE_OAUTH_TOKEN='+token+'\n');cred.chmod(0o600)
+            Path(str(cred)+'.identity.json').write_text(json.dumps({'schema_version':1,'label':name,
+                'account_id':'fixture-'+name,'token_sha256':hashlib.sha256(token.encode()).hexdigest(),
+                'verified_at':'2026-10-04T20:00:00Z','method':'private-window-and-usage-bar',
+                'evidence':'https://app.slack.com/archives/Cfixture/p123'}))
+        (home/'engine').write_text(json.dumps({'acc':'claude-r2d2','model':'claude-sonnet-5','mode':'persistent'}))
+        def rows():return S.read_jsonl(str(home/'wire.jsonl'))
+        def effects():return [r for r in rows() if r['kind']=='side_effect']
+        event=S.new_event('cli',{'text':'B8_QUEUED_HANG'},event_id='supdeath-hang')
+        S.append_event(folder,event)
+        ctx=multiprocessing.get_context('fork')
+        worker=ctx.Process(target=recovery_worker,args=(folder,binary),daemon=True);worker.start()
+        try:
+            deadline=time.monotonic()+15
+            while not effects() and time.monotonic()<deadline:time.sleep(.02)
+            assert len(effects())==1,'fixture never recorded its side effect'
+            os.kill(worker.pid,signal.SIGKILL);worker.join(5)
+            assert not worker.is_alive(),'supervisor worker survived SIGKILL'
+            hung=[r for r in rows() if r['kind']=='descendant'][-1]
+            assert present(hung['pid']),'fixture should still be hung when the supervisor dies'
+            # Restart against the same home: orphan retirement, no second execution, truthful status.
+            sup=S.Supervisor(home=folder,engines=engines,config={'engine_fallback':{'claude_models':[]}},
+                             poster=lambda *a:{'ok':True,'ts':'1.0'},buildlog_poster=lambda *a:None,reactor=S.DryReactor(folder),
+                             engine_timeout=.3,codex_home=str(home/'codex'))
+            for _ in range(3):sup.run_once()
+            tree_gone(rows(),'supervisor death orphan')
+            assert len(effects())==1,('restart re-executed the submitted event',effects())
+            assert event['id'] in S.handled_ids(folder),'event left pending after supervisor death; it would run again'
+            assert not any(r.get('success') for r in S.read_jsonl(str(home/'logs/attempts.jsonl'))),'orphaned event claimed success'
+            status=S.status_text(folder).lower()
+            assert 'running' not in status.split('persistent')[-1][:80] or S.persistent_status(folder)['state']!='running' or S.persistent_status(folder)['pid']!=hung['pid'],'dead supervisor child reported healthy'
+            fresh=S.new_event('cli',{'text':'B8_FRESH_AFTER_DEATH'},event_id='supdeath-fresh')
+            S.append_event(folder,fresh)
+            with patch.object(S.time,'time',return_value=time.time()+86400):
+                for _ in range(3):sup.run_once()
+            assert fresh['id'] in S.handled_ids(folder),'fresh event was not completed after supervisor death'
+            assert len(effects())==1
+        finally:
+            (home/'stop-worker').write_text('1')
+            if worker.is_alive():worker.kill();worker.join(5)
+            kill_fixture_tree(rows(),binary)
+
 def attach_worker(folder):
     sup=S.Supervisor(home=folder,poster=lambda *a:None,buildlog_poster=lambda *a:None,
                      reactor=S.DryReactor(folder),engine_timeout=8)
@@ -352,6 +423,7 @@ if __name__=='__main__':
         queued_recovery(sys.argv[2])
     else:
         for fault in ('CRASH','HANG'):queued_recovery(fault)
+        supervisor_death()
         for code in (0,17,None):separate_attach(code)
         lifecycle()
     print('b8 lifecycle contracts passed; rollover and real evidence are separate required exit gates')

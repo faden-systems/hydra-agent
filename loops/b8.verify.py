@@ -70,6 +70,22 @@ def preserve_regressions():
                 assert name in Path('loops',replacement).read_text(),f'runner does not name its replaced test: {name}'
         names=[node.name for node in after.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef))]
         assert len(names)==len(set(names)),f'duplicate definition overrides regression: {file}'
+        # 2.3: no new module-level skip/collection override may disable retained tests without touching them.
+        def overrides(tree):
+            found=set()
+            for node in tree.body:
+                if isinstance(node,(ast.Assign,ast.AnnAssign)):
+                    targets=node.targets if isinstance(node,ast.Assign) else [node.target]
+                    for target in targets:
+                        if isinstance(target,ast.Name) and target.id in ('pytestmark','collect_ignore','collect_ignore_glob','pytest_plugins'):found.add(target.id)
+                if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name.startswith('pytest_'):found.add(node.name)
+                for d in getattr(node,'decorator_list',[]):
+                    text=ast.dump(d)
+                    if "attr='skip'" in text or "attr='skipif'" in text or "attr='xfail'" in text:
+                        if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and node.name in baseline_tests:found.add('decorator:'+node.name)
+            return found
+        new=overrides(after)-overrides(before)
+        assert not new,f'new skip/collection override in {file}: {sorted(new)}'
         retained=[ast.dump(node,include_attributes=False) for node in after.body]
         for node in before.body:
             if isinstance(node,ast.FunctionDef) and node.name in exempt:
@@ -108,7 +124,25 @@ fence()
 preserve_regressions()
 inherited_contracts()
 run([sys.executable,'loops/b8.regressions.py',BASE],120)
-run([sys.executable,'-m','pytest','-q','tests/manager'],300)
+JUNIT='/tmp/b8-junit-'+str(os.getpid())+'.xml'
+run([sys.executable,'-m','pytest','-q','tests/manager','--junitxml',JUNIT],300)
+def baseline_tests_executed():
+    # 2.3: every retained baseline test actually ran; skips/xfails of baseline node ids are rejected.
+    import xml.etree.ElementTree as ET
+    retained=set()
+    for file in git('ls-tree','-r','--name-only',BASE,'tests/manager').decode().splitlines():
+        if not file.endswith('.py') or file.endswith('conftest.py'):continue
+        exempt=SUPERSEDED.get(file,{})
+        for node in ast.parse(git('show',BASE+':'+file).decode()).body:
+            if isinstance(node,ast.FunctionDef) and node.name.startswith('test_') and node.name not in exempt:retained.add(node.name)
+    seen={}
+    for case in ET.parse(JUNIT).getroot().iter('testcase'):
+        name=case.get('name','').split('[')[0]
+        seen.setdefault(name,[]).append([child.tag for child in case])
+    for name in sorted(retained):
+        assert name in seen,f'retained baseline test did not run: {name}'
+        assert not any(tag in ('skipped',) for tags in seen[name] for tag in tags),f'retained baseline test was skipped: {name}'
+baseline_tests_executed()
 for file in ('b8.identity.py','b8.mode.py','b8.acceptance.py','b8.rollover.py'):
     run([sys.executable,'loops/'+file],120)
 # The real gate runs only with explicit scratch evidence input, never production defaults.

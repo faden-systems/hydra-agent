@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Draft real capture orchestration. Explicit scratch inputs only; never defaults to production."""
-import argparse,hashlib,json,os,signal,subprocess,sys,tempfile,time,shutil
+import argparse,hashlib,json,os,runpy,signal,subprocess,sys,tempfile,time,shutil
 from unittest.mock import patch
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
@@ -28,8 +28,6 @@ def write_manifest(output,candidate,binary):
     manifest={str(p.relative_to(output)):digest(p) for p in sorted(output.rglob('*'))
               if p.is_file() and p.name!='manifest.json'}
     save(output/'manifest.json',manifest)
-def m_name(meta):return str(meta['wrapper_pid'])
-
 def wire_objects(wire):
     rows=[]
     for path in sorted(wire.glob('*.stdout')):
@@ -85,7 +83,18 @@ def capture_models(sup,home,engines,mode,mode_root):
             save(mode_root/'model-audit.json',{'aliases':aliases,'routing_config':routing_config,'retry_models':retries,'probes':records})
             assert rc==0,'real model audit failed; inspect retained wire output'
             successful_model(wire,requested_model=model)
-        finally:stop_recorded(wire)
+        finally:
+            orderly_shutdown(sup);stop_recorded(wire)
+
+FORCED=[]
+def orderly_shutdown(sup):
+    """B3: ask the candidate to end any persistent CLI process by closing its input and waiting for exit;
+    returns the candidate's report. Forced signals belong to stop_recorded and are recorded separately."""
+    if hasattr(sup,'shutdown_persistent'):
+        report=sup.shutdown_persistent()
+        assert isinstance(report,dict) and 'orderly' in report,'shutdown_persistent must report orderly/returncode'
+        return report
+    return None
 
 def stop_recorded(wire):
     # Start ticks prevent an old capture from targeting a reused PID. Child tracking
@@ -107,6 +116,10 @@ def stop_recorded(wire):
                 try:
                     (os.killpg if item[2] else os.kill)(item[0],sig)
                 except ProcessLookupError:pass
+    survivors=[item for item in owned if alive(item)]
+    for pid,start,group in survivors:
+        FORCED.append({'child_pid' if group else 'wrapper_pid':pid,'start':start,'wire':str(wire)})
+    if not survivors:return
     for sig in (signal.SIGTERM,signal.SIGKILL):
         stop(sig)
         deadline=time.monotonic()+3
@@ -186,6 +199,7 @@ def capture_auth(source_home, engines, mode, mode_root):
             assert len([w for w in writes if w['cause']=='fallback'])==1
         finally:
             observer.stop()
+            orderly_shutdown(sup)
             for wire in wires:stop_recorded(wire)
 
 def capture_credits(sup, home, engines, mode_root):
@@ -217,12 +231,15 @@ def capture_credits(sup, home, engines, mode_root):
             assert attempts[0]['model']=='claude-fable-5-1' and attempts[0]['classification']=='credits'
             assert attempts[0]['reason'].strip()
             assert attempts[1]['success'] and attempts[1]['model']==model==MODEL
-            assert sum(t.get('is_error') is False for t in terminal)==1,'missing successful retry terminal'
-            # A failed invocation is proven by an error terminal or a finalized nonzero exit with diagnostics.
-            exits=[json.loads(m.read_text()) for m in sorted(wire.glob('*.json'))]
-            nonzero=[m for m in exits if isinstance(m.get('returncode'),int) and m['returncode']!=0
-                     and (wire/(m_name(m)+'.stderr')).read_text().strip()]
-            assert sum(t.get('is_error') is True for t in terminal)+len(nonzero)==1,'exactly one proven Fable failure required'
+            # B2/B5: one proven failed process and one clean-exit success process, by the validator's own rule.
+            orderly_shutdown(sup)
+            live=runpy.run_path(str(ROOT/'loops/b8.live.py'))
+            processes=live['scan_wire'](wire)
+            failed=[p for p in processes if live['failure_proof'](p) is not None]
+            assert len(failed)==1,'exactly one proven Fable failure process required'
+            successes=[p for p in processes if p is not failed[0]]
+            assert len(successes)==1 and successes[0]['finalized'] and successes[0]['returncode']==0,'retry process must finish cleanly after orderly shutdown'
+            assert [r.get('is_error') for r in successes[0]['results']]==[False],'retry process lacks exactly one successful terminal'
             assert MODEL in observed and observed <= {MODEL,'claude-fable-5-1'}
             outcome='exhausted'
         save(mode_root/'credits.json',{'outcome':outcome,'observed_at':sup.now(),
@@ -266,6 +283,14 @@ def capture_switches(binary, sources, output, retry_config=None):
                'capture_harness_sha256':digest(Path(__file__)),
                'wire_harness_sha256':digest(ROOT/'loops/b8.capture-wire.py')}
     output.mkdir(mode=0o700,parents=False,exist_ok=False)
+    # 4.2: every scenario runs under an exit-owned scratch login environment; inherited auth never reaches a child.
+    scratch=Path(tempfile.mkdtemp(prefix='b8-capture-env-'))
+    for name in ('home','xdg','claude'):(scratch/name).mkdir(mode=0o700)
+    cleared=[k for k in list(os.environ) if k.startswith(('CLAUDE','ANTHROPIC'))]
+    for k in cleared:os.environ.pop(k,None)
+    os.environ.update(HOME=str(scratch/'home'),XDG_CONFIG_HOME=str(scratch/'xdg'),CLAUDE_CONFIG_DIR=str(scratch/'claude'))
+    candidate['isolation']={'scratch':['HOME','XDG_CONFIG_HOME','CLAUDE_CONFIG_DIR'],'inherited_auth_cleared':True,
+                            'cleared_variable_count':len(cleared)}
     save(output/'candidate.json',candidate)
     capture_identity_discovery(binary,sources,output)
     for mode in ('per-turn','persistent'):
@@ -315,7 +340,9 @@ def capture_switches(binary, sources, output, retry_config=None):
                 os.environ['B8_CAPTURE_WIRE_DIR']=str(mode_root/'claude-l')
                 capture_credits(sup,home,engines,mode_root)
             finally:
+                orderly_shutdown(sup)
                 for wire in wires:stop_recorded(wire)
+    save(output/'forced-cleanup.json',FORCED)
     assert candidate['candidate_sha']==git('rev-parse','HEAD')
     assert not git('status','--porcelain','--untracked-files=all'),'candidate changed during capture'
     write_manifest(output,candidate,binary)

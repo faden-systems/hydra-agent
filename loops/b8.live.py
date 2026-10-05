@@ -22,8 +22,16 @@ def pinned_binary(summary):
 def operator_attestation(root,summary,manifest,pin_path,pin_sha):
     """B4: an operator-written attestation outside the manifest binds the candidate, the pinned binary and the exact
     bundle (manifest and summary digests). A bundle without it, or with digests that do not match, is rejected."""
-    path=Path(os.environ.get('B8_LIVE_ATTESTATION') or root/'attestation.json').resolve()
+    location=os.environ.get('B8_LIVE_ATTESTATION') or ''
+    assert location.startswith('/'),'B8_LIVE_ATTESTATION must name the operator-controlled attestation file (never a bundle default)'
+    path=Path(location).resolve()
     assert path.is_file(),'operator attestation missing'
+    try:
+        path.relative_to(root)
+    except ValueError:pass
+    else:raise AssertionError('attestation must live outside the implementer bundle')
+    mode=path.stat().st_mode;parent_mode=path.parent.stat().st_mode
+    assert not (mode&0o022) and not (parent_mode&0o022),'attestation file and directory must not be writable by group or others'
     manifest_bytes=(root/'manifest.json').read_bytes()
     try:rel=str(path.relative_to(root))
     except ValueError:rel=None
@@ -40,16 +48,67 @@ def operator_attestation(root,summary,manifest,pin_path,pin_sha):
     assert att['evidence'].startswith('https://'),'attestation needs a durable evidence link'
     return att
 
-IDENTITY_MARKERS=('account','email','organization','org ','org:','plan','logged in as','user:','workspace')
+IDENTIFIER_KEYS=('email','account','account_id','account id','organization','organization_id','org','user','user_id','login','logged in as')
+ABSENT_VALUES={'','-','none','null','n/a','not logged in','unknown','(none)','logged out'}
+LOGGED_IN_RE=re.compile(r'^\s*(?P<key>logged in as)\s+(?P<value>\S.*?)\s*$',re.I)
+IDENTIFIER_RE=re.compile(r'^\s*(?P<key>[a-z][a-z _-]{1,30}?)\s*[:=]\s*(?P<value>.*?)\s*$',re.I)
 
-def account_lines(text):
-    """Lines of retained CLI output that could identify an account; redacted secrets never count."""
-    out=set()
+def identifier_values(text):
+    """B1: documented account-identifier fields (key: value) in retained CLI output. Plan, tier or model lines
+    never identify an account; empty, null or logged-out values are absence; redacted secrets never count."""
+    found={}
     for line in text.splitlines():
-        low=line.strip().lower()
-        if low and '[redacted]' not in low and any(m in low for m in IDENTITY_MARKERS):
-            out.add(low)
-    return out
+        m=IDENTIFIER_RE.match(line) or LOGGED_IN_RE.match(line)
+        if not m:continue
+        key=m.group('key').strip().lower();value=m.group('value').strip()
+        if key not in IDENTIFIER_KEYS or '[redacted]' in value.lower():continue
+        if value.strip('"\'').lower() in ABSENT_VALUES:continue
+        found[key]=value
+    return found
+
+def scan_wire(directory):
+    """One record per recorded CLI process in a recorder directory (no manifest): finalized exit code,
+    terminal results and retained diagnostics. Shared by the validator and the capture harness (B2)."""
+    directory=Path(directory);records=[]
+    for meta_path in sorted(directory.glob('*.json')):
+        meta=json.loads(meta_path.read_text());stem=meta_path.with_suffix('')
+        stdout=Path(str(stem)+'.stdout').read_text() if Path(str(stem)+'.stdout').exists() else ''
+        stderr=Path(str(stem)+'.stderr').read_text() if Path(str(stem)+'.stderr').exists() else ''
+        results=[];plain=[]
+        for line in stdout.splitlines():
+            try:row=json.loads(line)
+            except json.JSONDecodeError:
+                if line.strip():plain.append(line.strip())
+                continue
+            if isinstance(row,dict) and row.get('type')=='result':results.append(row)
+        rc=meta.get('returncode')
+        records.append({'name':str(stem),'pid':meta.get('child_pid'),'returncode':rc,
+                        'finalized':isinstance(rc,int) and not isinstance(rc,bool) and bool(meta.get('ended_at')),
+                        'results':results,'stderr':stderr.strip(),'stdout_text':'\n'.join(plain)})
+    return records
+
+def terminal_error_text(terminal):
+    err=terminal.get('error')
+    if isinstance(err,dict) and err.get('message'):return str(err['message'])
+    if isinstance(err,str) and err.strip():return err
+    result=terminal.get('result')
+    return result if isinstance(result,str) and result.strip() else 'the engine reported is_error=true'
+
+def failure_proof(record):
+    """B5: a failed invocation is proven by exactly one error terminal (and no success terminal in that
+    process), or by a finalized nonzero exit with retained stderr or plain stdout and no terminal at all.
+    Returns the diagnostic text, or None when the process did not fail. One process counts once (B2)."""
+    errors=[r for r in record['results'] if r.get('is_error') is True]
+    if errors:
+        assert len(errors)==1,'several error terminals in one process'
+        assert not any(r.get('is_error') is False for r in record['results']),'error and success terminals in one process'
+        return terminal_error_text(errors[0])
+    if record['finalized'] and record['returncode']!=0:
+        assert not record['results'],'nonzero exit after a terminal result is ambiguous'
+        diagnostic=record['stderr'] or record['stdout_text']
+        assert diagnostic,'nonzero exit without retained diagnostics'
+        return diagnostic
+    return None
 
 def identity_discovery(root, manifest, pin_sha):
     """PR45 1.1: the discovery experiment is retained and the conclusion re-derived from the outputs."""
@@ -70,10 +129,15 @@ def identity_discovery(root, manifest, pin_sha):
         stem=metas[0][:-5]
         assert stem+'.stdout' in manifest and stem+'.stderr' in manifest
         outputs[(r['credential'],r['probe'])]=(root/(stem+'.stdout')).read_text()+'\n'+(root/(stem+'.stderr')).read_text()
-    control=account_lines(outputs[('none','auth-status')])
-    assert not control,('no-credential control shows an account: cached login leaked into the isolation',sorted(control)[:3])
-    a=account_lines(outputs[('claude-r2d2','auth-status')]);b=account_lines(outputs[('claude-l','auth-status')])
-    conclusion='token_bound' if a and b and a!=b else 'not_reported'
+    control=identifier_values(outputs[('none','auth-status')])
+    assert not control,('no-credential control shows an account identifier: cached login leaked into the isolation',sorted(control))
+    rc={r['credential']:r.get('returncode') for r in records if r['probe']=='auth-status'}
+    a=identifier_values(outputs[('claude-r2d2','auth-status')]);b=identifier_values(outputs[('claude-l','auth-status')])
+    # token_bound only when both credential probes succeeded and report nonempty, distinct identifier values
+    # for the same documented field; differing plan/tier lines or broad markers never count.
+    shared=[k for k in a if k in b]
+    distinct=any(a[k]!=b[k] for k in shared)
+    conclusion='token_bound' if rc.get('claude-r2d2')==0 and rc.get('claude-l')==0 and shared and distinct else 'not_reported'
     return conclusion
 
 def validate(root, require_attestation=True):
@@ -101,6 +165,15 @@ def validate(root, require_attestation=True):
     if require_attestation:
         operator_attestation(root,summary,manifest,pin_path,pin_sha)
     conclusion=identity_discovery(root,manifest,pin_sha)
+    # 4.2: the whole capture ran under an exit-owned scratch environment, never the operator's login state.
+    isolation=summary.get('isolation') or {}
+    assert set(isolation.get('scratch') or [])>={'HOME','XDG_CONFIG_HOME','CLAUDE_CONFIG_DIR'},'capture did not isolate HOME/XDG/CLAUDE_CONFIG_DIR'
+    assert isolation.get('inherited_auth_cleared') is True,'capture did not clear inherited authentication variables'
+    # B3: processes the harness had to kill after an orderly shutdown failed; a successful scenario process may never be among them.
+    forced=set()
+    if 'forced-cleanup.json' in manifest:
+        for row in json.loads((root/'forced-cleanup.json').read_text()):
+            forced.add(row.get('child_pid'))
     assert set(summary['modes'])=={'per-turn','persistent'}
     for mode,record in summary['modes'].items():
         # Each item references independently retained real supervisor output, not boolean claims.
@@ -131,12 +204,6 @@ def validate(root, require_attestation=True):
                 assert ('--input-format' in argv)==(mode=='persistent')
                 if mode=='persistent':assert argv[argv.index('--input-format')+1]=='stream-json'
                 assert name[:-5]+'.stdout' in manifest and name[:-5]+'.stderr' in manifest
-        def terminal_error_text(terminal):
-            err=terminal.get('error')
-            if isinstance(err,dict) and err.get('message'):return str(err['message'])
-            if isinstance(err,str) and err.strip():return err
-            result=terminal.get('result')
-            return result if isinstance(result,str) and result.strip() else 'the engine reported is_error=true'
         def invocations(directory):
             """One record per recorded CLI process: finalized exit code, terminal results, retained diagnostics."""
             prefix=f'{mode}/{directory}/'
@@ -152,24 +219,10 @@ def validate(root, require_attestation=True):
                         if line.strip():plain.append(line.strip())
                         continue
                     if isinstance(row,dict) and row.get('type')=='result':results.append(row)
-                records.append({'name':stem,'returncode':meta.get('returncode'),
+                records.append({'name':stem,'pid':meta.get('child_pid'),'returncode':meta.get('returncode'),
                                 'finalized':isinstance(meta.get('returncode'),int) and not isinstance(meta.get('returncode'),bool) and bool(meta.get('ended_at')),
                                 'results':results,'stderr':stderr.strip(),'stdout_text':'\n'.join(plain)})
             return records
-        def failure_proof(record):
-            """B5: a failed invocation is proven by an error terminal, or by a finalized nonzero process exit
-            with retained diagnostics. Returns the diagnostic text, or None when the process did not fail."""
-            errors=[r for r in record['results'] if r.get('is_error') is True]
-            if errors:
-                assert len(errors)==1,'several error terminals in one process'
-                assert not any(r.get('is_error') is False for r in record['results']),'error and success terminals in one process'
-                return terminal_error_text(errors[0])
-            if record['finalized'] and record['returncode']!=0:
-                assert not record['results'],'nonzero exit after a terminal result is ambiguous'
-                diagnostic=record['stderr'] or record['stdout_text']
-                assert diagnostic,'nonzero exit without retained diagnostics'
-                return diagnostic
-            return None
         def one_failure_then_success(directory, attempt):
             """Exactly one proven failed process, exactly one successful terminal in a different finalized
             process, and the recorded attempt reason reconciled with the retained CLI diagnostic."""
@@ -180,6 +233,7 @@ def validate(root, require_attestation=True):
             successes=[r for r in records if r is not failed[0][0]]
             for r in successes:
                 assert r['finalized'] and r['returncode']==0,'successful fallback process did not finish cleanly'
+                assert r['pid'] not in forced,'successful process was terminated by forced cleanup, not an orderly shutdown (B3)'
                 assert [x.get('is_error') for x in r['results']]==[False],'fallback process lacks exactly one successful terminal'
             assert len(successes)==1,f'{directory}: expected one successful fallback process, found {len(successes)}'
             reason=(attempt.get('reason') or '').strip();diagnostic=failed[0][1].strip()
