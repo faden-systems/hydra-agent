@@ -243,8 +243,12 @@ def capture_credits(sup, home, engines, mode_root):
         assert winner=='claude-l' and all(a['engine']=='claude-l' for a in attempts)
         rows=wire_objects(wire)
         terminal=[r for _,r in rows if r.get('type')=='result']
+        # The CLI reports a failed request as a synthetic assistant row (model `<synthetic>`, the same row shape as a
+        # safeguard refusal); it is not a model the candidate selected, so it is left out of the observed set. The
+        # failed attempt is still proven below by the attempts log (classification credits) and failure_proof.
         observed={r['message']['model'] for _,r in rows if r.get('type')=='assistant'
-                  and isinstance(r.get('message'),dict) and r['message'].get('model')}
+                  and isinstance(r.get('message'),dict) and r['message'].get('model')
+                  and r['message'].get('model')!='<synthetic>'}
         if len(attempts)==1:
             assert model=='claude-fable-5-1' and attempts[0]['success']
             assert len(terminal)==1 and terminal[0].get('is_error') is False
