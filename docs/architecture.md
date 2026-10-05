@@ -416,6 +416,12 @@ Each is a loop spec with an exit-owned harness, reviewed before merge. None chan
 3. Whether the manager's Codex fallback is the CLI on the VM only, or also Codex cloud tasks when the VM is down.
 4. Timing of the Codex adapter (R1) relative to the x3 counting run.
 
+### Decided (log)
+
+| Date | Decision | Where |
+|---|---|---|
+| 2026-10-05 | founder: `Supervisor.invoke` is the manager's single vendor boundary; the persistent Claude lifecycle and message framing stay behind it; bridge and `hydra` CLI commands are limited to engine selection and session-ownership coordination; why: one seam keeps every vendor mechanic (process, framing, compaction, auth, diagnostics) out of the bridge and the CLI, so engines stay swappable and persistent mode (b8) is an implementation behind the same call; supersedes none | b8 spec `loops/b8.md` (F1), thread 1791146805.942509, decision 1791173879.179799 |
+
 ## Appendix A. Production hardening, deferred (gap check of 2026-09-19)
 
 Founder's decision: none of this is a priority before the product is usable and in beta. It is kept as the record
