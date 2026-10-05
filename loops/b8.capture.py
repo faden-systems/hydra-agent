@@ -63,29 +63,52 @@ def discover_retries(config):
         assert seen and seen[0]=='claude-fable-5-1'
         return seen[1:]
 
+PROBE_PROMPT='Please reply with the single word B8_MODEL_OK and nothing else.'
+
+def synthetic_refusal(wire):
+    """A vendor-side refusal: the CLI answers with a synthetic assistant row (model `<synthetic>`) or an error
+    terminal that says the request was flagged by a safeguard. Not a model-availability fact; retried once in a
+    new session (founder 2026-10-05, thread 1791229946.497799)."""
+    for _,row in wire_objects(wire):
+        message=row.get('message') if isinstance(row.get('message'),dict) else {}
+        if row.get('type')=='assistant' and message.get('model')=='<synthetic>':return True
+        if row.get('type')=='result' and row.get('is_error') and 'safeguards flagged' in str(row.get('result') or '').lower():return True
+    return False
+
 def capture_models(sup,home,engines,mode,mode_root):
     aliases=json.loads((ROOT/'manager/models.json').read_text())['claude']['aliases']
     assert aliases.get('opus5')=='claude-opus-5' and aliases.get('opus5.5')=='claude-opus-5-5','required alias mapping changed (2.2)'
     routing_config={'engine_fallback':sup.config.get('engine_fallback',{})}
     retries=discover_retries(routing_config)
-    models=list(dict.fromkeys([aliases['opus5'],aliases['opus5.5'],*retries]))
+    # Opus 5.5 before Opus 5 (founder 2026-10-04 1791148777.512759: the L non-Fable probe is claude-opus-5-5).
+    models=list(dict.fromkeys([aliases['opus5.5'],aliases['opus5'],*retries]))
     records=[]
     for index,model in enumerate(models):
-        wire=mode_root/f'model-audit-{index}';wire.mkdir(mode=0o700)
-        os.environ['B8_CAPTURE_WIRE_DIR']=str(wire)
-        save(home/'engine',{'acc':'claude-l','model':model,'mode':mode})
-        try:
-            rc,out,err,usage=sup.invoke('claude-l',engines['claude-l'],
-                                      'Reply only B8_MODEL_OK. Do not use tools.',model=model)
-            reported=sorted({r['message']['model'] for _,r in wire_objects(wire)
-                if r.get('type')=='assistant' and isinstance(r.get('message'),dict) and r['message'].get('model')})
-            records.append({'requested_model':model,'reported_models':reported,'returncode':rc,
-                            'wire':wire.name,'usage':usage})
-            save(mode_root/'model-audit.json',{'aliases':aliases,'routing_config':routing_config,'retry_models':retries,'probes':records})
-            assert rc==0,'real model audit failed; inspect retained wire output'
-            successful_model(wire,requested_model=model)
-        finally:
-            orderly_shutdown(sup);stop_recorded(wire)
+        attempts=[]
+        for attempt in (0,1):
+            wire=mode_root/(f'model-audit-{index}' if attempt==0 else f'model-audit-{index}-retry');wire.mkdir(mode=0o700)
+            os.environ['B8_CAPTURE_WIRE_DIR']=str(wire)
+            # Each probe starts a fresh session: with an empty session-id file invoke() runs `--session-id <new uuid>`
+            # instead of resuming the scratch conversation filled by the earlier probes (attempt 4: a resumed session
+            # was refused by a safeguard classifier, not by the model).
+            S.write_text(home/'session-id','')
+            save(home/'engine',{'acc':'claude-l','model':model,'mode':mode})
+            try:
+                rc,out,err,usage=sup.invoke('claude-l',engines['claude-l'],PROBE_PROMPT,model=model)
+                reported=sorted({r['message']['model'] for _,r in wire_objects(wire)
+                    if r.get('type')=='assistant' and isinstance(r.get('message'),dict) and r['message'].get('model')})
+                refused=bool(rc) and synthetic_refusal(wire)
+                attempts.append({'wire':wire.name,'returncode':rc,'reported_models':reported,'usage':usage,
+                                 'synthetic_refusal':refused})
+            finally:
+                orderly_shutdown(sup);stop_recorded(wire)
+            if rc==0 or not refused:break
+        last=attempts[-1]
+        records.append({'requested_model':model,'reported_models':last['reported_models'],'returncode':last['returncode'],
+                        'wire':last['wire'],'usage':last['usage'],'attempts':attempts})
+        save(mode_root/'model-audit.json',{'aliases':aliases,'routing_config':routing_config,'retry_models':retries,'probes':records})
+        assert last['returncode']==0,'real model audit failed; inspect retained wire output'
+        successful_model(mode_root/last['wire'],requested_model=model)
 
 FORCED=[]
 def orderly_shutdown(sup):
