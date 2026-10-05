@@ -29,6 +29,7 @@ def contracts():
         meta.write_text(json.dumps(doc))
         result=identity();check(result,True,True)
         assert result['account_id']=='fixture-L' and result['verified_at']==doc['verified_at']
+        assert result.get('source')=='manual-sidecar' and result.get('method')==doc['method'],'identity must report its source and method (PR45 1.1)'
         for key in ('verified_at','method','evidence','token_sha256','account_id'):
             broken=dict(doc);broken.pop(key);meta.write_text(json.dumps(broken))
             check(identity(),False,False)

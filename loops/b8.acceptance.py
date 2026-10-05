@@ -1,11 +1,38 @@
 #!/usr/bin/env python3
 """Exit-owned b8 integration contracts."""
-import datetime, hashlib, json, os, runpy, shutil, signal, sys, tempfile, threading, time
+import subprocess, datetime, hashlib, json, os, runpy, shutil, signal, sys, tempfile, threading, time
 from unittest.mock import patch
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'manager'))
 import supervisor as S
+
+def present(pid):
+    """True while /proc still lists the pid in any state, including an unreaped zombie."""
+    return (Path('/proc')/str(pid)).exists()
+
+def tree_gone(wire_rows, label, settle_s=0.5):
+    """PR45 2.5: after a hang, the hung process must be reaped (no /proc entry, not a zombie) and its
+    TERM-resistant descendant must be gone too, BEFORE the next request starts; cleanup never conceals a leak."""
+    descendants=[r for r in wire_rows if r['kind']=='descendant']
+    assert descendants, label+': fixture did not record a descendant'
+    hung=descendants[-1]
+    assert not present(hung['pid']), label+': hung process still present (killed but not reaped, or alive)'
+    deadline=time.monotonic()+settle_s
+    while present(hung['child']) and time.monotonic()<deadline:time.sleep(.01)
+    assert not present(hung['child']), label+': TERM-resistant descendant leaked past recovery'
+    return hung
+
+def kill_fixture_tree(rows, binary):
+    """Fixture-only cleanup, never a production PID: the fake CLI processes and their recorded descendants."""
+    for row in rows:
+        pids=[row['pid']] if row['kind']=='start' else [row['child']] if row['kind']=='descendant' else []
+        for pid in pids:
+            try:
+                cmdline=(Path('/proc')/str(pid)/'cmdline').read_bytes().split(b'\0')
+                if str(binary).encode() in cmdline or b'signal.SIG_IGN' in b' '.join(cmdline):
+                    os.kill(pid,signal.SIGKILL)
+            except (ProcessLookupError,FileNotFoundError):pass
 
 def lifecycle():
     with tempfile.TemporaryDirectory(prefix='b8-offline-') as folder:
@@ -63,7 +90,10 @@ def lifecycle():
             assert call('after-crash','claude-l')[0]==0
             begin=time.monotonic();assert call('HANG','claude-l')[0]!=0
             assert time.monotonic()-begin<4, 'hang cleanup exceeded timeout plus grace'
+            hung=tree_gone(wire(),'lifecycle hang')
             assert call('after-hang','claude-l')[0]==0
+            restarted=[r for r in wire() if r['kind']=='start'][-1]
+            assert restarted['pid']!=hung['pid'],'hang recovery must start a fresh process'
             # Model changes and explicit rollback also close the previous writer.
             before=[r for r in wire() if r['kind']=='start']
             assert call('model-switch','claude-l','claude-fable-5-1')[0]==0
@@ -144,69 +174,6 @@ def lifecycle():
             sup.run_once()
             assert call('next-day','claude-l')[0]==0
             assert len([r for r in wire() if r['kind']=='start'])==restart_starts+1
-            # Execute the production attach command with a real interactive child.
-            # Only configuration lookup and the external message sink are replaced.
-            cli=runpy.run_path(str(ROOT/'manager/hydra'),run_name='b8_attach_cli')
-            for exit_code in (0,17):
-                previous=[r for r in wire() if r['kind']=='start'][-1]['pid']
-                entered_before=len([r for r in wire() if r['kind']=='interactive_enter'])
-                result=[];busy_result=[];busy=None
-                if exit_code==0:
-                    sup.engine_timeout=5
-                    def busy_turn():
-                        try:
-                            with S.acquire_writer(folder,'supervisor'):
-                                busy_result.append(call('WAIT_FOR_ATTACH','claude-l'))
-                        except BaseException as exc:busy_result.append(exc)
-                    busy=threading.Thread(target=busy_turn,daemon=True);busy.start()
-                    deadline=time.monotonic()+3
-                    while not any(r.get('text')=='WAIT_FOR_ATTACH' for r in wire()):
-                        assert time.monotonic()<deadline and busy.is_alive(),busy_result
-                        time.sleep(.01)
-                def attach():
-                    try:result.append(cli['cmd_attach'](folder,[]))
-                    except BaseException as exc:result.append(exc)
-                with patch.object(S,'default_engines',return_value=engines), \
-                     patch.object(S,'load_config',return_value=dict(sup.config)), \
-                     patch.object(S,'default_poster',return_value=post):
-                    worker=threading.Thread(target=attach,daemon=True);worker.start()
-                    if busy is not None:
-                        try:
-                            time.sleep(.1)
-                            assert worker.is_alive(),'attach refused instead of waiting for current turn'
-                            assert len([r for r in wire() if r['kind']=='interactive_enter'])==entered_before
-                            os.kill(previous,0)
-                        finally:
-                            (home/'turn-release').write_text('release')
-                            busy.join(timeout=5)
-                        assert not busy.is_alive() and len(busy_result)==1,busy_result
-                        assert isinstance(busy_result[0],tuple) and busy_result[0][0]==0,busy_result
-                    deadline=time.monotonic()+5
-                    while len([r for r in wire() if r['kind']=='interactive_enter'])==entered_before:
-                        assert worker.is_alive(),result
-                        assert time.monotonic()<deadline,'attach never acquired session'
-                        sup.run_once();time.sleep(.01)
-                    try:
-                        try:os.kill(previous,0)
-                        except ProcessLookupError:pass
-                        else:raise AssertionError('background Claude still alive during attach')
-                        assert S.persistent_status(folder)['state']=='parked'
-                        assert 'parked' in S.status_text(folder)
-                        entered=[r for r in wire() if r['kind']=='interactive_enter'][-1]
-                        assert entered['sid']==sid
-                        try:
-                            with S.acquire_writer(folder,'second-writer'):
-                                raise AssertionError('attach did not hold exclusive writer')
-                        except S.WriterHeld:pass
-                        sup.run_once()
-                        assert len([r for r in wire() if r['kind']=='interactive_enter'])==entered_before+1
-                    finally:
-                        (home/'attach-release').write_text(str(exit_code))
-                        worker.join(timeout=5)
-                    assert not worker.is_alive() and result==[exit_code],result
-                sup.run_once()
-                assert call('after-attach-'+str(exit_code),'claude-l')[0]==0
-                assert [r for r in wire() if r['kind']=='start'][-1]['sid']==sid
             # Old token/byte pressure must no longer schedule automatic rollover.
             sup.schedule_compaction(1000000)
             assert sup.compaction_due()[0] is False, 'ordinary usage scheduled rollover'
@@ -239,16 +206,152 @@ def lifecycle():
             assert len([r for r in rows if r.get('text')=='CRASH'])==1
             assert len([r for r in rows if r.get('text')=='HANG'])==1
             assert any(r['kind']=='interrupt' for r in rows)
+            leaked=[r['child'] for r in rows if r['kind']=='descendant' and present(r['child'])]
+            assert not leaked,('descendants alive at the end of the lifecycle; cleanup must not conceal them',leaked)
         finally:
-            # Fixture-only cleanup, never a production PID.
-            for row in wire():
-                if row['kind']=='start':
+            kill_fixture_tree(wire(),binary)
+
+def queued_recovery(fault):
+    """No re-execution after a child has accepted an event and performed a side effect."""
+    with tempfile.TemporaryDirectory(prefix='b8-queued-') as folder:
+        home=Path(folder); binary=home/'fake-claude'
+        shutil.copyfile(ROOT/'loops/b8.fake.py',binary);binary.chmod(0o755)
+        engines={name:{'bin':str(binary),'kind':'claude','cred':name+'.env'}
+                 for name in ('claude-r2d2','claude-l')}
+        (home/'credentials').mkdir()
+        for name,spec in engines.items():
+            token='dummy-'+name;cred=home/'credentials'/spec['cred']
+            cred.write_text('CLAUDE_CODE_OAUTH_TOKEN='+token+'\n');cred.chmod(0o600)
+            Path(str(cred)+'.identity.json').write_text(json.dumps({'schema_version':1,'label':name,
+                'account_id':'fixture-'+name,'token_sha256':hashlib.sha256(token.encode()).hexdigest(),
+                'verified_at':'2026-10-04T20:00:00Z','method':'private-window-and-usage-bar',
+                'evidence':'https://app.slack.com/archives/Cfixture/p123'}))
+        (home/'engine').write_text(json.dumps({'acc':'claude-r2d2','model':'claude-sonnet-5','mode':'persistent'}))
+        alerts=[]
+        def post(*args):
+            alerts.append(args[-1]);return {'ok':True,'ts':'123.456'}
+        def supervisor():
+            return S.Supervisor(home=folder,engines=engines,config={'engine_fallback':{'claude_models':[]}},
+                poster=post,buildlog_poster=post,reactor=S.DryReactor(folder),engine_timeout=.3,
+                codex_home=str(home/'codex'))
+        def rows():return S.read_jsonl(str(home/'wire.jsonl'))
+        def effects():return [r for r in rows() if r['kind']=='side_effect']
+        event=S.new_event('cli',{'text':'B8_QUEUED_'+fault},event_id='fault-'+fault)
+        S.append_event(folder,event)
+        try:
+            sup=supervisor();sup.run_once()
+            assert len(effects())==1,('inline routing replayed submitted event',fault,effects())
+            if fault=='HANG':tree_gone(rows(),'queued hang')
+            assert not any(r.get('success') for r in S.read_jsonl(str(home/'logs/attempts.jsonl'))), 'failed event claimed success'
+            # Advance beyond backoff without modifying queue or retry records. Reconstruction
+            # discards in-memory guards; durable event disposition must prevent another execution.
+            future=time.time()+86400
+            with patch.object(S.time,'time',return_value=future):
+                for _ in range(2):sup.run_once()
+                sup=supervisor()
+                for _ in range(2):sup.run_once()
+            assert len(effects())==1,('backoff/restart replayed submitted event',fault,effects())
+            # A new event is still serviceable; quarantining an uncertain result must not
+            # disable all future work or batch the failed event into this request.
+            fresh=S.new_event('cli',{'text':'B8_FRESH_EVENT'},event_id='fresh-'+fault)
+            S.append_event(folder,fresh)
+            with patch.object(S.time,'time',return_value=future+86400):
+                for _ in range(3):sup.run_once()
+            assert len(effects())==1,('fresh event replayed failed event',fault,effects())
+            assert fresh['id'] in S.handled_ids(folder),'fresh event was not completed'
+            assert any('B8_FRESH_EVENT' in r.get('text','') for r in rows() if r['kind']=='request')
+        finally:
+            kill_fixture_tree(rows(),binary)
+
+def attach_worker(folder):
+    sup=S.Supervisor(home=folder,poster=lambda *a:None,buildlog_poster=lambda *a:None,
+                     reactor=S.DryReactor(folder),engine_timeout=8)
+    while not (Path(folder)/'stop-worker').exists():
+        sup.run_once();time.sleep(.02)
+
+def separate_attach(exit_code=None):
+    with tempfile.TemporaryDirectory(prefix='b8-attach-') as folder:
+        home=Path(folder);binary=home/'fake-claude'
+        shutil.copyfile(ROOT/'loops/b8.fake.py',binary);binary.chmod(0o755)
+        (home/'credentials').mkdir();cred=home/'credentials/fixture.env'
+        token='dummy-attach';cred.write_text('CLAUDE_CODE_OAUTH_TOKEN='+token+'\n')
+        Path(str(cred)+'.identity.json').write_text(json.dumps({'schema_version':1,'label':'claude-r2d2',
+            'account_id':'fixture-r2d2','token_sha256':hashlib.sha256(token.encode()).hexdigest(),
+            'verified_at':'2026-10-04T20:00:00Z','method':'private-window-and-usage-bar',
+            'evidence':'https://app.slack.com/archives/Cfixture/p123'}))
+        (home/'config.json').write_text(json.dumps({'engines':{'claude-r2d2':{'bin':str(binary),'kind':'claude','cred':'fixture.env'}},
+             'engine_fallback':{'claude_models':[]},'codex_home':str(home/'codex')}))
+        (home/'engine').write_text(json.dumps({'acc':'claude-r2d2','model':'claude-sonnet-5','mode':'persistent'}))
+        env={'PATH':os.environ['PATH'],'HOME':folder,'HYDRA_HOME':folder,'PYTHONPATH':str(ROOT/'manager')}
+        processes=[]
+        def launch(argv):
+            p=subprocess.Popen(argv,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL,start_new_session=True)
+            processes.append(p);return p
+        def rows():return S.read_jsonl(str(home/'wire.jsonl'))
+        def wait_for(test,label):
+            deadline=time.monotonic()+6
+            while not test():
+                assert time.monotonic()<deadline,label
+                time.sleep(.02)
+        def alive(pid):
+            try:return (Path('/proc')/str(pid)/'stat').read_text().split(') ')[1].split()[0]!='Z'
+            except FileNotFoundError:return False
+        def enqueue(text,eid):S.append_event(folder,S.new_event('cli',{'text':text},event_id=eid))
+        worker=launch([sys.executable,__file__,'--attach-worker',folder])
+        try:
+            enqueue('WAIT_FOR_ATTACH','busy')
+            wait_for(lambda:any('WAIT_FOR_ATTACH' in r.get('text','') for r in rows()),'busy request never started')
+            old=[r for r in rows() if r['kind']=='start'][-1]
+            attached=launch([sys.executable,str(ROOT/'manager/hydra'),'attach'])
+            time.sleep(.2)
+            assert attached.poll() is None,'attach refused busy handoff'
+            assert not any(r['kind']=='interactive_enter' for r in rows()),'attach overlapped busy turn'
+            (home/'turn-release').write_text('release')
+            wait_for(lambda:any(r['kind']=='interactive_enter' for r in rows()),'attach did not enter')
+            interactive=[r for r in rows() if r['kind']=='interactive_enter'][-1]
+            assert interactive['sid']==old['sid']
+            assert not alive(old['pid']),'background writer survived attach'
+            # A distinct process must fail to acquire the held writer lock.
+            competing=launch([sys.executable,'-c',
+                'import supervisor as S,sys\ntry:\n with S.acquire_writer(sys.argv[1],"competitor"): sys.exit(9)\nexcept S.WriterHeld: sys.exit(0)',folder])
+            assert competing.wait(timeout=3)==0,'competing writer acquired attach lock'
+            enqueue('AFTER_ATTACH','fresh')
+            time.sleep(.2)
+            assert not any('AFTER_ATTACH' in r.get('text','') for r in rows()),'supervisor wrote during attach'
+            # Kill only CLI parent, leaving its interactive child alive at that instant.
+            assert alive(interactive['pid'])
+            if exit_code is None:
+                attached.kill();attached.wait(timeout=3)
+            else:
+                (home/'attach-release').write_text(str(exit_code))
+                assert attached.wait(timeout=3)==exit_code,'attach exit status changed'
+            wait_for(lambda:'fresh' in S.handled_ids(folder),'orphan attach prevented recovery')
+            assert not alive(interactive['pid']),'orphan interactive writer survived recovery'
+            starts=[r for r in rows() if r['kind']=='start']
+            assert starts[-1]['sid']==old['sid'],'attach recovery changed conversation'
+            assert worker.poll() is None,'supervisor died during attach recovery'
+        finally:
+            for p in processes:
+                try:os.killpg(p.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                p.wait(timeout=3)
+            for r in rows():
+                if r['kind']=='start':
                     try:
-                        argv=Path('/proc')/str(row['pid'])/'cmdline'
-                        if str(binary).encode() in argv.read_bytes().split(b'\0'):
-                            os.kill(row['pid'],signal.SIGKILL)
-                    except (ProcessLookupError,FileNotFoundError):pass
+                        if str(binary).encode() in (Path('/proc')/str(r['pid'])/'cmdline').read_bytes().split(b'\0'):
+                            os.kill(r['pid'],signal.SIGKILL)
+                    except (FileNotFoundError,ProcessLookupError):pass
 
 if __name__=='__main__':
-    lifecycle()
+    if len(sys.argv)>1 and sys.argv[1]=='--attach-worker':
+        attach_worker(sys.argv[2]);sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=='--attach-only':
+        separate_attach()
+    elif len(sys.argv)>1 and sys.argv[1]=='--queued-only':
+        queued_recovery(sys.argv[2])
+    else:
+        for fault in ('CRASH','HANG'):queued_recovery(fault)
+        for code in (0,17,None):separate_attach(code)
+        lifecycle()
     print('b8 lifecycle contracts passed; rollover and real evidence are separate required exit gates')

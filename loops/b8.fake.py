@@ -40,8 +40,24 @@ if '-p' not in sys.argv:
     record('interactive_exit', code=code)
     sys.exit(code)
 emit(dict(type='system', subtype='init', session_id=sid))
+def hang_with_descendant():
+    """A hang that leaks a TERM-resistant tool child (PR45 2.5): reaping must cover the process tree."""
+    import subprocess
+    child=subprocess.Popen([sys.executable,'-c',
+        'import signal,time;[signal.signal(s,signal.SIG_IGN) for s in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP)];time.sleep(120)'])
+    record('descendant', child=child.pid)
+    signal.signal(signal.SIGINT, lambda *_: record('interrupt'))
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True: time.sleep(.05)
+
 def serve(text):
     record('request', text=text)
+    # Queued-event fault marker survives the real supervisor prompt wrapper.
+    for fault_kind in ('CRASH', 'HANG'):
+        if 'B8_QUEUED_'+fault_kind in text:
+            record('side_effect', fault=fault_kind)
+            if fault_kind=='CRASH': os._exit(17)
+            hang_with_descendant()
     failure=home/'resume-error.json'
     if '--resume' in sys.argv and failure.exists():
         fault=json.loads(failure.read_text())
@@ -49,7 +65,7 @@ def serve(text):
             emit(dict(type='result',subtype='error_during_execution',is_error=True,
                       result=fault['error'],session_id=sid))
             return
-    if text == 'WAIT_FOR_ATTACH':
+    if 'WAIT_FOR_ATTACH' in text:
         deadline=time.monotonic()+5
         while not (home/'turn-release').exists():
             if time.monotonic()>deadline:sys.exit(92)
@@ -58,9 +74,7 @@ def serve(text):
         record('busy_turn_released')
     if text == 'CRASH': os._exit(17)
     if text == 'HANG':
-        signal.signal(signal.SIGINT, lambda *_: record('interrupt'))
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        while True: time.sleep(.05)
+        hang_with_descendant()
     error = text == 'ERROR'
     message = dict(id=f'{os.getpid()}-{time.monotonic_ns()}', type='message', role='assistant',
                    content=[dict(type='text', text='reply:'+text)],

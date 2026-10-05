@@ -28,6 +28,8 @@ def write_manifest(output,candidate,binary):
     manifest={str(p.relative_to(output)):digest(p) for p in sorted(output.rglob('*'))
               if p.is_file() and p.name!='manifest.json'}
     save(output/'manifest.json',manifest)
+def m_name(meta):return str(meta['wrapper_pid'])
+
 def wire_objects(wire):
     rows=[]
     for path in sorted(wire.glob('*.stdout')):
@@ -164,7 +166,7 @@ def capture_auth(source_home, engines, mode, mode_root):
                 account='claude-l' if phase=='fallback' else 'claude-r2d2'
                 identity=S.credential_identity(folder,account,engines[account])
                 save(mode_root/('auth-'+phase+'-identity.json'),
-                     {k:identity.get(k) for k in ('verified','verified_at','mismatch','account_id')})
+                     {k:identity.get(k) for k in ('verified','verified_at','mismatch','account_id','source','method')})
             attempts=[json.loads(line) for line in (home/'logs/attempts.jsonl').read_text().splitlines()]
             save(mode_root/'auth-attempts.json',attempts)
             assert len(attempts)==3 and attempts[0]['classification']=='auth'
@@ -215,7 +217,12 @@ def capture_credits(sup, home, engines, mode_root):
             assert attempts[0]['model']=='claude-fable-5-1' and attempts[0]['classification']=='credits'
             assert attempts[0]['reason'].strip()
             assert attempts[1]['success'] and attempts[1]['model']==model==MODEL
-            assert len(terminal)==2 and sum(t.get('is_error') is True for t in terminal)==1
+            assert sum(t.get('is_error') is False for t in terminal)==1,'missing successful retry terminal'
+            # A failed invocation is proven by an error terminal or a finalized nonzero exit with diagnostics.
+            exits=[json.loads(m.read_text()) for m in sorted(wire.glob('*.json'))]
+            nonzero=[m for m in exits if isinstance(m.get('returncode'),int) and m['returncode']!=0
+                     and (wire/(m_name(m)+'.stderr')).read_text().strip()]
+            assert sum(t.get('is_error') is True for t in terminal)+len(nonzero)==1,'exactly one proven Fable failure required'
             assert MODEL in observed and observed <= {MODEL,'claude-fable-5-1'}
             outcome='exhausted'
         save(mode_root/'credits.json',{'outcome':outcome,'observed_at':sup.now(),
@@ -224,6 +231,35 @@ def capture_credits(sup, home, engines, mode_root):
                  else 'Fable credits error followed by same-account Opus5.5 success.'})
     finally:stop_recorded(wire)
 
+DISCOVERY_PROBES=(('auth-status',['auth','status']),)
+
+def capture_identity_discovery(binary, sources, output):
+    """PR45 1.1: does the installed CLI report the account behind an explicitly supplied token? Each probe runs
+    in a fresh HOME and CLAUDE_CONFIG_DIR with only that credential's variables (no cached login can leak in),
+    plus one control with no credential at all. Outputs are retained through the recorder (secrets redacted);
+    the validator derives the conclusion from the retained output, never from this record alone."""
+    root=output/'identity-discovery';root.mkdir(mode=0o700)
+    records=[]
+    for label,source in (('claude-r2d2',sources['claude-r2d2']),('claude-l',sources['claude-l']),('none',None)):
+        for probe,argv in DISCOVERY_PROBES:
+            wire=root/label/probe;wire.mkdir(mode=0o700,parents=True)
+            with tempfile.TemporaryDirectory(prefix='b8-discovery-') as isolated:
+                env={k:v for k,v in os.environ.items() if not k.startswith(('CLAUDE','ANTHROPIC'))}
+                env.update(HOME=isolated,CLAUDE_CONFIG_DIR=str(Path(isolated)/'config'),XDG_CONFIG_HOME=str(Path(isolated)/'xdg'),
+                           B8_REAL_CLAUDE=str(binary),B8_CAPTURE_WIRE_DIR=str(wire))
+                if source is not None:
+                    env.update({k:v for k,v in S.read_env_file(str(source)).items() if k.startswith(('CLAUDE','ANTHROPIC'))})
+                try:
+                    proc=subprocess.run([sys.executable,str(ROOT/'loops/b8.capture-wire.py'),*argv],env=env,
+                                        capture_output=True,text=True,timeout=60,stdin=subprocess.DEVNULL)
+                    rc=proc.returncode;timeout=False
+                except subprocess.TimeoutExpired:
+                    rc=None;timeout=True
+                records.append({'credential':label,'probe':probe,'argv':argv,'returncode':rc,'timed_out':timeout,
+                                'wire':f'identity-discovery/{label}/{probe}','isolated':['HOME','CLAUDE_CONFIG_DIR','XDG_CONFIG_HOME']})
+    save(output/'identity-discovery.json',{'records':records,
+         'rule':'token_bound only if both credential probes print account-identifying lines that differ from each other and the no-credential control prints none; otherwise not_reported'})
+
 def capture_switches(binary, sources, output, retry_config=None):
     assert not git('status','--porcelain','--untracked-files=all'),'commit a clean candidate first'
     candidate={'candidate_sha':git('rev-parse','HEAD'),'candidate_tree':git('rev-parse','HEAD^{tree}'),
@@ -231,6 +267,7 @@ def capture_switches(binary, sources, output, retry_config=None):
                'wire_harness_sha256':digest(ROOT/'loops/b8.capture-wire.py')}
     output.mkdir(mode=0o700,parents=False,exist_ok=False)
     save(output/'candidate.json',candidate)
+    capture_identity_discovery(binary,sources,output)
     for mode in ('per-turn','persistent'):
         mode_root=output/mode;mode_root.mkdir(mode=0o700)
         with tempfile.TemporaryDirectory(prefix='b8-real-switch-') as folder:
@@ -303,5 +340,11 @@ if __name__=='__main__':
                      {'claude-r2d2':args.r2d2_credential.resolve(strict=True),
                       'claude-l':args.l_credential.resolve(strict=True)},args.output.resolve(),retry_config)
     import runpy
-    runpy.run_path(str(ROOT/'loops/b8.live.py'))['validate'](args.output.resolve())
-    print('b8 capture complete: candidate evidence validated')
+    # Structural self-check only; the operator attestation (B4) is written afterwards and checked by the exit.
+    runpy.run_path(str(ROOT/'loops/b8.live.py'))['validate'](args.output.resolve(),require_attestation=False)
+    output=args.output.resolve()
+    manifest=json.loads((output/'manifest.json').read_text())
+    print('b8 capture complete: candidate evidence validated (unattested)')
+    print('attest: candidate_sha', json.loads((output/'summary.json').read_text())['candidate_sha'])
+    print('attest: manifest_sha256', digest(output/'manifest.json'))
+    print('attest: summary_sha256', manifest['summary.json'])
