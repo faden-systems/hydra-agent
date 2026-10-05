@@ -191,6 +191,37 @@ def test_fallback_notice_persists_across_restart_without_duplication(home):
     assert len(S.read_outbox(home)) == 1
 
 
+def test_fallback_episode_closes_when_mode_was_ever_explicitly_set(home):
+    """b8 attempt 4, real capture (attempt 3): once an operator has ever set `mode=` (requirement 7,
+    loops/b8.md), `engine-runtime.json`'s persisted "configured" pair carries a `mode` key alongside acc/model.
+    When the restored primary (re-selected explicitly, exactly as the real capture's recovery phase does)
+    completes a turn, `_note_fallback_transition`'s winning-vs-configured comparison must still recognize it
+    and close the episode -- not only announce it starting (requirement 12/13, loops/b8.md)."""
+    eng_map = {"claude-r2d2": {"bin": "fixture"}, "codex": {"bin": "fixture", "kind": "codex"}}
+    S.set_engine(home, "claude-r2d2", "claude-sonnet-5", eng_map, mode="per-turn")
+    cfg = {"dev_channel": "C_DEV_FIXTURE", "engine_fallback": {"claude_models": []}}
+    sup = S.Supervisor(home=home, engines=eng_map, config=cfg, poster=lambda *a: None)
+    failing = True
+
+    def invoke(name, spec, message, model=None, preamble=""):
+        if name == "claude-r2d2" and failing:
+            return 1, "", "Out of usage credits", None
+        return 0, "ok", "", None
+    with patch.object(sup, "invoke", side_effect=invoke):
+        sup.run_engines("first", [])
+    notices = S.read_outbox(home)
+    assert len(notices) == 1 and "fallback started" in notices[0]["text"].lower()
+    # The operator (or the real capture's recovery phase) explicitly restores the primary; this re-selection
+    # is exactly what stamps `mode` onto engine-runtime.json's "configured" pair.
+    S.set_engine(home, "claude-r2d2", "claude-sonnet-5", eng_map, mode="per-turn")
+    failing = False
+    with patch.object(sup, "invoke", side_effect=invoke):
+        sup.run_engines("second", [])
+    notices = S.read_outbox(home)
+    assert len(notices) == 2, notices
+    assert "fallback ended" in notices[1]["text"].lower(), notices
+
+
 def test_deliberately_selecting_codex_is_not_a_fallback_episode(home):
     eng_map = {"claude-r2d2": {"bin": "fixture"}, "codex": {"bin": "fixture", "kind": "codex"}}
     S.set_engine(home, "codex", "gpt-6-astra", eng_map)

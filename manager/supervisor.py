@@ -3021,7 +3021,10 @@ class Supervisor:
         configured = runtime.get("configured") or started_pair
         winning = {"acc": winning_acc, "model": winning_model}
         active = bool(runtime.get("episode_id")) and bool(runtime.get("active"))
-        if winning == configured:
+        # Compare acc/model only: once an operator has ever set mode=... (requirement 7, loops/b8.md),
+        # the persisted "configured" pair also carries a "mode" key, which must never prevent recognizing
+        # the restored primary and closing the episode (requirement 12/13).
+        if winning == {"acc": configured.get("acc"), "model": configured.get("model")}:
             if active:
                 self._close_fallback_episode(runtime)
             return
