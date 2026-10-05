@@ -30,6 +30,7 @@ Honours HYDRA_HOME (default /srv/hydra/manager); `update` also honours HYDRA_REP
 /srv/hydra/repos/hydra-agent) and HYDRA_APP (default /srv/hydra/manager/app/manager), and HYDRA_FAKE_UID (an
 integer that stands in for the effective uid, the acceptance harness's injection).
 """
+import contextlib
 import getpass
 import json
 import os
@@ -119,16 +120,16 @@ def cmd_tail(home, args):
 def cmd_engine(home, args):
     current = S.read_engine(home)
     if not args:
-        print(f"engine: {S.engine_label(current)} [{current['mode']}]")
+        print(f"engine: {S.engine_label(current)}{S.mode_suffix(current)}")
         return 0
     try:
         pair = S.parse_engine_command(" ".join(args), current=current)
     except S.BadEngine as e:
-        print(f"{e}; nothing changed (engine: {S.engine_label(current)} [{current['mode']}])", file=sys.stderr)
+        print(f"{e}; nothing changed (engine: {S.engine_label(current)}{S.mode_suffix(current)})", file=sys.stderr)
         return 2
     S.set_engine(home, pair["acc"], pair["model"], mode=pair.get("mode"))
     updated = S.read_engine(home)
-    print(f"engine: {S.engine_label(updated)} [{updated['mode']}]")
+    print(f"engine: {S.engine_label(updated)}{S.mode_suffix(updated)}")
     return 0
 
 
@@ -167,8 +168,57 @@ def cmd_resume(home, args):
     return 0
 
 
+def _acquire_writer_waiting(home, who, timeout):
+    """`acquire_writer`, but waiting (polling) for a busy turn to finish instead of refusing immediately
+    (requirement 5, loops/b8.md: attach requests a park after the current turn). Returns the entered context
+    manager on success; raises S.WriterHeld after `timeout` seconds."""
+    deadline = time.time() + timeout
+    last = None
+    while True:
+        cm = S.acquire_writer(home, who)
+        try:
+            cm.__enter__()
+            return cm
+        except S.WriterHeld as e:
+            last = e
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
+def _park_persistent(home):
+    """Stop any live persistent Claude writer before the interactive process starts (requirement 5,
+    loops/b8.md): no background writer may share its conversation with the attached session. Attach owns no
+    pipe to it (a separate process spawned it), so this is a signal, not an orderly `shutdown_persistent`."""
+    status = S.persistent_status(home)
+    pid = status.get("pid")
+    if not pid:
+        return
+    for sig in (15, 9):
+        try:
+            os.killpg(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            pass
+        deadline = time.time() + 1.0
+        while time.time() < deadline and S.pid_alive(pid):
+            time.sleep(0.02)
+        if not S.pid_alive(pid):
+            break
+    S._bump_restart(home, "planned", "parked for hydra attach")
+    S._save_persistent_status(home, pid=None)
+
+
 def cmd_attach(home, args):
-    """Take WRITER, run the manager session interactively, release, post a two-line summary to #dev."""
+    """Wait for the current turn, take WRITER, park any live persistent writer, run the manager session
+    interactively, release, post a two-line summary to #dev. Resumes supervisor service on exit, including
+    an abnormal one: the interactive child's pid is recorded durably so a surviving supervisor can retire it
+    as an orphan if this process itself dies before releasing WRITER (requirement 5, loops/b8.md)."""
     cfg = S.load_config(home)
     engines = S.default_engines(home, cfg)
     engine = S.current_engine(home)
@@ -176,18 +226,30 @@ def cmd_attach(home, args):
         engine = next((n for n in S.ENGINE_ORDER if n in engines and n != "codex"), engine)
     spec = engines[engine]
     sup = S.Supervisor(home=home, engines=engines, poster=lambda *a: None, config=cfg)
-    sid = sup.session_id()
-    pair = S.read_engine(home, engines)
-    model = pair["model"] if pair["acc"] == engine else S.family_default_model("claude", sup.models)
-    argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", model] + list(args)
     me = who()
     started = time.time()
+    timeout = float(os.environ.get("HYDRA_ATTACH_WAIT_TIMEOUT", "10"))
     try:
-        with S.acquire_writer(home, me):
-            rc = subprocess.call(argv, env=sup.engine_env(spec), cwd=home)
+        cm = _acquire_writer_waiting(home, me, timeout)
     except S.WriterHeld as e:
         print(f"cannot attach: {e}", file=sys.stderr)
         return 1
+    child_pid_path = os.path.join(home, "logs", "attach-child.pid")
+    try:
+        # sid is read only now, once any busy turn has actually finished and released WRITER, so attach
+        # joins the conversation the supervisor was really running, never one read before it existed.
+        sid = sup.session_id()
+        pair = S.read_engine(home, engines)
+        model = pair["model"] if pair["acc"] == engine else S.family_default_model("claude", sup.models)
+        argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", model] + list(args)
+        _park_persistent(home)
+        child = subprocess.Popen(argv, env=sup.engine_env(spec), cwd=home)
+        S.write_text(child_pid_path, str(child.pid))
+        rc = child.wait()
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(child_pid_path)
+        cm.__exit__(None, None, None)
     ended = time.time()
     summary = (f"console session by {me} (hydra attach): {S.now_iso(started)} to {S.now_iso(ended)}, "
                f"{(ended - started) / 60:.0f} min, exit {rc}\n"

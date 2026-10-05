@@ -1645,12 +1645,17 @@ def sanitize_reply(text):
     return BROADCAST_RE.sub(lambda m: (m.group(1) or m.group(2)), text)
 
 
+HANDOFF_LINE_RE = re.compile(r"(?m)^[ \t]*" + re.escape(HANDOFF_MARK) + r"[ \t]*$")
+
+
 def split_handoff(text):
-    """(reply, handoff) from an engine's stdout; handoff is None when there is no marker."""
-    idx = text.find(HANDOFF_MARK)
-    if idx < 0:
+    """(reply, handoff) from an engine's stdout; handoff is None when there is no marker. The marker is "a
+    line containing only `---HANDOFF---`" (manager/CLAUDE.md), never a mid-sentence mention of the same text
+    (e.g. inside the manager's own prompt instruction, which a test fixture may echo back verbatim)."""
+    m = HANDOFF_LINE_RE.search(text)
+    if not m:
         return text.strip(), None
-    return text[:idx].strip(), text[idx + len(HANDOFF_MARK):].strip()
+    return text[:m.start()].strip(), text[m.end():].strip()
 
 
 HANDOFF_REQUIRED_PREFIXES = ("tracks:", "waiting on:", "last decision:", "next action:", "open question:")
@@ -1681,10 +1686,14 @@ def record_attempt(home, engine, model, rc, classification, reason, success):
 # ----------------------------------------------------------------------------------------------- the supervisor
 
 class AllEnginesFailed(Exception):
-    def __init__(self, errors):
+    def __init__(self, errors, uncertain=False):
         parts = [f"{e[0]}: {e[1]}" if isinstance(e, (tuple, list)) and len(e) == 2 else str(e) for e in errors]
         super().__init__("; ".join(parts))
         self.errors = errors
+        # requirement 1/8, loops/b8.md: a crash or a turn timeout left the submitted request's outcome
+        # uncertain (it may have already had a real side effect); turn() gives it a durable disposition
+        # instead of the ordinary retry-after-backoff treatment a classifiable engine error gets.
+        self.uncertain = uncertain
 
 
 class Supervisor:
@@ -1788,6 +1797,10 @@ class Supervisor:
         self.heartbeat()
         if self.paused():
             return False
+        self._reconcile_in_flight()  # requirement 9/PR45 8.1, loops/b8.md: before anything else touches
+        # the conversation or the queue, retire an orphan and give an interrupted submission a durable,
+        # truthful disposition instead of silently resubmitting it
+        self._reconcile_attach_orphan()
         if os.path.exists(self.path("inbox", "pending-replies.jsonl")):
             return self.deliver_pending()
         if self._reconcile_settlement_journal():
@@ -1820,6 +1833,89 @@ class Supervisor:
             log(f"skip: {e}")
             return False
 
+    # ---- interrupted-submission recovery (requirement 9, loops/b8.md; PR45 8.1): a durable marker proves
+    # whether a request was actually submitted to an engine, surviving a crash of this very process.
+    def in_flight_path(self):
+        return self.path("logs", "in-flight.json")
+
+    def _mark_in_flight(self, n, events):
+        write_text(self.in_flight_path(), json.dumps({"turn": n, "events": [ev["id"] for ev in events]}))
+
+    def _clear_in_flight(self):
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.in_flight_path())
+
+    def _reconcile_in_flight(self):
+        """A marker that outlived the process that wrote it means that process died before `run_engines`
+        returned (or raised): the submitted request's outcome is unknown, and a live orphaned persistent
+        child may still be serving it. Retire the orphan, then give those exact events a durable failed
+        disposition (never a silent resubmission, never a success claim) before anything else runs."""
+        path = self.in_flight_path()
+        try:
+            raw = read_text(path, "")
+            data = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            data = None
+        if not isinstance(data, dict):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+            return
+        status = _read_persistent_status(self.home)
+        orphan = status.get("pid")
+        if orphan and self._persistent_child() is None and pid_alive(orphan):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(orphan, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(orphan, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError, OSError):
+                os.waitpid(orphan, 0)
+            _bump_restart(self.home, "orphan", "orphan persistent process retired (supervisor restart)")
+            _save_persistent_status(self.home, pid=None)
+        ids = [i for i in (data.get("events") or []) if isinstance(i, str)]
+        pending_ids = {e["id"] for e in pending_events(self.home)}
+        affected = [i for i in ids if i in pending_ids]
+        if affected:
+            n = data.get("turn")
+            n = n if isinstance(n, int) else len(self.turns()) + 1
+            events = events_by_ids(self.home, affected)
+            record_attempt(self.home, current_engine(self.home), "", None, "other",
+                           "supervisor died mid-turn; disposition recorded without a success claim", False)
+            append_jsonl(self.path("logs", "turns.jsonl"),
+                        {"n": n, "at": time.time(), "engine": current_engine(self.home), "model": "",
+                         "events": affected, "duration_s": 0.0, "error": "interrupted by a supervisor restart"})
+            self.post_unavailable(events)
+            mark_handled(self.home, affected, turn=n)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+
+    def attach_child_path(self):
+        return self.path("logs", "attach-child.pid")
+
+    def _reconcile_attach_orphan(self):
+        """`hydra attach` records its interactive child's pid durably before waiting on it; if that process
+        itself dies before releasing WRITER (an abnormal attach exit), WRITER goes stale and this retires the
+        orphaned interactive child before the next event, so service resumes even then (requirement 5,
+        loops/b8.md)."""
+        path = self.attach_child_path()
+        raw = read_text(path, "").strip()
+        if not raw:
+            return
+        ws = writer_status(self.home)
+        if ws is not None and ws[0] != "stale":
+            return  # attach is still legitimately running
+        with contextlib.suppress(ValueError):
+            pid = int(raw)
+            if pid_alive(pid):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+                with contextlib.suppress(ChildProcessError, OSError):
+                    os.waitpid(pid, 0)
+                _bump_restart(self.home, "orphan", "orphaned attach interactive process retired")
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+
     # ---- one turn
     def turn(self, events):
         started = time.time()
@@ -1836,12 +1932,15 @@ class Supervisor:
         reacted = self.react_start(events)
         ticker = self.start_heartbeat([ev["id"] for ev in events])
         failure = None
+        self._mark_in_flight(n, events)  # requirement 9/PR45 8.1: proof a submission's disposition is
+        # unknown if this process dies before clearing it (a crash, not caught by the try/except below)
         try:
             engine, model, stdout, usage, transition = self.run_engines(message, notes)
         except AllEnginesFailed as e:
             failure = e
         finally:
             self.stop_heartbeat(ticker)  # before anything else touches the reactions
+            self._clear_in_flight()
         if failure is not None:
             e = failure
             log(f"turn {n}: every engine failed: {e}")
@@ -1853,6 +1952,11 @@ class Supervisor:
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
             self.react_failed(events)
             self.post_unavailable(events)
+            if getattr(e, "uncertain", False):
+                # requirement 1/8, loops/b8.md: an uncertain submitted request (crash/timeout) gets a durable
+                # disposition that prevents automatic replay -- never reported successful, and not left
+                # pending for the ordinary retry-after backoff to resubmit it on a later tick/restart.
+                mark_handled(self.home, [ev["id"] for ev in events], turn=n)
             return True
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("logs", "retry-after"))
@@ -2123,6 +2227,12 @@ class Supervisor:
                 errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
                 log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
                 last_reason = err
+                if rc in (17, 124):
+                    # requirement 1/8, loops/b8.md: a process crash (17) or a turn timeout (124) is an
+                    # UNCERTAIN disposition -- the request may have already had a real side effect -- so it
+                    # must never be silently replayed on a different engine within the same turn; the event
+                    # layer (turn()/post_unavailable) gives it a durable, truthful failure outcome instead.
+                    raise AllEnginesFailed(errors, uncertain=True)
                 if classification == "prompt_too_long":
                     skip_claude = True
                     if family == "claude" and self._is_working(name, model, spec):
@@ -2283,7 +2393,7 @@ class Supervisor:
                     _bump_restart(self.home, "planned", f"switch to {name}/{model}")
                 else:
                     self._set_persistent_child(None)
-                    _bump_restart(self.home, "unexpected", "process found dead before reuse")
+                    _bump_restart(self.home, "crash", "process found dead before reuse")
             else:
                 # This instance never spawned the recorded pid (a genuine process restart: a fresh Python
                 # process owns no pipe to it and can never reuse it safely), but it may still be alive and
@@ -2297,7 +2407,7 @@ class Supervisor:
                     with contextlib.suppress(ChildProcessError, OSError):
                         os.waitpid(orphan, 0)  # reap directly: no Popen object survived to do it (same OS
                         # process as a real restart would be a different one; ECHILD there is expected/safe)
-                    _bump_restart(self.home, "unexpected", "orphan persistent process retired")
+                    _bump_restart(self.home, "orphan", "orphan persistent process retired")
             argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
                    ["--model", model, "--dangerously-skip-permissions",
                     "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
@@ -2320,13 +2430,13 @@ class Supervisor:
         if timed_out:
             child.kill_tree()
             self._set_persistent_child(None)
-            _bump_restart(self.home, "unexpected", f"turn timed out after {self.engine_timeout}s")
+            _bump_restart(self.home, "timeout", f"turn timed out after {self.engine_timeout}s")
             _save_persistent_status(self.home, pid=None)
             return 124, "", f"timeout after {self.engine_timeout}s", None
         if crashed:
             diagnostic = child.diagnostic()
             self._set_persistent_child(None)
-            _bump_restart(self.home, "unexpected", "crash" + (f": {diagnostic}" if diagnostic else ""))
+            _bump_restart(self.home, "crash", "crash" + (f": {diagnostic}" if diagnostic else ""))
             _save_persistent_status(self.home, pid=None)
             return 17, "", self._failure_reason(diagnostic, text, ""), None
         reply, usage, error_text, new_sid = self._parse_claude_output(text)
