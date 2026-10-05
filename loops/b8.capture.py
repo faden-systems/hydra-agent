@@ -65,6 +65,7 @@ def discover_retries(config):
 
 def capture_models(sup,home,engines,mode,mode_root):
     aliases=json.loads((ROOT/'manager/models.json').read_text())['claude']['aliases']
+    assert aliases.get('opus5')=='claude-opus-5' and aliases.get('opus5.5')=='claude-opus-5-5','required alias mapping changed (2.2)'
     routing_config={'engine_fallback':sup.config.get('engine_fallback',{})}
     retries=discover_retries(routing_config)
     models=list(dict.fromkeys([aliases['opus5'],aliases['opus5.5'],*retries]))
@@ -246,7 +247,9 @@ def capture_credits(sup, home, engines, mode_root):
              'attempts':attempts,'wire':'credits-wire','usage':usage,
              'explanation':'Fable succeeded; exhaustion no longer reproduced.' if outcome=='reset'
                  else 'Fable credits error followed by same-account Opus5.5 success.'})
-    finally:stop_recorded(wire)
+    finally:
+        # B2 (round 3): orderly shutdown on every path, including a credits reset or an exception.
+        orderly_shutdown(sup);stop_recorded(wire)
 
 DISCOVERY_PROBES=(('auth-status',['auth','status']),)
 

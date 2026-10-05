@@ -9,7 +9,7 @@ import bridge as B
 
 def contracts():
     aliases=json.loads((ROOT/'manager/models.json').read_text())['claude']['aliases']
-    assert aliases['opus5.5']=='claude-opus-5-5'
+    assert aliases['opus5.5']=='claude-opus-5-5' and aliases['opus5']=='claude-opus-5','required alias mapping changed (2.2)'
     with tempfile.TemporaryDirectory(prefix='b8-mode-') as tmp:
         home=Path(tmp)
         env={k:v for k,v in os.environ.items() if not k.startswith(('CLAUDE','ANTHROPIC','HYDRA_'))}

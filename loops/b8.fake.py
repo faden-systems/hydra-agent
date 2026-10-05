@@ -43,9 +43,11 @@ emit(dict(type='system', subtype='init', session_id=sid))
 def hang_with_descendant():
     """A hang that leaks a TERM-resistant tool child (PR45 2.5): reaping must cover the process tree."""
     import subprocess
+    ready=home/('descendant-ready-'+str(os.getpid()))
     child=subprocess.Popen([sys.executable,'-c',
-        'import signal,time;[signal.signal(s,signal.SIG_IGN) for s in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP)];time.sleep(120)'])
-    record('descendant', child=child.pid)
+        'import signal,time,sys,pathlib;[signal.signal(s,signal.SIG_IGN) for s in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP)];'
+        'pathlib.Path(sys.argv[1]).write_text(str(__import__("os").getpid()));time.sleep(120)',str(ready)])
+    record('descendant', child=child.pid, ready=str(ready))
     signal.signal(signal.SIGINT, lambda *_: record('interrupt'))
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while True: time.sleep(.05)

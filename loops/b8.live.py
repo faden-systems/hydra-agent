@@ -170,10 +170,13 @@ def validate(root, require_attestation=True):
     assert set(isolation.get('scratch') or [])>={'HOME','XDG_CONFIG_HOME','CLAUDE_CONFIG_DIR'},'capture did not isolate HOME/XDG/CLAUDE_CONFIG_DIR'
     assert isolation.get('inherited_auth_cleared') is True,'capture did not clear inherited authentication variables'
     # B3: processes the harness had to kill after an orderly shutdown failed; a successful scenario process may never be among them.
+    # B3/B1: the forced-cleanup record is mandatory (an empty list when nothing had to be signalled); both the
+    # CLI child and the recorder wrapper identities count.
+    assert 'forced-cleanup.json' in manifest,'forced-cleanup.json missing from the bundle'
     forced=set()
-    if 'forced-cleanup.json' in manifest:
-        for row in json.loads((root/'forced-cleanup.json').read_text()):
-            forced.add(row.get('child_pid'))
+    for row in json.loads((root/'forced-cleanup.json').read_text()):
+        for key in ('child_pid','wrapper_pid'):
+            if row.get(key) is not None:forced.add(row[key])
     assert set(summary['modes'])=={'per-turn','persistent'}
     for mode,record in summary['modes'].items():
         # Each item references independently retained real supervisor output, not boolean claims.
@@ -219,9 +222,19 @@ def validate(root, require_attestation=True):
                         if line.strip():plain.append(line.strip())
                         continue
                     if isinstance(row,dict) and row.get('type')=='result':results.append(row)
-                records.append({'name':stem,'pid':meta.get('child_pid'),'returncode':meta.get('returncode'),
+                records.append({'name':stem,'pid':meta.get('child_pid'),'wrapper_pid':meta.get('wrapper_pid'),'returncode':meta.get('returncode'),
                                 'finalized':isinstance(meta.get('returncode'),int) and not isinstance(meta.get('returncode'),bool) and bool(meta.get('ended_at')),
                                 'results':results,'stderr':stderr.strip(),'stdout_text':'\n'.join(plain)})
+            return records
+        def clean_success(directory, label=None):
+            """B1 (round 3): every process of a successful scenario finished orderly: finalized metadata, exit 0,
+            neither its CLI nor its recorder identity in the forced-cleanup record."""
+            records=invocations(directory)
+            assert records,'CLI process records missing: '+directory
+            for r in records:
+                assert r['finalized'] and r['returncode']==0,(label or directory,'process did not finish with exit 0 after orderly shutdown',r['name'])
+                assert r['pid'] not in forced and r['wrapper_pid'] not in forced,(label or directory,'successful process was forcibly cleaned up (B3)',r['name'])
+                assert not any(x.get('is_error') is True for x in r['results']),(label or directory,'error terminal in a successful scenario')
             return records
         def one_failure_then_success(directory, attempt):
             """Exactly one proven failed process, exactly one successful terminal in a different finalized
@@ -233,7 +246,7 @@ def validate(root, require_attestation=True):
             successes=[r for r in records if r is not failed[0][0]]
             for r in successes:
                 assert r['finalized'] and r['returncode']==0,'successful fallback process did not finish cleanly'
-                assert r['pid'] not in forced,'successful process was terminated by forced cleanup, not an orderly shutdown (B3)'
+                assert r['pid'] not in forced and r['wrapper_pid'] not in forced,'successful process was terminated by forced cleanup, not an orderly shutdown (B3)'
                 assert [x.get('is_error') for x in r['results']]==[False],'fallback process lacks exactly one successful terminal'
             assert len(successes)==1,f'{directory}: expected one successful fallback process, found {len(successes)}'
             reason=(attempt.get('reason') or '').strip();diagnostic=failed[0][1].strip()
@@ -247,12 +260,14 @@ def validate(root, require_attestation=True):
         assert audit['retry_models']==discover(config),'retry models differ from captured routing configuration'
         aliases=json.loads((candidate/'manager/models.json').read_text())['claude']['aliases']
         assert audit['aliases']==aliases
+        assert aliases.get('opus5')=='claude-opus-5' and aliases.get('opus5.5')=='claude-opus-5-5','required alias mapping changed (2.2)'
         required=set([aliases['opus5'],aliases['opus5.5'],*audit['retry_models']])
         assert required=={r['requested_model'] for r in audit['probes']}
         assert len(audit['probes'])==len(required),'duplicate model probes'
         assert len({r['wire'] for r in audit['probes']})==len(required),'reused model evidence'
         for probe in audit['probes']:
             provenance(probe['wire'], count=1)
+            clean_success(probe['wire'],'model probe '+probe['requested_model'])
             assert probe['returncode']==0 and probe['reported_models']==[probe['requested_model']]
             rows=wire_rows(probe['wire'])
             results=[r for r in rows if r.get('type')=='result']
@@ -266,6 +281,7 @@ def validate(root, require_attestation=True):
         assert all(x['requested_model']==x['effective_model']=='claude-opus-5-5' and x['success'] for x in switches)
         assert switches[0]['session_id'] and switches[0]['session_id']==switches[1]['session_id']
         for switch in switches:
+            clean_success(switch['wire'],'account switch '+switch['engine'])
             rows=wire_rows(switch['wire'])
             results=[r for r in rows if r.get('type')=='result']
             assert len(results)==2 and all(r.get('is_error') is False for r in results)
@@ -304,6 +320,7 @@ def validate(root, require_attestation=True):
         auth=[a for a in attempts if a['classification']=='auth' and not a['success']]
         assert len(auth)==1 and auth[0]['reason'].strip(),(mode,auth)
         one_failure_then_success('auth-fallback',auth[0])
+        clean_success('auth-recovery')
         recovery_rows=wire_rows('auth-recovery')
         recovery_results=[r for r in recovery_rows if r.get('type')=='result']
         assert len(recovery_results)==1 and recovery_results[0].get('is_error') is False
@@ -368,6 +385,7 @@ def validate(root, require_attestation=True):
             assert seq[0]['model']=='claude-fable-5-1'
             results=[r for r in wire_rows(credit['wire']) if r.get('type')=='result']
             assert len(results)==1 and results[0].get('is_error') is False
+            clean_success(credit['wire'],'credits reset')
     return summary
 
 if __name__=='__main__':

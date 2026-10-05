@@ -126,22 +126,48 @@ inherited_contracts()
 run([sys.executable,'loops/b8.regressions.py',BASE],120)
 JUNIT='/tmp/b8-junit-'+str(os.getpid())+'.xml'
 run([sys.executable,'-m','pytest','-q','tests/manager','--junitxml',JUNIT],300)
-def baseline_tests_executed():
-    # 2.3: every retained baseline test actually ran; skips/xfails of baseline node ids are rejected.
+def baseline_node_ids():
+    # 2.4: the baseline's complete collected node ids (file::Class::function[param]) from a detached worktree.
+    import tempfile,shutil
+    tmp=tempfile.mkdtemp(prefix='b8-base-')
+    try:
+        git('worktree','add','--detach',tmp,BASE)
+        out=subprocess.run([sys.executable,'-m','pytest','--rootdir=.','--collect-only','-q','tests/manager'],cwd=tmp,capture_output=True,text=True)
+        assert out.returncode==0,'baseline collection failed: '+out.stdout[-500:]+out.stderr[-500:]
+        return {line.strip() for line in out.stdout.splitlines() if line.startswith('tests/manager/') and '::' in line}
+    finally:
+        subprocess.run(['git','worktree','remove','--force',tmp],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);shutil.rmtree(tmp,ignore_errors=True)
+def junit_node_ids(path):
     import xml.etree.ElementTree as ET
+    executed={}
+    for case in ET.parse(path).getroot().iter('testcase'):
+        classname=case.get('classname','');name=case.get('name','')
+        parts=classname.split('.')
+        # tests.manager.test_x[.Class...] -> tests/manager/test_x.py::Class...::name
+        file_parts=[];classes=[]
+        for part in parts:
+            if classes or (file_parts and part[:1].isupper()):classes.append(part)
+            else:file_parts.append(part)
+        nodeid='/'.join(file_parts)+'.py::'+'::'.join(classes+[name]) if file_parts else name
+        executed.setdefault(nodeid,[]).extend(child.tag for child in case)
+    return executed
+def baseline_tests_executed():
+    # 2.3/2.4: every retained baseline node id (per file, class, function and parameter) ran unskipped;
+    # a same-named test elsewhere cannot stand in for it.
+    exempt=set()
+    for file,names in SUPERSEDED.items():
+        for name in names:exempt.add((file,name))
     retained=set()
-    for file in git('ls-tree','-r','--name-only',BASE,'tests/manager').decode().splitlines():
-        if not file.endswith('.py') or file.endswith('conftest.py'):continue
-        exempt=SUPERSEDED.get(file,{})
-        for node in ast.parse(git('show',BASE+':'+file).decode()).body:
-            if isinstance(node,ast.FunctionDef) and node.name.startswith('test_') and node.name not in exempt:retained.add(node.name)
-    seen={}
-    for case in ET.parse(JUNIT).getroot().iter('testcase'):
-        name=case.get('name','').split('[')[0]
-        seen.setdefault(name,[]).append([child.tag for child in case])
-    for name in sorted(retained):
-        assert name in seen,f'retained baseline test did not run: {name}'
-        assert not any(tag in ('skipped',) for tags in seen[name] for tag in tags),f'retained baseline test was skipped: {name}'
+    for nodeid in baseline_node_ids():
+        file,_,rest=nodeid.partition('::')
+        function=rest.split('::')[-1].split('[')[0]
+        if (file,function) in exempt:continue
+        retained.add(nodeid)
+    assert retained,'empty baseline node set'
+    executed=junit_node_ids(JUNIT)
+    for nodeid in sorted(retained):
+        assert nodeid in executed,f'retained baseline test did not run: {nodeid}'
+        assert 'skipped' not in executed[nodeid],f'retained baseline test was skipped: {nodeid}'
 baseline_tests_executed()
 for file in ('b8.identity.py','b8.mode.py','b8.acceptance.py','b8.rollover.py'):
     run([sys.executable,'loops/'+file],120)

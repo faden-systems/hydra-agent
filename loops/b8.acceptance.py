@@ -34,6 +34,32 @@ def kill_fixture_tree(rows, binary):
                     os.kill(pid,signal.SIGKILL)
             except (ProcessLookupError,FileNotFoundError):pass
 
+def descendant_ready(wire_rows, seconds=5):
+    """4.2: wait until the fixture recorded its descendant AND the descendant installed its signal handlers."""
+    deadline=time.monotonic()+seconds
+    while time.monotonic()<deadline:
+        rows=[r for r in wire_rows() if r['kind']=='descendant']
+        if rows and Path(rows[-1]['ready']).exists():return rows[-1]
+        time.sleep(.02)
+    raise AssertionError('descendant did not become signal-ready in time')
+
+def fresh_completed(home, event_id, marker, wire_rows, poster_texts=None):
+    """2.3: a fresh recovery event is COMPLETED, not merely marked handled: exactly one fixture request carried
+    it, one successful attempt and one error-free turn/ledger entry are tied to it, and (when the poster is
+    observable) its reply was delivered."""
+    home=Path(home)
+    requests=[r for r in wire_rows() if r['kind']=='request' and marker in r.get('text','')]
+    assert len(requests)==1,('fresh event must be served exactly once',marker,len(requests))
+    turns=[t for t in S.read_jsonl(str(home/'logs'/'turns.jsonl')) if event_id in (t.get('events') or [])]
+    assert len(turns)==1 and 'error' not in turns[0],('fresh event needs exactly one error-free turn',turns)
+    attempts=S.read_jsonl(str(home/'logs'/'attempts.jsonl'))
+    assert any(a.get('success') for a in attempts),'no successful attempt recorded for the fresh event'
+    ledger=S.read_jsonl(str(home/'manager-memory'/'LEDGER.jsonl')) if (home/'manager-memory'/'LEDGER.jsonl').exists() else []
+    assert any(l.get('turn')==turns[0].get('n') for l in ledger) or not ledger,'ledger entry for the fresh turn missing'
+    if poster_texts is not None:
+        assert any('reply:'+marker in t for t in poster_texts),'fresh event reply was not delivered'
+    assert event_id in S.handled_ids(str(home))
+
 def lifecycle():
     with tempfile.TemporaryDirectory(prefix='b8-offline-') as folder:
         home=Path(folder); binary=home/'fake-claude'
@@ -237,7 +263,7 @@ def queued_recovery(fault):
         (home/'engine').write_text(json.dumps({'acc':'claude-r2d2','model':'claude-sonnet-5','mode':'persistent'}))
         alerts=[]
         def post(*args):
-            alerts.append(args[-1]);return {'ok':True,'ts':'123.456'}
+            alerts.append(str(args[-1]));return {'ok':True,'ts':'123.456'}
         def supervisor():
             return S.Supervisor(home=folder,engines=engines,config={'engine_fallback':{'claude_models':[]}},
                 poster=post,buildlog_poster=post,reactor=S.DryReactor(folder),engine_timeout=.3,
@@ -261,13 +287,13 @@ def queued_recovery(fault):
             assert len(effects())==1,('backoff/restart replayed submitted event',fault,effects())
             # A new event is still serviceable; quarantining an uncertain result must not
             # disable all future work or batch the failed event into this request.
-            fresh=S.new_event('cli',{'text':'B8_FRESH_EVENT'},event_id='fresh-'+fault)
+            fresh=S.new_event('slack',{'channel':'C_B8','thread_ts':'1.0','ts':'1.1','user':'U_FOUNDER','text':'B8_FRESH_EVENT',
+                                       'instructs':True,'addressed':True},event_id='fresh-'+fault)
             S.append_event(folder,fresh)
             with patch.object(S.time,'time',return_value=future+86400):
                 for _ in range(3):sup.run_once()
             assert len(effects())==1,('fresh event replayed failed event',fault,effects())
-            assert fresh['id'] in S.handled_ids(folder),'fresh event was not completed'
-            assert any('B8_FRESH_EVENT' in r.get('text','') for r in rows() if r['kind']=='request')
+            fresh_completed(folder,fresh['id'],'B8_FRESH_EVENT',rows,alerts)
         finally:
             kill_fixture_tree(rows(),binary)
 
@@ -308,13 +334,16 @@ def supervisor_death():
             deadline=time.monotonic()+15
             while not effects() and time.monotonic()<deadline:time.sleep(.02)
             assert len(effects())==1,'fixture never recorded its side effect'
+            hung=descendant_ready(rows)  # 4.2: both records present and the descendant signal-ready before the kill
             os.kill(worker.pid,signal.SIGKILL);worker.join(5)
             assert not worker.is_alive(),'supervisor worker survived SIGKILL'
-            hung=[r for r in rows() if r['kind']=='descendant'][-1]
-            assert present(hung['pid']),'fixture should still be hung when the supervisor dies'
+            assert present(hung['pid']) and present(hung['child']),'fixture tree should still be alive when the supervisor dies'
             # Restart against the same home: orphan retirement, no second execution, truthful status.
+            posted=[]
+            def post(*args):
+                posted.append(str(args[-1]));return {'ok':True,'ts':'1.0'}
             sup=S.Supervisor(home=folder,engines=engines,config={'engine_fallback':{'claude_models':[]}},
-                             poster=lambda *a:{'ok':True,'ts':'1.0'},buildlog_poster=lambda *a:None,reactor=S.DryReactor(folder),
+                             poster=post,buildlog_poster=lambda *a:None,reactor=S.DryReactor(folder),
                              engine_timeout=.3,codex_home=str(home/'codex'))
             for _ in range(3):sup.run_once()
             tree_gone(rows(),'supervisor death orphan')
@@ -323,11 +352,12 @@ def supervisor_death():
             assert not any(r.get('success') for r in S.read_jsonl(str(home/'logs/attempts.jsonl'))),'orphaned event claimed success'
             status=S.status_text(folder).lower()
             assert 'running' not in status.split('persistent')[-1][:80] or S.persistent_status(folder)['state']!='running' or S.persistent_status(folder)['pid']!=hung['pid'],'dead supervisor child reported healthy'
-            fresh=S.new_event('cli',{'text':'B8_FRESH_AFTER_DEATH'},event_id='supdeath-fresh')
+            fresh=S.new_event('slack',{'channel':'C_B8','thread_ts':'1.0','ts':'1.2','user':'U_FOUNDER','text':'B8_FRESH_AFTER_DEATH',
+                                       'instructs':True,'addressed':True},event_id='supdeath-fresh')
             S.append_event(folder,fresh)
             with patch.object(S.time,'time',return_value=time.time()+86400):
                 for _ in range(3):sup.run_once()
-            assert fresh['id'] in S.handled_ids(folder),'fresh event was not completed after supervisor death'
+            fresh_completed(folder,fresh['id'],'B8_FRESH_AFTER_DEATH',rows,posted)
             assert len(effects())==1
         finally:
             (home/'stop-worker').write_text('1')
@@ -390,6 +420,10 @@ def separate_attach(exit_code=None):
             enqueue('AFTER_ATTACH','fresh')
             time.sleep(.2)
             assert not any('AFTER_ATTACH' in r.get('text','') for r in rows()),'supervisor wrote during attach'
+            # 1.2: ownership is reported truthfully while the interactive writer holds the conversation.
+            parked=S.persistent_status(folder)
+            assert parked['state']=='parked',('attach ownership not reported as parked',parked)
+            assert 'parked' in S.status_text(folder).lower(),'rendered status does not show the parked state'
             # Kill only CLI parent, leaving its interactive child alive at that instant.
             assert alive(interactive['pid'])
             if exit_code is None:
@@ -398,6 +432,10 @@ def separate_attach(exit_code=None):
                 (home/'attach-release').write_text(str(exit_code))
                 assert attached.wait(timeout=3)==exit_code,'attach exit status changed'
             wait_for(lambda:'fresh' in S.handled_ids(folder),'orphan attach prevented recovery')
+            fresh_completed(folder,'fresh','AFTER_ATTACH',rows)  # 2.3: completed, not merely handled
+            running=S.persistent_status(folder)
+            assert running['state']=='running' and running['pid']==[r for r in rows() if r['kind']=='start'][-1]['pid'],running
+            assert running['turns_served']>=1 and running['uptime_s']>=0 and 'parked' not in S.status_text(folder).lower()
             assert not alive(interactive['pid']),'orphan interactive writer survived recovery'
             starts=[r for r in rows() if r['kind']=='start']
             assert starts[-1]['sid']==old['sid'],'attach recovery changed conversation'
