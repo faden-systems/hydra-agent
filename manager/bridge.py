@@ -24,10 +24,12 @@ writes `logs/bridge.pid` so `hydra post` knows whether a bridge is there to drai
 """
 import argparse
 import contextlib
+import datetime as dt
 import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -623,7 +625,11 @@ class SocketHealth:
     app-level filtering) or a changed `client.current_session.last_ping_pong_time` has been observed within
     `timeout_s` seconds of monotonic elapsed time. An idle channel with fresh pongs stays healthy; outbound pings
     and Web API calls never count. A session replacement that happens to carry the same old pong timestamp cannot
-    buy fresh activity repeatedly: only a *changed* value counts."""
+    buy fresh activity repeatedly: only a *changed* value counts.
+
+    Requirement 1, loops/b9.md: `envelope_count` and `pong_count` count those same two kinds of inbound activity
+    (never outbound traffic), starting at 0 and never resetting while the process lives, exposed as integer
+    attributes and by `counters()`."""
 
     def __init__(self, client, clock=time.monotonic, timeout_s=300):
         self.client = client
@@ -631,6 +637,8 @@ class SocketHealth:
         self.timeout_s = timeout_s
         self._last_activity = clock()
         self._last_pong_seen = self._current_pong()
+        self.pong_count = 0
+        self.envelope_count = 0
 
     def _current_pong(self):
         session = getattr(self.client, "current_session", None)
@@ -639,12 +647,14 @@ class SocketHealth:
     def note_envelope(self, *args):
         """A raw Socket Mode receipt listener: `(client, request)`, but any arguments are accepted and ignored."""
         self._last_activity = self.clock()
+        self.envelope_count += 1
 
     def _note_pong_if_changed(self):
         current = self._current_pong()
         if current is not None and current != self._last_pong_seen:
             self._last_pong_seen = current
             self._last_activity = self.clock()
+            self.pong_count += 1
 
     def check(self):
         """True when healthy. Never reconnects by itself."""
@@ -652,6 +662,9 @@ class SocketHealth:
             return False
         self._note_pong_if_changed()
         return (self.clock() - self._last_activity) < self.timeout_s
+
+    def counters(self):
+        return {"pong_count": self.pong_count, "envelope_count": self.envelope_count}
 
 
 def _reconnect_or_die(client, timeout_s):
@@ -704,24 +717,102 @@ def _verify_fresh_activity_or_die(health, clock, grace_s, stop):
         time.sleep(min(0.01, grace_s))
 
 
-def run_socket_mode(handler, stop, clock=time.monotonic, poll_s=10, reconnect_timeout_s=30):
+def _iso_utc(ts=None):
+    """UTC ISO 8601 ending in `Z`, millisecond precision; `ts` a `time.time()`-style epoch, else now."""
+    moment = dt.datetime.now(dt.timezone.utc) if ts is None else dt.datetime.fromtimestamp(ts, dt.timezone.utc)
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+_PROCESS_STARTED_AT = _iso_utc()  # fixed for the life of the process (requirement 3, loops/b9.md)
+
+
+def health_snapshot(health, reconnect_count, poll_s, clock):
+    """The telemetry-only snapshot of one poll's observable state (requirement 3, loops/b9.md): exactly the
+    metadata keys below, nothing from Slack. `reconnect_count` and `poll_s` are owned by the caller
+    (`run_socket_mode`); `clock` supplies both `monotonic` and the age of the last inbound activity."""
+    now = clock()
+    counts = health.counters()
+    return {
+        "at": _iso_utc(),
+        "monotonic": now,
+        "pid": os.getpid(),
+        "process_started_at": _PROCESS_STARTED_AT,
+        "connected": bool(health.client.is_connected()),
+        "pong_count": counts["pong_count"],
+        "envelope_count": counts["envelope_count"],
+        "reconnect_count": reconnect_count,
+        "last_activity_age_s": now - health._last_activity,
+        "poll_s": poll_s,
+    }
+
+
+def write_health_observation(path, snapshot):
+    """Atomic telemetry write (requirement 3/4, loops/b9.md): a sibling temporary file in `path`'s own directory,
+    then `os.replace`, so a reader never sees a partial file and none is left behind by any failure -- a bad
+    snapshot, an unwritable directory, or a failed replacement. Returns True or False; never raises."""
+    try:
+        text = json.dumps(snapshot)
+    except (TypeError, ValueError):
+        return False
+    directory = os.path.dirname(path) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".bridge-health-", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        tmp = None
+        return True
+    except Exception:
+        return False
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
+
+def run_socket_mode(handler, stop, clock=time.monotonic, poll_s=10, reconnect_timeout_s=30, observation_path=None):
     """The required testable seam (requirement 2, loops/b7.md): connects once, installs the raw receipt listener,
     then monitors `SocketHealth` in the calling thread (never a background one: "a background SystemExit alone is
     insufficient" means the process must actually fail from its own main thread) every `poll_s` seconds, at most
     `reconnect_timeout_s` seconds per recovery attempt plus the same bound again to verify fresh activity
     (requirement 23, loops/b7.md: B4). Disables the SDK's own competing auto-reconnect for this managed lifecycle.
     Raises (an exception, or lets one propagate) on failed recovery; it never calls `handler.start()`, which
-    blocks forever instead of returning control to the caller."""
+    blocks forever instead of returning control to the caller.
+
+    Requirement 2/3/4, loops/b9.md: `reconnect_count` accumulates recovery attempts across this invocation,
+    counted before an attempt's outcome is known. With `observation_path` set, every poll iteration writes
+    exactly one snapshot in that iteration's `finally`, after the health check and any recovery, through
+    `health_snapshot` and `write_health_observation` by those module-level names (so a fatal recovery attempt is
+    still counted in the last snapshot written). Snapshot construction and writing share one telemetry-only
+    exception boundary: a failure there is logged at most once per failed-poll streak and never changes the
+    health result, the recovery decision, or a recovery exception in flight."""
     client = handler.client
     client.auto_reconnect_enabled = False
     client.default_auto_reconnect_enabled = False
     health = SocketHealth(client, clock=clock, timeout_s=300)
     client.socket_mode_request_listeners.append(health.note_envelope)
     handler.connect()
+    reconnect_count = 0
+    failed_streak = False
     while not stop.is_set():
-        if not health.check():
-            _reconnect_or_die(client, reconnect_timeout_s)
-            _verify_fresh_activity_or_die(health, clock, reconnect_timeout_s, stop)
+        try:
+            if not health.check():
+                reconnect_count += 1
+                _reconnect_or_die(client, reconnect_timeout_s)
+                _verify_fresh_activity_or_die(health, clock, reconnect_timeout_s, stop)
+        finally:
+            if observation_path is not None:
+                try:
+                    snapshot = health_snapshot(health, reconnect_count, poll_s, clock)
+                    wrote = write_health_observation(observation_path, snapshot)
+                except Exception:
+                    wrote = False
+                if wrote:
+                    failed_streak = False
+                elif not failed_streak:
+                    S.log("health observation write failed; monitoring continues")
+                    failed_streak = True
         if stop.wait(poll_s):
             return
 
@@ -766,7 +857,9 @@ def serve(home):
     handler = SocketModeHandler(app, app_token)
     S.log(f"bridge up as {bot_user_id}, home={home}")
     try:
-        run_socket_mode(handler, stop)  # connects once; raises on failed recovery (requirement 2, loops/b7.md)
+        # connects once; raises on failed recovery (requirement 2, loops/b7.md); writes the idle-pong observation
+        # file every poll (requirement 3, loops/b9.md)
+        run_socket_mode(handler, stop, observation_path=os.path.join(home, "logs", "bridge-health.json"))
     finally:
         stop.set()
         pump.join(5)

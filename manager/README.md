@@ -37,6 +37,7 @@ logs/compaction.json        the compaction policy's state: pending, verify, last
 logs/reactions.json         {event id: {channel, ts, thread_ts, name, at}}: the reactions the working indicator has standing on messages (name: eyes, hourglass_flowing_sand or x)
 logs/outbox.json            {posted, failed, last_at}: what the bridge has posted from the outbox (`hydra status` shows it)
 logs/bridge.pid             the bridge service's pid: `hydra post` waits for the post when a bridge is alive
+logs/bridge-health.json     the bridge's own idle-pong telemetry, rewritten every poll (see "The bridge")
 logs/heartbeat, logs/supervisor.pid, logs/notes.json, logs/retry-after, logs/posts.jsonl and logs/reactions.jsonl (dry mode)
 threads.json                {channel: {thread_ts: {joined_at, last_seen}}}: the threads the manager is part of (bridge and supervisor both write it, under threads.json.lock)
 COMPACT                     present: a compaction runs before the next turn (hydra compact, @manager compact); content is who asked
@@ -378,6 +379,16 @@ HH:MMZ tool: ...
   "paused (by …)" to mentions and queues them; while `hydra attach` holds `WRITER` it answers "manager in console
   session".
 - Files are downloaded with `files:read` to `inbox/files/<ts>-<name>`; the path travels in the event.
+- Idle-pong telemetry (`loops/b9.md`): `SocketHealth` counts the two kinds of inbound Socket Mode activity it
+  already watches for liveness -- `envelope_count` (one per raw receipt) and `pong_count` (one per *changed*
+  `last_ping_pong_time`; an unchanged value, or a replacement session carrying the old one, never counts).
+  Outbound pings and Web API calls stay invisible. `run_socket_mode` also counts `reconnect_count` (one per
+  recovery attempt, before its outcome is known, so a fatal attempt is still counted) and, every poll, writes
+  `logs/bridge-health.json` (`health_snapshot` then `write_health_observation`, an atomic sibling-temp-file-then-
+  `os.replace`): `at`, `monotonic`, `pid`, `process_started_at`, `connected`, `pong_count`, `envelope_count`,
+  `reconnect_count`, `last_activity_age_s` and `poll_s` -- metadata only, nothing from Slack. A failed snapshot or
+  write never changes the health result or the recovery decision, and logs at most one `health observation`
+  diagnostic per streak of failed polls.
 
 ## The console
 
