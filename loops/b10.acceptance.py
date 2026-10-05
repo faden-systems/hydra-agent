@@ -407,27 +407,51 @@ def dirty_sync_then_persist():
 
 
 def rebase_in_progress():
-    """Requirements 1 and 7j: an unfinished rebase blocks before any git call."""
+    """Requirements 1 and 7j: an unfinished rebase (either metadata directory) blocks each entry point before any
+    git call, on a fresh supervisor with no preceding blocked call."""
+    for marker in ('rebase-merge', 'rebase-apply'):
+        for entry in ('sync', 'persist'):
+            remote, repo, other = make_repo()
+            h = home()
+            write_state(h, {'tracks': []})
+            now = [4500.0]
+            sup = make_sup(h, repo, now)
+            (repo / '.git' / marker).mkdir()
+            if entry == 'sync':
+                _, calls = trace(sup, sup.sync_repo_before)
+            else:
+                ok, calls = trace(sup, lambda: sup.persist(1))
+                assert ok is False
+            st = status(h)
+            assert calls == [], f'{entry} must not touch git during a rebase ({marker}): {calls}'
+            assert st['status'] == 'blocked' and st['error'].startswith('rebase: rebase in progress'), (marker, entry, st)
+            assert S.read_outbox(h) == []
+            (repo / '.git' / marker).rmdir()
+            now[0] = 4600.0
+            sup.sync_repo_before()
+            assert sup.persist(2) is True and status(h)['status'] == 'synced'
+            assert S.read_outbox(h) == []
+    print('rebase in progress: ok')
+
+
+def fast_forward_sync():
+    """Requirements 1 and 7m: a remote ahead of a clone with no unpushed commits is fast-forwarded."""
     remote, repo, other = make_repo()
     h = home()
     write_state(h, {'tracks': []})
-    now = [4500.0]
+    external = push_other(other, 'external', 'keep')
+    now = [4700.0]
     sup = make_sup(h, repo, now)
-    (repo / '.git' / 'rebase-merge').mkdir()
     _, calls = trace(sup, sup.sync_repo_before)
-    st = status(h)
-    assert calls == [], f'sync must not touch git during a rebase: {calls}'
-    assert st['status'] == 'blocked' and st['error'].startswith('rebase: rebase in progress'), st
-    ok, calls = trace(sup, lambda: sup.persist(1))
-    assert ok is False and calls == [], calls
-    assert status(h)['error'].startswith('rebase: rebase in progress')
+    branch = git(repo, 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    assert head(repo) == external == git(repo, 'rev-parse', f'origin/{branch}').stdout.strip(), 'not fast-forwarded'
+    assert (repo / 'external').read_text() == 'keep'
+    assert git(repo, 'rev-list', '--merges', 'HEAD').stdout.strip() == ''
+    assert not Path(h, 'logs', 'persistence.json').exists() or status(h).get('status') not in ('pending', 'blocked')
     assert S.read_outbox(h) == []
-    (repo / '.git' / 'rebase-merge').rmdir()
-    now[0] = 4600.0
-    sup.sync_repo_before()
-    assert sup.persist(2) is True and status(h)['status'] == 'synced'
-    assert S.read_outbox(h) == []
-    print('rebase in progress: ok')
+    assert sup.persist(1) is True and head(remote) == head(repo)
+    no_merges(remote)
+    print('fast-forward sync: ok')
 
 
 def legacy_records():
@@ -590,13 +614,21 @@ def notice_from_failed_attempt():
     now = [8000.0]
     sup = make_sup(h, repo, now)
     assert sup.persist(1) is False and S.read_outbox(h) == []
+    first_error = status(h)['error']
+    assert first_error.startswith('push: ')
+    missing = remote.parent / 'missing.git'
+    git(repo, 'remote', 'set-url', 'origin', str(missing))  # the threshold attempt fails at a different step
     now[0] = 8300.0
     ok, calls = trace(sup, lambda: sup.persist(2))
-    assert ok is False and [c[0] for c in calls].count('push') == 1, calls
+    assert ok is False and 'push' not in [c[0] for c in calls], calls
+    st = status(h)
+    assert st['error'].startswith('fetch: ') and st['error'] != first_error and 'missing.git' in st['error'], st['error']
     notices = S.read_outbox(h)
     assert len(notices) == 1, notices
-    assert notices[0]['text'] == f"persistence pending for 5 min: {S.notice_error_summary(status(h)['error'])}", notices[0]['text']
-    assert status(h)['notice_at'] == 8300.0 and status(h)['failures'] == 2
+    assert notices[0]['text'] == f"persistence pending for 5 min: {S.notice_error_summary(st['error'])}", notices[0]['text']
+    assert notices[0]['text'].startswith('persistence pending for 5 min: fetch: ') and 'missing.git' in notices[0]['text']
+    assert st['notice_at'] == 8300.0 and st['failures'] == 2
+    git(repo, 'remote', 'set-url', 'origin', str(remote))
     now[0] = 8361.0
     assert sup.persist(3) is False and len(S.read_outbox(h)) == 1
     print('notice from failed attempt: ok')
@@ -667,6 +699,7 @@ if __name__ == '__main__':
     conflict_blocks()
     dirty_sync_then_persist()
     rebase_in_progress()
+    fast_forward_sync()
     legacy_records()
     abort_failure()
     notice_from_failed_attempt()
