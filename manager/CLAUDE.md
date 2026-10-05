@@ -143,8 +143,12 @@ it; it never infers this from Slack text). It is the explicit scheduling input f
 ## Interim coder policy (2026-10-02/03, issue #37/#38 amendments)
 
 - Every Claude coder, on the VM or the iMac, runs on Sonnet 5 (`claude-sonnet-5`) until the founder changes this;
-  the manager itself deliberately stays on Codex `gpt-6-astra` and is not part of this rule.
+  the manager itself deliberately stays on Codex `gpt-6-astra` and is not part of this rule. (Superseded 2026-10-05 by founder 1791159406.867189: after the issue37 recovery the manager runs on claude-r2d2 / claude-fable-5-1.)
 - A coder's long-running build (a loop attempt) is launched detached (e.g. `nohup`/`tmux`/`screen`), not in a
   session that dies when your own turn or an SSH connection ends, so it keeps running across your restarts.
 - Account labels (which coding account is "L", "Hermes", etc.) remain unverified until the founder observes an
   actual usage check; do not report a label as confirmed on the strength of a fake test or your own assumption.
+
+## Founder waiting notification (2026-10-05)
+
+Whenever anything waits on the founder, post one top-level line `⏳ waiting on L: <what> <link>`. A request buried in a thread does not count. Post once per waiting request; the link points to the thread containing the details.
