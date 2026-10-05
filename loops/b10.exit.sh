@@ -10,7 +10,7 @@ FROZEN="loops/b10.md loops/b10.exit.sh loops/b10.acceptance.py loops/b7.acceptan
 EXEMPT="test_failure_then_recovery_sends_exactly_two_deduplicated_notices test_diverged_histories_reconcile_with_an_ordinary_merge"
 fence() {
   local changed fixtures bad f
-  changed=$( (git diff --name-only "$BASE" HEAD; git diff --name-only "$BASE"; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
+  changed=$( (git diff --no-renames --name-only "$BASE" HEAD; git diff --no-renames --name-only "$BASE"; git diff --no-renames --name-only; git diff --no-renames --cached --name-only; git ls-files --others --exclude-standard) | sort -u )
   fixtures=$(printf '%s\n' "$changed" | grep -E '^tests/manager/fixtures/' || true)
   test -z "$fixtures" || fail "recorded fixtures changed (committed, staged, unstaged or untracked): $fixtures"
   bad=$(printf '%s\n' "$changed" | grep -Ev '^$|^manager/(supervisor\.py|README\.md)$|^tests/manager/|^docs/notes/b10\.md$' || true)
@@ -19,10 +19,30 @@ fence() {
 }
 fence
 test -f docs/notes/b10.md || fail 'docs/notes/b10.md missing'
-for section in '## What changed' '## Evidence' '## Open questions'; do
-  grep -qF "$section" docs/notes/b10.md || fail "docs/notes/b10.md lacks the section '$section'"
-done
 PYTHON="${PYTHON:-python3}"
+# Notes gate (requirement 8): real headings with bodies, evidence content, no Slack ids / tokens / hostnames.
+"$PYTHON" - <<'PY' || fail 'notes gate'
+import re,sys
+from pathlib import Path
+text=Path('docs/notes/b10.md').read_text()
+sections={}
+current=None
+for line in text.splitlines():
+    if line.startswith('## '):
+        current=line[3:].strip();sections.setdefault(current,[])
+    elif current is not None:
+        sections[current].append(line)
+for name in ('What changed','Evidence','Open questions'):
+    assert name in sections,f'docs/notes/b10.md lacks the heading "## {name}"'
+    body=' '.join(l.strip() for l in sections[name] if l.strip() and not l.startswith('#'))
+    assert len(body)>=4,f'section "{name}" has no body'
+evidence=' '.join(sections['Evidence'])
+assert re.search(r'\b\d+ passed\b',evidence),'Evidence lacks a pytest count'
+assert '[b10.acceptance] PASS' in evidence,'Evidence lacks the acceptance PASS line'
+for label,pat in (('Slack id',r'\b[CUW]0[A-Z0-9]{8,}\b'),('token',r'xox[a-z]-|ghp_[A-Za-z0-9]|sk-ant-|CLAUDE_CODE_OAUTH_TOKEN='),('tailnet address',r'\b100\.\d+\.\d+\.\d+\b'),('hostname',r'\b[a-z0-9-]+\.local\b|\bhydra-manager\b')):
+    assert not re.search(pat,text),f'notes contain a {label}'
+print('[b10] notes ok')
+PY
 "$PYTHON" -c 'import pytest, slack_bolt, slack_sdk' || fail 'install pytest, slack_bolt and slack_sdk in the selected Python environment'
 grep -q 'PERSISTENCE_NOTICE_AFTER_S = 300' manager/supervisor.py || fail 'PERSISTENCE_NOTICE_AFTER_S = 300 missing (requirement 3)'
 grep -Eq '^def notice_error_summary\(' manager/supervisor.py || fail 'module-level notice_error_summary missing (requirement 4)'

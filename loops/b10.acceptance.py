@@ -82,11 +82,35 @@ def make_sup(h, repo, now):
                         poster=lambda *a: None)
 
 
+ALLOWED_GIT = {'fetch', 'rebase', 'push', 'rev-parse', 'merge-base', 'status', 'add', 'diff', 'commit'}
+
+
+def check_trace(calls):
+    """Requirement 7i: only plain, argument-exact persistence commands; nothing destructive anywhere."""
+    for call in calls:
+        args = tuple(a for a in call if a != '-q')
+        name = args[0] if args else ''
+        assert name in ALLOWED_GIT, f'forbidden git command issued by persistence: {call}'
+        assert not any(str(a).startswith('--force') or a in ('-f', '--hard') for a in args), f'forbidden flag: {call}'
+        if name == 'push':
+            assert args == ('push', 'origin', 'HEAD'), f'push must be plain: {call}'
+        elif name == 'fetch':
+            assert args == ('fetch', 'origin'), f'fetch must be plain: {call}'
+        elif name == 'rebase':
+            assert args == ('rebase', '--abort') or (len(args) == 2 and args[1].startswith('origin/')), f'rebase shape: {call}'
+
+
 def tick(sup, git_allowed=True):
-    with patch.object(sup, 'compaction_due', return_value=(False, '')), \
-            patch.object(sup, '_git', wraps=sup._git) as wrapped:
+    calls = []
+    real = sup._git
+
+    def wrapped(*args, **kw):
+        calls.append(tuple(args))
+        return real(*args, **kw)
+    with patch.object(sup, 'compaction_due', return_value=(False, '')), patch.object(sup, '_git', wrapped):
         result = sup.run_once()
-    assert git_allowed or not wrapped.called, 'this tick must not touch git'
+    assert git_allowed or not calls, f'this tick must not touch git: {calls}'
+    check_trace(calls)
     return result
 
 
@@ -104,6 +128,7 @@ def trace(sup, fn):
         return real(*args, **kw)
     with patch.object(sup, '_git', wrapped):
         result = fn()
+    check_trace(calls)
     return result, calls
 
 
@@ -469,6 +494,74 @@ def legacy_records():
     print('legacy records: ok')
 
 
+def abort_failure():
+    """Requirement 7k: a rebase whose abort also fails blocks with both outputs and builds on nothing."""
+    import subprocess as sp
+    for entry in ('sync', 'persist'):
+        remote, repo, other = make_repo()
+        h = home()
+        write_state(h, {'tracks': []})
+        hook = reject(remote)
+        now = [7000.0]
+        sup = make_sup(h, repo, now)
+        assert sup.persist(1) is False
+        local = head(repo)
+        hook.unlink()
+        push_other(other, 'external', 'keep')  # the retry must rebase
+        real = sup._git
+        calls = []
+
+        def fake(*args, **kw):
+            calls.append(tuple(args))
+            if args and args[0] == 'rebase':
+                if '--abort' in args:
+                    return sp.CompletedProcess(args, 1, '', 'fake abort failure')
+                return sp.CompletedProcess(args, 1, '', 'CONFLICT (fake) could not apply')
+            return real(*args, **kw)
+        now[0] = 7061.0
+        with patch.object(sup, '_git', fake):
+            if entry == 'sync':
+                sup.sync_repo_before()
+                assert sup.persist(2) is False
+            else:
+                assert sup.persist(2) is False
+        names = [c[0] for c in calls]
+        assert 'push' not in names, names
+        i = names.index('rebase')
+        assert names[i + 1] == 'rebase' and '--abort' in calls[i + 1], names
+        assert names[i + 2:] == [], f'nothing may follow the failed abort: {names[i + 2:]}'
+        st = status(h)
+        assert st['status'] == 'blocked' and st['error'].startswith('rebase: '), st
+        assert 'CONFLICT (fake)' in st['error'] and 'abort: fake abort failure' in st['error'], st['error']
+        assert head(repo) == local
+        (repo / '.git' / 'rebase-merge').mkdir()  # the metadata a failed abort leaves behind
+        ok, calls2 = trace(sup, lambda: sup.persist(3))
+        assert ok is False and calls2 == [], calls2
+        assert status(h)['status'] == 'blocked' and S.read_outbox(h) == []
+    print('abort failure: ok')
+
+
+def notice_from_failed_attempt():
+    """Requirement 7l: the failed attempt itself crossing the threshold queues the notice, no tick needed."""
+    remote, repo, other = make_repo()
+    h = home()
+    write_state(h, {'tracks': []})
+    hook = reject(remote)
+    now = [8000.0]
+    sup = make_sup(h, repo, now)
+    assert sup.persist(1) is False and S.read_outbox(h) == []
+    now[0] = 8300.0
+    ok, calls = trace(sup, lambda: sup.persist(2))
+    assert ok is False and [c[0] for c in calls].count('push') == 1, calls
+    notices = S.read_outbox(h)
+    assert len(notices) == 1, notices
+    assert notices[0]['text'] == f"persistence pending for 5 min: {S.notice_error_summary(status(h)['error'])}", notices[0]['text']
+    assert status(h)['notice_at'] == 8300.0 and status(h)['failures'] == 2
+    now[0] = 8361.0
+    assert sup.persist(3) is False and len(S.read_outbox(h)) == 1
+    print('notice from failed attempt: ok')
+
+
 def summary_contract():
     """Requirement 4: the one-line summary of a stored error."""
     f = S.notice_error_summary
@@ -533,4 +626,6 @@ if __name__ == '__main__':
     dirty_sync_then_persist()
     rebase_in_progress()
     legacy_records()
+    abort_failure()
+    notice_from_failed_attempt()
     print('[b10.acceptance] PASS')
