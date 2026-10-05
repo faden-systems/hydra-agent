@@ -15,6 +15,7 @@ REQUIRED = ('at', 'monotonic', 'pid', 'process_started_at', 'connected', 'pong_c
 MIN_SPAN_S = 300.0
 FRESH_S = 300.0
 GAP_FACTOR = 3.0  # a sampling gap longer than GAP_FACTOR x the sampling interval breaks a run (round 1: 2.4)
+LAG_FACTOR = 3.0  # round 3 B1: a snapshot older than LAG_FACTOR x poll_s at read time is stalled telemetry
 INFINITE = (float('inf'), float('-inf'))
 
 
@@ -70,14 +71,28 @@ def read_sample(path):
     return sample
 
 
+def telemetry_lag(sample):
+    """Observer monotonic read time minus the snapshot's monitor monotonic time. Both are CLOCK_MONOTONIC on the
+    same VM (the observer runs where the bridge runs), so this is how old the snapshot was when it was read."""
+    return sample['sampled_mono'] - sample['monotonic']
+
+
 def eligible(sample):
-    """Round 1 B2: a sample may start or extend a quiet run only when readable, connected and fresh."""
+    """Round 1 B2 / round 3 B1: a sample may start or extend a quiet run only when readable, connected, fresh,
+    and its telemetry is live: the snapshot was written within LAG_FACTOR x poll_s before it was read."""
     if 'error' in sample:
         return sample['error']
     if sample['connected'] is not True:
         return 'disconnected'
     if not (sample['last_activity_age_s'] < FRESH_S):
         return 'activity stale'
+    if 'sampled_mono' not in sample:
+        return 'no observer monotonic time'
+    lag = telemetry_lag(sample)
+    if lag < 0:
+        return 'telemetry clock skew'
+    if lag > LAG_FACTOR * float(sample['poll_s']):
+        return 'stale telemetry'
     return None
 
 
@@ -203,7 +218,7 @@ def synthetic(n, interval=10.0, pid=4242, start='2026-10-05T01:00:00Z', mutate=N
         s = {'sampled_at': 1000.0 + i * interval, 'sampled_mono': 5000.0 + i * interval, 'pid': pid,
              'process_started_at': start, 'connected': True, 'envelope_count': 7, 'reconnect_count': 0,
              'pong_count': 100 + i * 2, 'last_activity_age_s': 3.0, 'at': at_of(i), 'poll_s': 10,
-             'monotonic': 500.0 + i * interval}
+             'monotonic': 4997.0 + i * interval}  # written 3 s before each read: live telemetry
         if mutate:
             mutate(i, s)
         samples.append(s)
@@ -281,16 +296,33 @@ def self_test():
     assert evaluate(synthetic(33, mutate=disconnected_first))['verdict'] == 'observed', '310 s after an ineligible first sample qualifies'
     # Round 1 2.5: a qualifying prefix followed by a frozen-file tail still qualifies and the interval is retained.
     def frozen_tail(i, s):
-        if i >= 32: s['at'] = at_of(31); s['pong_count'] = 100 + 31 * 2
+        if i >= 32: s['at'] = at_of(31); s['pong_count'] = 100 + 31 * 2; s['monotonic'] = 4997.0 + 31 * 10
     v = evaluate(synthetic(80, mutate=frozen_tail))
     assert v['verdict'] == 'observed' and v['qualifying_interval']['to_index'] == 31, v['qualifying_interval']
-    assert v['longest_run']['span_s'] == 790.0 and v['longest_run']['qualifies'], v['longest_run']
+    assert v['runs'][0]['broken_by'] == 'stale telemetry' and v['runs'][0]['qualifies'], v['runs'][0]
+    # Round 3 B1: a monitor that stalls after 150 s cannot qualify, even though 16 distinct `at` values, a pong rise
+    # and a frozen "fresh" age survive in the frozen file: the snapshot's monotonic time falls behind the read time.
+    def stalled_monitor(i, s):
+        if i >= 16:
+            frozen = synthetic(16)[15]
+            for k in ('at', 'monotonic', 'pong_count', 'last_activity_age_s'): s[k] = frozen[k]
+    v = evaluate(synthetic(32, mutate=stalled_monitor))
+    assert v['verdict'] == 'not observed', 'a stalled monitor must not qualify'
+    assert v['runs'][0]['broken_by'] == 'stale telemetry' and v['runs'][0]['span_s'] < 300, v['runs']
+    assert evaluate(synthetic(64, mutate=stalled_monitor))['verdict'] == 'not observed', 'a longer frozen tail is still stalled'
+    def lagging_but_live(i, s):
+        s['monotonic'] = 5000.0 + i * 10 - 30.0  # exactly three polls behind: still live
+    assert evaluate(synthetic(40, mutate=lagging_but_live))['verdict'] == 'observed'
+    def future_snapshot(i, s):
+        if i == 20: s['monotonic'] = s['sampled_mono'] + 1
+    v = evaluate(synthetic(40, mutate=future_snapshot))
+    assert v['runs'][0]['broken_by'] == 'telemetry clock skew', v['runs']
     # Round 1 2.4: wall-clock jumps do not inflate spans; an observer stall breaks the run as a sampling gap.
     def wall_jump(i, s):
         if i >= 10: s['sampled_at'] += 10000
     assert evaluate(synthetic(31, mutate=wall_jump))['verdict'] == 'not observed', 'wall-clock jump inflated the span'
     def stall(i, s):
-        if i >= 20: s['sampled_mono'] += 60; s['sampled_at'] += 60
+        if i >= 20: s['sampled_mono'] += 60; s['sampled_at'] += 60; s['monotonic'] += 60  # the observer stalled, the monitor did not
     v = evaluate(synthetic(40, mutate=stall))
     assert v['verdict'] == 'not observed' and v['runs'][0]['broken_by'] == 'sampling gap', v['runs']
     assert evaluate(synthetic(40, mutate=stall), interval=30)['verdict'] == 'observed', 'the gap rule scales with the declared interval'
@@ -360,6 +392,24 @@ def self_test():
         assert closure_check(out) is None
         (out / 'samples.jsonl').write_text('')
         assert closure_check(out) == 'samples digest differs'
+    # Round 3 5.1: the deployment identity check applies to the qualifying interval of an `observed` verdict only.
+    with tempfile.TemporaryDirectory(prefix='b9-closure-') as tmp:
+        out = Path(tmp)
+        def other_process_first(i, s):
+            if i == 0: s['pid'] = 1111; s['process_started_at'] = '2026-10-04T00:00:00Z'
+            if i == 1: malform(s, pid=None)
+        samples = synthetic(40, mutate=other_process_first)
+        raw = ''.join(json.dumps(x) + '\n' for x in samples).encode()
+        (out / 'samples.jsonl').write_bytes(raw)
+        evaluation = evaluate(samples, 10.0)
+        assert evaluation['verdict'] == 'observed' and evaluation['qualifying_interval']['from_index'] == 2
+        (out / 'verdict.json').write_text(json.dumps({'verdict': 'observed', 'evaluation': evaluation,
+                                                      'samples_sha256': hashlib.sha256(raw).hexdigest(),
+                                                      'metadata': {'interval_s': 10.0}}))
+        assert closure_check(out) is None
+        assert closure_check(out, pid=4242, process_started_at='2026-10-05T01:00:00Z') is None, 'earlier process and error samples outside the interval are allowed'
+        assert closure_check(out, pid=1111).startswith('qualifying interval sample pid 4242')
+        assert closure_check(out, pid=4242, process_started_at='x').startswith('qualifying interval sample process_started_at')
     print('[b9.observe] self-test PASS')
 
 
@@ -370,9 +420,11 @@ def recompute(samples_path, interval=None):
     return {'evaluation': evaluate(samples, interval), 'samples_sha256': hashlib.sha256(raw).hexdigest()}
 
 
-def closure_check(evidence_dir):
+def closure_check(evidence_dir, pid=None, process_started_at=None):
     """Requirement 9: None when the recorded verdict.json matches a recomputation from samples.jsonl field for
-    field (evaluation and digest, using the recorded interval); otherwise the first difference."""
+    field (evaluation and digest, using the recorded interval); otherwise the first difference. Round 3 5.1: when
+    the verdict is `observed` and a deployment identity is given, every sample of the qualifying interval must
+    carry that pid (and process_started_at when given); error samples and other runs are not required to."""
     evidence_dir = Path(evidence_dir)
     recorded = json.loads((evidence_dir / 'verdict.json').read_text())
     again = recompute(str(evidence_dir / 'samples.jsonl'), recorded['metadata']['interval_s'])
@@ -382,6 +434,15 @@ def closure_check(evidence_dir):
         return 'evaluation differs'
     if recorded.get('verdict') != again['evaluation']['verdict']:
         return 'verdict field differs from evaluation'
+    if again['evaluation']['verdict'] == 'observed' and (pid is not None or process_started_at is not None):
+        interval = again['evaluation']['qualifying_interval']
+        raw = (evidence_dir / 'samples.jsonl').read_bytes().decode().splitlines()
+        samples = [json.loads(line) for line in raw if line.strip()]
+        for sample in samples[interval['from_index']:interval['to_index'] + 1]:
+            if pid is not None and sample.get('pid') != pid:
+                return f'qualifying interval sample pid {sample.get("pid")} is not the deployed bridge pid {pid}'
+            if process_started_at is not None and sample.get('process_started_at') != process_started_at:
+                return 'qualifying interval sample process_started_at differs from the deployed bridge'
     return None
 
 
@@ -389,6 +450,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--evaluate', metavar='SAMPLES_JSONL', help='recompute evaluation and digest from retained samples')
     parser.add_argument('--closure-check', metavar='EVIDENCE_DIR', help='compare verdict.json with a recomputation; exit 1 on difference')
+    parser.add_argument('--deployed-pid', type=int, help='with --closure-check: the bridge MainPID every qualifying sample must carry')
+    parser.add_argument('--deployed-process-started-at', help='with --closure-check: the process_started_at every qualifying sample must carry')
     parser.add_argument('--path')
     parser.add_argument('--minutes', type=float, default=15)
     parser.add_argument('--interval', type=float, default=10)
@@ -403,7 +466,7 @@ def main():
         print(json.dumps(recompute(args.evaluate, args.interval), indent=2, sort_keys=True))
         return
     if args.closure_check:
-        difference = closure_check(args.closure_check)
+        difference = closure_check(args.closure_check, args.deployed_pid, args.deployed_process_started_at)
         print(difference or 'closure check: recorded verdict matches recomputation')
         raise SystemExit(1 if difference else 0)
     if not (args.path and args.out and args.deployed_sha):

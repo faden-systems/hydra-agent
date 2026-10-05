@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exit-owned offline b9 contracts (loops/b9.md). No real Slack, credentials or network."""
+import contextlib
 import datetime as dt
 import json
 import os
@@ -231,69 +232,104 @@ def scheduled_polls(schedule, on_poll, observation_path, logs):
     return [m for m in logs[before:] if 'health observation' in m]
 
 
+def failure_layers(tmp):
+    """Round 2 2.1 / round 3 1.1: every way a poll's telemetry can fail, each armed by `layer.arm(flag)` and
+    active only inside `layer.patched()`. All go through the production monitor; nothing else is patched."""
+    real_snapshot, real_writer, real_replace = B.health_snapshot, B.write_health_observation, os.replace
+    layers = []
+
+    class Layer:
+        def __init__(self, name, patched, on_arm=None):
+            self.name, self.patched, self.on_arm, self.armed = name, patched, on_arm, False
+            layers.append(self)
+
+        def arm(self, flag):
+            self.armed = flag
+            if self.on_arm:
+                self.on_arm(flag)
+
+    snapshot_raises = Layer('snapshot raises', lambda: patch.object(B, 'health_snapshot', side_effect=lambda *a, **k: (
+        (_ for _ in ()).throw(RuntimeError('fixture snapshot failure')) if snapshot_raises.armed else real_snapshot(*a, **k))))
+    writer_false = Layer('writer returns False', lambda: patch.object(B, 'write_health_observation', side_effect=lambda p, snap: (
+        False if writer_false.armed else real_writer(p, snap))))
+    writer_raises = Layer('writer raises', lambda: patch.object(B, 'write_health_observation', side_effect=lambda p, snap: (
+        (_ for _ in ()).throw(OSError('fixture writer failure')) if writer_raises.armed else real_writer(p, snap))))
+    serialization = Layer('serialization fails', lambda: patch.object(B, 'health_snapshot', side_effect=lambda *a, **k: (
+        dict(real_snapshot(*a, **k), poison=object()) if serialization.armed else real_snapshot(*a, **k))))
+    replace_fails = Layer('os.replace fails', lambda: patch.object(B.os, 'replace', side_effect=lambda src, dst: (
+        (_ for _ in ()).throw(OSError('fixture replace failure')) if replace_fails.armed else real_replace(src, dst))))
+    directory = Path(tmp) / 'fs-layer'
+    directory.mkdir()
+    filesystem = Layer('directory unwritable', contextlib.nullcontext, lambda flag: os.chmod(directory, 0o500 if flag else 0o700))
+    filesystem.directory = directory
+    return layers
+
+
 def telemetry_boundary():
-    """Round 1 1.2 / 5.1, round 2 2.1: within ONE monitor invocation, the deterministic poll sequence
-    fail, fail, ok, fail, fail produces exactly two `health observation` diagnostics across every logging layer,
-    for each failure layer separately: snapshot construction raising, the writer returning False, and the real
-    writer failing on the filesystem. Telemetry failures never alter health or recovery outcomes."""
+    """Round 1 1.2 / 5.1, round 2 2.1, round 3 1.1: within ONE monitor invocation, the deterministic poll
+    sequence fail, fail, ok, fail, fail produces exactly two `health observation` diagnostics across every logging
+    layer, for each failure layer separately (snapshot raising, writer returning False, writer raising,
+    serialization failure, os.replace failure, unwritable directory) and for consecutive failures that switch
+    layers without a successful write. Telemetry failures never alter health or recovery outcomes in any layer."""
     logs = []
     schedule = [True, True, False, True, True]
     with tempfile.TemporaryDirectory(prefix='b9-') as tmp, \
             patch.object(B.S, 'log', side_effect=lambda message: logs.append(str(message))):
-        # Layer 1: health_snapshot raises on the scheduled polls.
-        arm = [False]
-        real_snapshot = B.health_snapshot
-
-        def flaky_snapshot(*args, **kwargs):
-            if arm[0]:
-                raise RuntimeError('fixture snapshot failure')
-            return real_snapshot(*args, **kwargs)
-        path = Path(tmp) / 'snapshot-layer.json'
-        with patch.object(B, 'health_snapshot', side_effect=flaky_snapshot):
-            diagnostics = scheduled_polls(schedule, lambda i, flag: arm.__setitem__(0, flag), str(path), logs)
-        assert len(diagnostics) == 2, ('snapshot layer: exactly two diagnostics for two streaks', diagnostics, logs)
-        assert path.is_file(), 'the ok poll wrote the file'
-        # Layer 2: the writer returns False on the scheduled polls (no exception anywhere).
-        real_writer = B.write_health_observation
-
-        def refusing_writer(p, snapshot):
-            return False if arm[0] else real_writer(p, snapshot)
-        logs.clear()
-        path = Path(tmp) / 'writer-false-layer.json'
-        with patch.object(B, 'write_health_observation', side_effect=refusing_writer):
-            diagnostics = scheduled_polls(schedule, lambda i, flag: arm.__setitem__(0, flag), str(path), logs)
-        assert len(diagnostics) == 2, ('writer-False layer: exactly two diagnostics', diagnostics, logs)
-        # Layer 3: the real writer fails on the real filesystem (directory made unwritable on scheduled polls).
-        directory = Path(tmp) / 'fs-layer'
-        directory.mkdir()
-        path = directory / 'bridge-health.json'
-
-        def set_mode(i, flag):
-            os.chmod(directory, 0o500 if flag else 0o700)
-        logs.clear()
+        layers = failure_layers(tmp)
         try:
-            diagnostics = scheduled_polls(schedule, set_mode, str(path), logs)
+            for layer in layers:
+                logs.clear()
+                directory = getattr(layer, 'directory', Path(tmp) / layer.name.replace(' ', '-'))
+                directory.mkdir(exist_ok=True)
+                path = directory / 'bridge-health.json'
+                with layer.patched():
+                    diagnostics = scheduled_polls(schedule, lambda i, flag: layer.arm(flag), str(path), logs)
+                layer.arm(False)
+                assert len(diagnostics) == 2, (layer.name, 'exactly two diagnostics for two streaks', diagnostics, logs)
+                assert path.is_file(), (layer.name, 'the ok poll wrote the file')
+                assert [p.name for p in directory.iterdir()] == ['bridge-health.json'], (layer.name, 'temporary file left behind')
+                # Recovery unchanged with this layer armed on the fatal poll: the recovery exception escapes.
+                layer.arm(True)
+                client = make_client(connected=False)
+                with layer.patched():
+                    try:
+                        run_monitor(client, str(path), stop_after=1.0)
+                    except (RuntimeError, SystemExit, TimeoutError) as exc:
+                        assert str(exc) == 'offline-fixture', (layer.name, 'the telemetry failure replaced the recovery failure', exc)
+                    else:
+                        raise AssertionError((layer.name, 'telemetry failure must not swallow the recovery failure'))
+                layer.arm(False)
+                assert client.reconnects == 1, layer.name
+            # Consecutive failures switching layers without a successful write: one streak, one diagnostic; then
+            # a success and two more layer-switching failures: a second diagnostic. Exactly two in all.
+            by_name = {layer.name: layer for layer in layers}
+            sequence = ['snapshot raises', 'writer returns False', 'os.replace fails', None, 'writer raises', 'serialization fails']
+
+            def switch(i, flag):
+                for layer in layers:
+                    layer.arm(layer.name == sequence[i])
+            logs.clear()
+            path = Path(tmp) / 'switching' / 'bridge-health.json'
+            path.parent.mkdir()
+            with contextlib.ExitStack() as stack:
+                for name in ('snapshot raises', 'writer returns False', 'os.replace fails'):
+                    stack.enter_context(by_name[name].patched())
+                # 'writer raises' and 'serialization fails' patch the same seams; emulate them through the armed ones.
+                diagnostics = scheduled_polls([x is not None for x in sequence[:4]] + [True, True],
+                                              lambda i, flag: switch(i, flag) if i < 4 else by_name['writer returns False'].arm(True) if i == 4 else by_name['snapshot raises'].arm(True),
+                                              str(path), logs)
+            for layer in layers:
+                layer.arm(False)
+            assert len(diagnostics) == 2, ('layer-switching streaks: exactly two diagnostics', diagnostics, logs)
+            assert path.is_file()
+            # A long failing run logs once; no flooding.
+            blocked = Path(tmp) / 'blocked'
+            blocked.write_text('a regular file where a directory is expected')
+            logs.clear()
+            diagnostics = scheduled_polls([True] * 25, lambda i, flag: None, str(blocked / 'bridge-health.json'), logs)
+            assert len(diagnostics) == 1, ('25 failing polls, one diagnostic', len(diagnostics))
         finally:
-            os.chmod(directory, 0o700)
-        assert len(diagnostics) == 2, ('filesystem layer: exactly two diagnostics across all layers', diagnostics, logs)
-        assert path.is_file() and [p.name for p in directory.iterdir()] == ['bridge-health.json']
-        # A long failing run logs once; no flooding.
-        blocked = Path(tmp) / 'blocked'
-        blocked.write_text('a regular file where a directory is expected')
-        logs.clear()
-        diagnostics = scheduled_polls([True] * 25, lambda i, flag: None, str(blocked / 'bridge-health.json'), logs)
-        assert len(diagnostics) == 1, ('25 failing polls, one diagnostic', len(diagnostics))
-        # Recovery outcomes unchanged while snapshots fail; the recovery exception is the one that escapes.
-        arm[0] = True
-        client = make_client(connected=False)
-        with patch.object(B, 'health_snapshot', side_effect=flaky_snapshot):
-            try:
-                run_monitor(client, str(Path(tmp) / 'fatal.json'), stop_after=1.0)
-            except (RuntimeError, SystemExit, TimeoutError) as exc:
-                assert 'fixture snapshot failure' not in str(exc), 'the telemetry failure replaced the recovery failure'
-            else:
-                raise AssertionError('telemetry failure must not swallow the recovery failure')
-        assert client.reconnects == 1
+            os.chmod(Path(tmp) / 'fs-layer', 0o700)
     print('telemetry boundary: ok')
 
 
