@@ -125,6 +125,8 @@ WORK_STATUS_STR_LIMIT = 4096
 CONTINUATION_WINDOW_S = 3600
 CONTINUATION_DEFAULT_MAX_PER_HOUR = 6
 PERSISTENCE_RETRY_AFTER_S = 60
+PERSISTENCE_NOTICE_AFTER_S = 300  # loops/b10.md requirement 3: one quiet-retry notice, five minutes into an episode
+_PERSISTENCE_USERINFO_RE = re.compile(r"(\w+://)[^\s/@]+@")
 MANAGED_REPO_PATHS = ("factory/state.json",)
 MANAGED_REPO_PREFIXES = ("factory/log/", MEMORY_DIRNAME + "/")
 LA_ZONE = zoneinfo.ZoneInfo("America/Los_Angeles")
@@ -134,6 +136,35 @@ def la_time_label(epoch):
     """`HH:MM PDT`/`HH:MM PST` for a UTC epoch in America/Los_Angeles (requirement 18, loops/b7.md)."""
     when = _dt.datetime.fromtimestamp(float(epoch), _dt.timezone.utc).astimezone(LA_ZONE)
     return when.strftime("%H:%M %Z")
+
+
+def notice_error_summary(text):
+    """A stored persistence error (`<step>: <detail>`) reduced to the one quiet-notice line `<step>: <line>`
+    (requirement 4, loops/b10.md): `<line>` is the first `error:`/`fatal:` line of the detail (that prefix
+    removed), else the first non-empty non-`hint:` line, else `unknown error`; an inline `hint:` and everything
+    after it is dropped first (an empty remainder is `unknown error` too), then whitespace collapses to single
+    spaces, URL userinfo is redacted, and the line is cut to 200 characters."""
+    step, _, detail = (text or "").partition(": ")
+    line = None
+    for raw in detail.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("error:") or stripped.startswith("fatal:"):
+            line = stripped[stripped.index(":") + 1:]
+            break
+    if line is None:
+        for raw in detail.splitlines():
+            stripped = raw.strip()
+            if stripped and not stripped.startswith("hint:"):
+                line = stripped
+                break
+    if line is None:
+        line = ""
+    hint_at = line.find("hint:")
+    if hint_at != -1:
+        line = line[:hint_at]
+    line = re.sub(r"\s+", " ", line).strip() or "unknown error"
+    line = _PERSISTENCE_USERINFO_RE.sub(r"\1<redacted>@", line)[:200]
+    return f"{step}: {line}"
 
 
 def read_work_status(home):
@@ -3860,43 +3891,89 @@ class Supervisor:
             return True
         return False
 
+    def _adopt_legacy_persistence(self):
+        """Adopt a b7-era `pending`/`blocked` record (no `since` field) at its first observation, by a tick or
+        by a failure, never rejected or crashed on (requirement 2, loops/b10.md): `since`/`failures` start as
+        if this were the first observed failure, `episode_id`/`error` are kept, and `notice_at` becomes now
+        only when the legacy `persistence-<episode_id>-failed` notice is already queued or receipted (so an
+        episode whose legacy notice already went out never gets a second one). Adoption itself queues nothing;
+        a record that already carries `since` is returned unchanged."""
+        status = self._read_persistence_status()
+        if status.get("status") not in ("pending", "blocked") or "since" in status:
+            return status
+        episode_id = status.get("episode_id")
+        note_id = f"persistence-{episode_id}-failed" if episode_id else None
+        legacy_notice_live = bool(note_id) and (
+            post_receipt(self.home, note_id) is not None
+            or any(it.get("id") == note_id for it in read_outbox(self.home)))
+        now = self.clock_epoch()
+        return self._save_persistence_status(since=now, failures=1, notice_at=now if legacy_notice_live else None)
+
+    def _maybe_queue_persistence_notice(self, status):
+        """The one notice an episode ever gets, queued through the durable outbox once its deadline has passed
+        (requirement 3, loops/b10.md), independent of the 60-second retry deadline: checked on every tick
+        (whether or not a retry is attempted this tick) and after every failed attempt."""
+        if status.get("status") not in ("pending", "blocked") or status.get("notice_at") is not None:
+            return
+        since = status.get("since")
+        if not isinstance(since, (int, float)) or isinstance(since, bool):
+            return
+        now = self.clock_epoch()
+        if now - since < PERSISTENCE_NOTICE_AFTER_S:
+            return
+        minutes = int((now - since) // 60)
+        summary = notice_error_summary(status.get("error") or "")
+        text = f"persistence {status['status']} for {minutes} min: {summary}"
+        _queue_notice_once(self.home, self.dev_channel, text, f"persistence-{status.get('episode_id')}-notice")
+        self._save_persistence_status(notice_at=now)
+
     def _persistence_fail(self, step, detail, blocked=False, pending_local_sha=None):
-        prev = self._read_persistence_status()
+        prev = self._adopt_legacy_persistence()
         was_failing = prev.get("status") in ("pending", "blocked")
         episode_id = prev.get("episode_id") if was_failing else str(uuid.uuid4())
+        since = prev.get("since") if was_failing and isinstance(prev.get("since"), (int, float)) \
+            else self.clock_epoch()
+        failures = (prev.get("failures") or 0) + 1 if was_failing else 1
         status = "blocked" if blocked else "pending"
         error = f"{step}: {detail}"[:2000]
-        fields = {"status": status, "error": error, "episode_id": episode_id,
-                  "retry_after": self.clock_epoch() + PERSISTENCE_RETRY_AFTER_S}
+        fields = {"status": status, "error": error, "episode_id": episode_id, "since": since,
+                  "failures": failures, "retry_after": self.clock_epoch() + PERSISTENCE_RETRY_AFTER_S}
+        if not was_failing:
+            fields["notice_at"] = None  # a fresh episode; requirement 3 queues its one notice, never here
         if pending_local_sha is not None:
             fields["pending_local_sha"] = pending_local_sha
-        self._save_persistence_status(**fields)
+        state = self._save_persistence_status(**fields)
         log(f"persistence {status}: {error}")
-        if not was_failing:
-            _queue_notice_once(self.home, self.dev_channel, f"persistence {status} (episode {episode_id}): {error}",
-                               f"persistence-{episode_id}-failed")
+        self._maybe_queue_persistence_notice(state)  # requirement 3: a failed attempt itself may cross the deadline
         return False
 
     def _persistence_recovered(self, last_sha):
         prev = self._read_persistence_status()
-        was_failing = prev.get("status") in ("pending", "blocked")
-        episode_id = prev.get("episode_id")
+        had_notice = prev.get("status") in ("pending", "blocked") and prev.get("notice_at") is not None
+        episode_id, since, now = prev.get("episode_id"), prev.get("since"), self.clock_epoch()
         self._save_persistence_status(status="synced", error=None, pending_local_sha=None,
-                                      last_successful_push_sha=last_sha, retry_after=None)
-        if was_failing and episode_id:
+                                      last_successful_push_sha=last_sha, retry_after=None,
+                                      since=None, failures=None, notice_at=None)
+        if had_notice and episode_id and isinstance(since, (int, float)):
+            minutes = int((now - since) // 60)
             _queue_notice_once(self.home, self.dev_channel,
-                               f"persistence recovered (episode {episode_id}): synced at {last_sha[:12]}",
+                               f"persistence recovered: synced at {last_sha[:12]} after {minutes} min",
                                f"persistence-{episode_id}-recovered")
         return True
 
     def reconcile_persistence(self):
         """Retried on every run_once tick, including one with no events, and after restart (requirement 19,
-        loops/b7.md): only a `pending` (retryable) status is retried automatically, and only once its own
-        60-second deadline has passed -- never a tight loop, and a new turn never resets that deadline.
-        `blocked` (a dirty tree or a real merge conflict) needs the founder, not an automatic retry."""
+        loops/b7.md; requirements 2/3, loops/b10.md): a legacy record is adopted and the five-minute notice is
+        evaluated on every tick regardless of status, but only a `pending` (retryable) status is retried
+        automatically, and only once its own 60-second deadline has passed -- never a tight loop, and a new
+        turn never resets that deadline. `blocked` (a dirty tree or a real rebase conflict) needs the founder,
+        not an automatic retry; it is retried at a turn start by `sync_repo_before` instead."""
         if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
             return
-        status = self._read_persistence_status()
+        status = self._adopt_legacy_persistence()
+        if status.get("status") not in ("pending", "blocked"):
+            return
+        self._maybe_queue_persistence_notice(status)
         if status.get("status") != "pending":
             return
         retry_after = status.get("retry_after")
@@ -3905,39 +3982,69 @@ class Supervisor:
         self.sync_repo_before()
         self.persist(status.get("last_turn") or 0)
 
+    def _rebase_in_progress(self):
+        return os.path.isdir(os.path.join(self.repo, ".git", "rebase-merge")) \
+            or os.path.isdir(os.path.join(self.repo, ".git", "rebase-apply"))
+
+    def _fetch_and_rebase_onto_remote(self):
+        """Fetch `origin`, then rebase the current branch onto `origin/<branch>` when it is not already an
+        ancestor of HEAD (requirement 1, loops/b10.md): no `--autostash`, no `--force`, no `--onto`, never
+        `git merge`. A failed fetch is a `pending` failure (step `fetch`); a failed rebase is aborted, its
+        result checked, and recorded as a `blocked` failure (step `rebase`), with both outputs in the detail
+        when the abort itself fails too. Neither failure attempts a push. Returns True when the branch is (or
+        becomes) an ancestor-safe to push: with no unpushed commits the rebase is a plain fast-forward."""
+        if self._rebase_in_progress():
+            return self._persistence_fail("rebase", "rebase in progress; refusing to act until it is cleared "
+                                          "by hand", blocked=True)
+        fetch = self._git("fetch", "-q", "origin", timeout=120)
+        if fetch.returncode != 0:
+            return self._persistence_fail("fetch", (fetch.stderr or "").strip()[-500:] or f"exit {fetch.returncode}")
+        branch = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        upstream = self._git("rev-parse", "--verify", f"origin/{branch}")
+        if upstream.returncode != 0:
+            return True  # no remote counterpart yet: nothing to reconcile against
+        ancestor = self._git("merge-base", "--is-ancestor", f"origin/{branch}", "HEAD")
+        if ancestor.returncode == 0:
+            return True  # origin/<branch> is already an ancestor of HEAD: nothing to rebase
+        rebase = self._git("rebase", "-q", f"origin/{branch}", timeout=120)
+        if rebase.returncode == 0:
+            return True
+        detail = (rebase.stderr or rebase.stdout or "").strip()[-500:]
+        abort = self._git("rebase", "--abort")
+        if abort.returncode != 0:
+            abort_detail = (abort.stderr or abort.stdout or "").strip()[-500:]
+            return self._persistence_fail("rebase", f"{detail} | abort: {abort_detail}", blocked=True)
+        return self._persistence_fail("rebase", detail, blocked=True)
+
     def sync_repo_before(self):
-        """Fetch and reconcile a clean diverged clone with an ordinary merge, preserving both histories (no
-        force-push, reset or automatic conflict resolution, requirement 19, loops/b7.md). A real conflict
-        aborts the merge, retains local work and marks `blocked`; unmanaged dirt blocks before touching git.
-        Respects the same pending-retry deadline as `persist`/`reconcile_persistence` (requirement 19, S2
-        repair): an incoming turn never resets it, so this is a no-op git-wise until it has passed."""
+        """Fetch and rebase a clean diverged clone's unpushed commits onto `origin/<branch>` (requirement 1,
+        loops/b10.md): no merge commit, no force-push, no automatic conflict resolution. A real conflict aborts
+        the rebase, retains local work and marks `blocked`; unmanaged dirt, or a rebase already in progress,
+        blocks before touching git at all. Unlike a tick, this retries a `blocked` status too (requirement 6):
+        it runs at the start of every turn, and a turn never resets the 60-second `pending` backoff."""
         self._sync_blocked = False
         if not self.repo or not os.path.isdir(os.path.join(self.repo, ".git")):
             return
-        status = self._read_persistence_status()
+        status = self._adopt_legacy_persistence()
         retry_after = status.get("retry_after")
         if status.get("status") == "pending" and isinstance(retry_after, (int, float)) \
                 and self.clock_epoch() < retry_after:
+            return
+        if self._rebase_in_progress():
+            self._sync_blocked = True
+            self._persistence_fail("rebase", "rebase in progress; refusing to act until it is cleared by hand",
+                                   blocked=True)
             return
         if self._repo_unsafe_dirty():
             self._sync_blocked = True
             self._persistence_fail("dirty", "repo has unmanaged local changes outside managed paths", blocked=True)
             return
         try:
-            fetch = self._git("fetch", "-q", "origin", timeout=120)
-            if fetch.returncode != 0:
-                self._persistence_fail("fetch", (fetch.stderr or "").strip()[-500:] or f"exit {fetch.returncode}")
+            if not self._fetch_and_rebase_onto_remote():
+                self._sync_blocked = True
                 return
-            branch = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-            upstream = self._git("rev-parse", "--verify", f"origin/{branch}")
-            if upstream.returncode == 0:
-                merge = self._git("merge", "-q", "--no-edit", f"origin/{branch}", timeout=120)
-                if merge.returncode != 0:
-                    self._git("merge", "--abort")
-                    self._sync_blocked = True
-                    self._persistence_fail("merge", (merge.stderr or merge.stdout or "").strip()[-500:], blocked=True)
-                    return
         except (OSError, subprocess.SubprocessError) as e:
+            self._sync_blocked = True
             self._persistence_fail("fetch", str(e))
             return
         repo_state = os.path.join(self.repo, "factory", "state.json")
@@ -3946,9 +4053,12 @@ class Supervisor:
 
     def persist(self, n):
         """Copy mirror/ into factory/log/ and state.json into factory/, add the memory folder, commit
-        `manager: turn <n>`, push -- checking every Git return code (requirement 19, loops/b7.md): a failed
-        pull/add/commit/push is never reported as synced, and an existing unpushed local commit is retried
-        even with nothing newly staged this turn."""
+        `manager: turn <n>`, fetch and rebase onto `origin/<branch>` when needed, push -- checking every Git
+        return code (requirement 19, loops/b7.md; requirement 1, loops/b10.md): a failed
+        fetch/rebase/add/commit/push is never reported as synced, and an existing unpushed local commit is
+        retried even with nothing newly staged this turn. A `persist` that follows a blocked `sync_repo_before`
+        in the same turn or tick returns False without a git call and without replacing the recorded step and
+        error."""
         if not self.repo:
             self._save_persistence_status(status="no_repo", error=None)
             return False
@@ -3957,12 +4067,17 @@ class Supervisor:
             self._save_persistence_status(status="no_repo", error=None)
             return False
         self._save_persistence_status(last_turn=n)
+        if getattr(self, "_sync_blocked", False):
+            return False  # a blocked sync_repo_before already recorded this episode's step and error
+        if self._rebase_in_progress():
+            return self._persistence_fail("rebase", "rebase in progress; refusing to act until it is cleared "
+                                          "by hand", blocked=True)
         status = self._read_persistence_status()
         retry_after = status.get("retry_after")
         if status.get("status") == "pending" and isinstance(retry_after, (int, float)) \
                 and self.clock_epoch() < retry_after:
             return False  # back off; a new turn does not reset this deadline
-        if getattr(self, "_sync_blocked", False) or self._repo_unsafe_dirty():
+        if self._repo_unsafe_dirty():
             return self._persistence_fail("dirty", "repo has unmanaged local changes outside managed paths",
                                           blocked=True)
         log_dir = os.path.join(self.repo, "factory", "log")
@@ -3991,6 +4106,8 @@ class Supervisor:
                 commit = self._git("commit", "-q", "-m", f"manager: turn {n}")
                 if commit.returncode != 0:
                     return self._persistence_fail("commit", (commit.stderr or commit.stdout or "").strip()[-500:])
+            if not self._fetch_and_rebase_onto_remote():  # requirement 1, loops/b10.md: every push is preceded
+                return False  # by a fresh fetch and, when needed, a rebase onto the remote; already recorded
             local_sha = self._git("rev-parse", "HEAD").stdout.strip()
             push = self._git("push", "-q", "origin", "HEAD", timeout=180)
             if push.returncode != 0:
