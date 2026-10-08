@@ -47,6 +47,9 @@ for name in ('What changed','Evidence','Open questions'):
 evidence=' '.join(sections['Evidence'])
 assert re.search(r'\b\d+ passed\b',evidence),'Evidence lacks a pytest count'
 assert '[b11.acceptance] PASS' in evidence,'Evidence lacks the acceptance PASS line'
+m=re.search(r'message bytes before:\s*(\d+)',evidence);n=re.search(r'message bytes after:\s*(\d+)',evidence)
+assert m and n,'Evidence lacks the labelled message bytes before/after'
+assert int(n.group(1))<int(m.group(1)),'message bytes after must be below before'
 for label,pat in (('Slack id',r'\b[CUW]0[A-Z0-9]{8,}\b'),('token',r'xox[a-z]-|ghp_[A-Za-z0-9]|sk-ant-|CLAUDE_CODE_OAUTH_TOKEN='),('tailnet address',r'\b100\.\d+\.\d+\.\d+\b'),('hostname',r'\b[a-z0-9-]+\.local\b')):
     assert not re.search(pat,text),f'notes contain a {label}'
 print('[b11] notes ok')

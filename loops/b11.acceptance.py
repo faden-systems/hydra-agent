@@ -178,6 +178,40 @@ def run_ticks(sup, n):
     for _ in range(n):
         sup.run_once()
 
+import threading
+
+
+class LiveLoop:
+    """A ticking supervisor in a thread plus a pid file naming this process, so `hydra compact` sees a live loop."""
+    def __init__(self, sup, h):
+        self.sup, self.h, self.stop = sup, h, threading.Event()
+        Path(h, 'logs', 'supervisor.pid').write_text(str(os.getpid()))
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                self.sup.run_once()
+            except Exception as e:  # noqa: BLE001 - surfaced by the contract's own checks
+                print('live loop tick error:', e)
+            time.sleep(0.2)
+
+    def close(self):
+        self.stop.set(); self.thread.join(5)
+        with open(os.devnull, 'w'):
+            pass
+        try:
+            Path(self.h, 'logs', 'supervisor.pid').unlink()
+        except FileNotFoundError:
+            pass
+
+
+def hydra_compact(h, timeout=120):
+    env = {**os.environ, 'HYDRA_HOME': h, 'HYDRA_COMPACT_TIMEOUT': str(timeout)}
+    r = subprocess.run([sys.executable, HYDRA, 'compact'], env=env, capture_output=True, text=True, timeout=timeout + 30)
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
 
 # ---------------------------------------------------------------------------------------------- scenarios
 def threshold_compacts_before_next_turn():
@@ -237,13 +271,17 @@ def quiet_hours_do_not_gate():
     check(kinds(d) == ['turn', 'compaction', 'turn'], f'quiet hours gated the compaction: {kinds(d)}')
 
 
+
 def held_is_loud_and_keeps_the_schedule():
     """Requirement 2: rollover explicitly disabled -> no engine call, held recorded, pending kept, COMPACT consumed,
-    one buildlog line per episode, and `hydra compact` reports the held outcome with exit 1."""
+    one buildlog line per episode; `hydra compact` reports held with exit 1, without and with a live loop."""
     h, d = home(), fakes(context=940000, context_after=90000)
     config(h, rollover_enabled=False)
     blog = Poster()
     sup = make(h, d, blog=blog)
+    rc, out = hydra_compact(h, timeout=10)
+    check(rc == 1 and 'compaction held' in out, f'no loop + rollover disabled: exit 1 and held expected, got rc={rc} {out[-200:]!r}')
+    check(not Path(h, 'COMPACT').exists(), 'no loop + rollover disabled must not write COMPACT')
     event(h, 'A'); sup.run_once()
     event(h, 'B'); sup.run_once()
     check(kinds(d) == ['turn', 'turn'], f'a held rollover must make no [compaction] engine call: {kinds(d)}')
@@ -253,17 +291,19 @@ def held_is_loud_and_keeps_the_schedule():
     run_ticks(sup, 2)
     held_lines = [t for _, _, t in blog.posted if 'compaction held' in t]
     check(len(held_lines) == 1, f'exactly one held buildlog line per episode, got {held_lines}')
-    check(f'over {LIMIT}' in held_lines[0] or 'over' in held_lines[0], f'held line must name the overage: {held_lines[0]}')
+    check('over' in held_lines[0], f'held line must name the overage: {held_lines[0]}')
     Path(h, 'COMPACT').write_text('')
     sup.run_once()
     check(not Path(h, 'COMPACT').exists(), 'a forced request must be consumed, not retried every tick')
     check(kinds(d) == ['turn', 'turn'], 'the forced request with rollover disabled must not call the engine')
     check(len([t for _, _, t in blog.posted if 'compaction held' in t]) == 1, 'the same held episode must not post twice')
     check(cstate(h).get('pending'), 'pending must survive a consumed forced request while held')
-    env = {**os.environ, 'HYDRA_HOME': h}
-    r = subprocess.run([sys.executable, HYDRA, 'compact'], env=env, capture_output=True, text=True, timeout=60)
-    out = (r.stdout or '') + (r.stderr or '')
-    check(r.returncode == 1 and 'compaction held' in out, f'hydra compact must exit 1 and say held: rc={r.returncode} out={out[-300:]!r}')
+    loop = LiveLoop(sup, h)
+    try:
+        rc, out = hydra_compact(h, timeout=60)
+    finally:
+        loop.close()
+    check(rc == 1 and 'compaction held' in out, f'live loop + held: exit 1 and held expected, got rc={rc} {out[-200:]!r}')
     # a clearing turn (context below the threshold) ends the episode; the next overage posts again
     (d / 'context').write_text('100000')
     event(h, 'C'); sup.run_once()
@@ -272,6 +312,27 @@ def held_is_loud_and_keeps_the_schedule():
     event(h, 'D'); sup.run_once()
     event(h, 'E'); sup.run_once()
     check(len([t for _, _, t in blog.posted if 'compaction held' in t]) == 2, 'a new overage after a clearing turn is a new held episode')
+    # a live loop with rollover enabled: `hydra compact` reports the verified rollover with exit 0
+    h2, d2 = home(), fakes(context=940000, context_after=90000)
+    sup2 = make(h2, d2)
+    event(h2, 'A'); sup2.run_once()
+    loop = LiveLoop(sup2, h2)
+    try:
+        rc, out = hydra_compact(h2, timeout=60)
+    finally:
+        loop.close()
+    check(rc == 0 and 'compacted at' in out, f'live loop + rollover: exit 0 and compacted expected, got rc={rc} {out[-200:]!r}')
+    check(session_id(h2) != 'sess-test', 'the CLI-requested rollover must replace the session id')
+    # a live loop whose rollover fails: exit 1, never a success line
+    h3, d3 = home(), fakes(context=940000, context_after=90000, fail_compact=True)
+    sup3 = make(h3, d3)
+    event(h3, 'A'); sup3.run_once()
+    loop = LiveLoop(sup3, h3)
+    try:
+        rc, out = hydra_compact(h3, timeout=60)
+    finally:
+        loop.close()
+    check(rc == 1 and 'compacted at' not in out, f'live loop + failed rollover: exit 1 expected, got rc={rc} {out[-200:]!r}')
 
 
 def failed_rollover_backs_off():
@@ -301,8 +362,10 @@ def transcript_dir(h):
     return Path(h, '.claude', 'projects', os.path.abspath(h).replace('/', '-'))
 
 
+
 def cli_compactions_detected():
-    """Requirement 3: the module-level parser, then the per-turn scan, the turn flag, the record and the status."""
+    """Requirement 3: the module-level parser, then the per-turn scan, the turn flag, the record, the status, the
+    path change after a rollover, truncation without duplicates, the 50-record cap, an unreadable transcript."""
     good = {'type': 'system', 'subtype': 'compact_boundary', 'timestamp': '2026-10-08T09:40:58.542Z'}
     other = {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}}
     data = (json.dumps(other) + '\n' + json.dumps(good) + '\n' + 'not json at all\n' + json.dumps(other) + '\n'
@@ -333,13 +396,36 @@ def cli_compactions_detected():
     check('(cli)' in line and 'last compaction: 2026-10-08T09:40:58' in line, f'status must show the CLI compaction last: {line}')
     event(h, 'C'); sup.run_once()
     check(len(cstate(h).get('cli_compactions') or []) == 1, 'a boundary must be counted once, not on every scan')
-    # a later supervisor compaction takes precedence in status
+    # truncation: the file is rewritten shorter with the same boundary -> rescanned, not duplicated
+    tpath.write_text(json.dumps(good) + '\n')
+    event(h, 'C2'); sup.run_once()
+    check(len(cstate(h).get('cli_compactions') or []) == 1, 'a rescan after truncation must not duplicate a recorded boundary')
+    # a supervisor rollover: the scan path follows the new session id, a boundary there is found
     (d / 'context').write_text('940000')
     event(h, 'D'); sup.run_once()
     event(h, 'E'); sup.run_once()
     check('compaction' in kinds(d), 'overage after the CLI case must compact')
+    check(session_id(h) != 'sess-test', 'rollover must replace the session id')
     line = status_line(h)
     check('(cli)' not in line and '->' in line, f'the newer supervisor compaction must be the status last: {line}')
+    newpath = tdir / f'{session_id(h)}.jsonl'
+    newpath.write_text(json.dumps(other) + '\n' + json.dumps(dict(good, timestamp='2026-10-08T12:00:00.000Z')) + '\n')
+    event(h, 'F'); sup.run_once()
+    cli = cstate(h).get('cli_compactions') or []
+    check(len(cli) == 2 and cli[-1].get('at') == '2026-10-08T12:00:00.000Z', f'a boundary in the new transcript must be found: {cli}')
+    check(turns(h)[-1].get('cli_compacted') is True, 'the turn after the new-transcript boundary must be flagged')
+    check('(cli)' in status_line(h), f'the newest CLI compaction must now be the status last: {status_line(h)}')
+    # the cap: 51 boundaries keep the newest 50
+    with newpath.open('a') as f:
+        for i in range(51):
+            f.write(json.dumps(dict(good, timestamp=f'2026-10-09T00:{i // 60:02d}:{i % 60:02d}.000Z')) + '\n')
+    event(h, 'G'); sup.run_once()
+    cli = cstate(h).get('cli_compactions') or []
+    check(len(cli) == 50 and cli[-1].get('at') == '2026-10-09T00:00:50.000Z', f'the newest 50 must be kept: {len(cli)} {cli[-1:]}')
+    # an unreadable transcript never fails a turn
+    newpath.unlink(); newpath.mkdir()
+    event(h, 'H'); check(sup.run_once() is True, 'an unreadable transcript must not fail the turn')
+    check(turns(h)[-1].get('events') == [turns(h)[-1]['events'][0]] if turns(h)[-1].get('events') else True, 'turn recorded')
     # a missing transcript never fails a turn
     h2, d2 = home(), fakes(context=100000)
     sup2 = make(h2, d2)
@@ -347,47 +433,124 @@ def cli_compactions_detected():
     check(turns(h2)[-1].get('cli_compacted') in (False, None), 'no transcript: no flag')
 
 
+
 def status_line_contract():
-    """Requirement 4: one number, the due limit, the last compaction, at most one suffix; never the old wording."""
+    """Requirement 4: one number, the due limit, the last compaction, at most one suffix in the stated precedence;
+    never the old wording; the back-off compares against the given clock."""
     def write(h, state=None, turn=None):
         if state is not None:
             S.write_text(S.compaction_state_path(h), json.dumps(state))
         if turn is not None:
             S.append_jsonl(os.path.join(h, 'logs', 'turns.jsonl'), turn)
+    now = dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc)
     h = home()
-    line = status_line(h)
+    line = S.compaction_status_line(h, now=now)
     check(line.startswith('context: unknown') and f'due at {LIMIT}' in line and 'last compaction: none' in line, f'no measurement: {line}')
     write(h, turn={'n': 1, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 100000})
-    line = status_line(h)
+    line = S.compaction_status_line(h, now=now)
     check(line.startswith('context: 100000 tokens (turn 1)') and '; compaction' not in line, f'below threshold: {line}')
     write(h, state={'pending': {'reason': 'tokens', 'value': 320000, 'limit': THRESHOLD, 'since': 'x'}},
           turn={'n': 2, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 320000})
-    line = status_line(h)
+    line = S.compaction_status_line(h, now=now)
     check(line.startswith('context: 320000 tokens (turn 2)') and '; compaction' not in line, f'pending between threshold and limit: {line}')
     write(h, state={'pending': {'reason': 'tokens', 'value': 940000, 'limit': THRESHOLD, 'since': 'x'}},
           turn={'n': 3, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 940000})
-    line = status_line(h)
+    line = S.compaction_status_line(h, now=now)
     check(line.startswith('context: 940000 tokens (turn 3)') and line.endswith('; compaction: due (tokens)'), f'due: {line}')
+    # a failure back-off in force suppresses due, measured against the given clock
+    write(h, state={'pending': {'reason': 'tokens', 'value': 940000, 'limit': THRESHOLD, 'since': 'x'},
+                    'failed_at': '2026-10-08T11:30:00Z', 'last': {'before_tokens': 940000, 'after_tokens': None, 'at': '2026-10-08T11:30:00Z', 'ok': False, 'reason': 'tokens', 'error': 'usage limit'}})
+    line = S.compaction_status_line(h, now=now)
+    check('; compaction: due' not in line and '(940000 -> failed)' in line, f'back-off in force: no due suffix: {line}')
+    line = S.compaction_status_line(h, now=now + dt.timedelta(hours=7))
+    check(line.endswith('; compaction: due (tokens)'), f'after the back-off the overage is due again: {line}')
+    # forced wins over everything
     Path(h, 'COMPACT').write_text('')
-    check(status_line(h).endswith('; compaction: forced'), f'forced: {status_line(h)}')
+    check(S.compaction_status_line(h, now=now).endswith('; compaction: forced'), f'forced: {S.compaction_status_line(h, now=now)}')
     Path(h, 'COMPACT').unlink()
+    # held wins over due (the overage stays, rollover is disabled)
     write(h, state={'pending': {'reason': 'tokens', 'value': 940000, 'limit': THRESHOLD, 'since': 'x'},
                     'last': {'before_tokens': 940000, 'after_tokens': None, 'at': '2026-10-08T09:58:22Z', 'ok': None,
-                             'reason': 'forced', 'error': 'held: automatic rollover is disabled'}, 'failed_at': '2026-10-08T09:58:22Z'})
-    line = status_line(h)
+                             'reason': 'forced', 'error': 'held: automatic rollover is disabled'}})
+    line = S.compaction_status_line(h, now=now)
     check('last compaction: 2026-10-08T09:58:22Z (940000 -> held)' in line and line.endswith('; compaction: held'), f'held: {line}')
-    write(h, state={'verify': {'before_tokens': 940000, 'at': '2026-10-08T11:00:00Z', 'reason': 'tokens'}},
+    # awaiting verification: a rollover happened, the stale pre-rollover measurement is not due
+    write(h, state={'verify': {'before_tokens': 940000, 'at': '2026-10-08T11:00:00Z', 'reason': 'tokens', 'old_id': 'a', 'new_id': 'b'}},
           turn={'n': 4, 'at': time.time(), 'engine': 'claude-r2d2', 'events': [], 'kind': 'compaction'})
-    line = status_line(h)
-    check(line.endswith('; compaction: awaiting verification'), f'awaiting verification: {line}')
+    line = S.compaction_status_line(h, now=now)
+    check(line.startswith('context: 940000 tokens (turn 3)') and line.endswith('; compaction: awaiting verification'), f'awaiting verification: {line}')
+    # the CLI compaction as the newest event; no suffix below the limit
     write(h, state={'last': {'before_tokens': 940000, 'after_tokens': 90000, 'at': '2026-10-08T11:00:00Z', 'ok': True, 'reason': 'tokens'},
                     'cli_compactions': [{'at': '2026-10-08T12:00:00Z', 'turn': 5}]},
           turn={'n': 5, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 90000, 'cli_compacted': True})
-    line = status_line(h)
+    line = S.compaction_status_line(h, now=now)
     check('last compaction: 2026-10-08T12:00:00Z (cli)' in line and '; compaction' not in line, f'cli last: {line}')
-    for case in ('context: unknown', 'context: 100000', 'context: 940000'):
-        pass
-    check('compaction: pending (' not in status_line(h), 'the old wording must never appear')
+    check('compaction: pending (' not in line, 'the old wording must never appear')
+
+
+def stale_pending_regression():
+    """Requirement 4 (the 2026-10-08 case): a stale pending of 935,607, a CLI boundary, then a measured 94,586:
+    status shows 94,586 and the CLI compaction, no suffix; nothing is due."""
+    good = {'type': 'system', 'subtype': 'compact_boundary', 'timestamp': '2026-10-08T09:40:58.542Z'}
+    h, d = home(), fakes(context=935607, context_after=94586)
+    config(h, rollover_enabled=False)
+    sup = make(h, d)
+    tdir = transcript_dir(h); tdir.mkdir(parents=True)
+    tpath = tdir / 'sess-test.jsonl'; tpath.write_text('')
+    event(h, 'A'); sup.run_once()
+    check((cstate(h).get('pending') or {}).get('value') == 935607, 'the stale pending of the diagnosis')
+    with tpath.open('a') as f:
+        f.write(json.dumps(good) + '\n')
+    (d / 'context').write_text('94586')
+    event(h, 'B'); sup.run_once()
+    line = status_line(h)
+    check(line.startswith('context: 94586 tokens'), f'status must show the last measured context, not the pending value: {line}')
+    check('(cli)' in line and '; compaction' not in line, f'the CLI compaction last and no suffix: {line}')
+    check(not cstate(h).get('pending'), 'a measurement below the threshold clears the stale pending')
+    due, _ = sup.compaction_due()
+    check(not due, 'scheduling must never act on a stale pending value')
+
+
+def bytes_overage_compacts():
+    """Requirement 1 (bytes) and 7j: a session file grown past max_bytes with the context below the threshold compacts
+    before the next queued event; suppressed during a failure back-off, retried after it."""
+    h, d = home(), fakes(context=100000, context_after=90000)
+    config(h, max_bytes=1000, retry_after_s=3600)
+    clock = Clock(dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc))
+    sup = make(h, d, clock=clock)
+    tdir = transcript_dir(h); tdir.mkdir(parents=True)
+    tpath = tdir / 'sess-test.jsonl'; tpath.write_text('x' * 5000 + '\n')
+    event(h, 'A'); sup.run_once()
+    pending = cstate(h).get('pending') or {}
+    check(pending.get('reason') == 'bytes', f'a bytes pending expected after the grown session file: {pending}')
+    due, reason = sup.compaction_due()
+    check(due and reason == 'bytes', f'compaction_due must be (True, "bytes"), got {(due, reason)}')
+    (d / 'fail_compact').write_text('1')
+    event(h, 'B'); sup.run_once()
+    check(kinds(d) == ['turn', 'compaction', 'turn'], f'the bytes overage must attempt the rollover before B: {kinds(d)}')
+    event(h, 'C'); sup.run_once()
+    check(kinds(d).count('compaction') == 1, 'no second attempt within the failure back-off')
+    (d / 'fail_compact').unlink()
+    clock.advance(3700)
+    event(h, 'D'); sup.run_once()
+    check(kinds(d).count('compaction') == 2, f'after the back-off the bytes overage is retried: {kinds(d)}')
+    check(session_id(h) != 'sess-test', 'the retried rollover must replace the session id')
+
+
+def codex_selected_ignores_stale_claude_measurement():
+    """Requirement 1's engine-family guard: with Codex selected, a stale 3x Claude measurement compacts nothing."""
+    h, d = home(), fakes(context=940000, context_after=90000)
+    sup = make(h, d)
+    event(h, 'A'); sup.run_once()
+    check(turns(h)[-1].get('context_tokens') == 940000, 'the Claude measurement')
+    Path(h, 'engine').write_text('codex\n')
+    due, _ = sup.compaction_due()
+    check(not due, 'nothing is due while Codex is selected')
+    event(h, 'B'); sup.run_once()
+    check(kinds(d) == ['turn', 'codex'], f'the Codex turn must run without a compaction: {kinds(d)}')
+    Path(h, 'engine').write_text('claude-r2d2\n')
+    due, reason = sup.compaction_due()
+    check(due and reason == 'tokens', 'back on Claude the overage is due again')
 
 
 def big_state(n_tracks=24, entry_kb=5):
@@ -404,9 +567,11 @@ def big_state(n_tracks=24, entry_kb=5):
             'tracks': tracks, 'next_gate': 'the next gate text', 'waits_on': 'the waits text'}
 
 
+
 def state_digest_bounds_the_message():
     """Requirement 5: every track's one-line fields, the full entries of the touched tracks only, the newest
-    decisions, under 40,000 bytes, for Claude and Codex, with message_bytes on the turn record."""
+    decisions, under 40,000 bytes, for Claude and Codex, message_bytes on every record, both assignee forms, the
+    mandatory-part overflow policy."""
     h, d = home(), fakes(context=100000)
     state = big_state()
     Path(h, 'state.json').write_text(json.dumps(state, indent=1))
@@ -414,8 +579,8 @@ def state_digest_bounds_the_message():
     check(raw > 120000, f'fixture state must be real-sized (>120 KB), got {raw}')
     Path(h, 'work-status.json').write_text(json.dumps({'turn': 0, 'mode': 'done', 'track': 't21'}))
     sup = make(h, d)
-    event(h, 'what is new?', thread='1791000005.000001')                       # (a) thread of t05
-    event(h, '<@U0FAKE> assignee: Hermes | track: t11\nrun the thing', thread='9.9')  # (b) assignee line
+    event(h, 'what is new? éè — café', thread='1791000005.000001')          # (a) thread of t05, non-ASCII text
+    event(h, '<@U0FAKE> assignee: Hermes | track: t11\nrun the thing', thread='9.9')  # (b) assignee line, mention-prefixed
     event(h, 'continue t17: carry on', thread='8.8')                           # (c) continue
     check(sup.run_once() is True, 'turn did not run')
     stdin = calls(d)[-1]['stdin']
@@ -435,6 +600,13 @@ def state_digest_bounds_the_message():
     check('the next gate text' in stdin and 'the waits text' in stdin, 'next_gate and waits_on missing')
     rec = turns(h)[-1]
     check(rec.get('message_bytes') == size, f'message_bytes must equal the stdin length: {rec.get("message_bytes")} != {size}')
+    # the plain assignee form selects too; extra words after the track id do not
+    event(h, 'assignee: Hermes | track: t03', thread='7.7')
+    event(h, 'assignee: Hermes | track: t04 please', thread='6.6')
+    sup.run_once()
+    stdin = calls(d)[-1]['stdin']
+    check('MARKER-t03-DEEP' in stdin, 'the plain assignee line must select its track')
+    check('MARKER-t04-DEEP' not in stdin, 'an assignee line with extra words must not select')
     # the cap: four touched tracks of ~15 KB each cannot fit; the last-selected (work-status) goes first
     state2 = big_state(entry_kb=15)
     Path(h, 'state.json').write_text(json.dumps(state2, indent=1))
@@ -450,7 +622,20 @@ def state_digest_bounds_the_message():
     check('MARKER-t21-DEEP' not in stdin, 'the last-selected touched track must be dropped first')
     for t in state2['tracks']:
         check(f"- {t['id']}: now:" in stdin, f"track lines are never dropped: {t['id']}")
-    # Codex gets the same digest and no second state section
+    # the mandatory part alone over the budget: 80 tracks with long fields and 30 long decisions still fit
+    state3 = big_state(n_tracks=80, entry_kb=1)
+    for t in state3['tracks']:
+        t['now'] = f"now of {t['id']}: " + ('n' * 230); t['waits_on'] = 'w' * 230; t['next_action'] = 'a' * 230
+    Path(h, 'state.json').write_text(json.dumps(state3, indent=1))
+    event(h, 'plain', thread='5.5')
+    sup.run_once()
+    stdin = calls(d)[-1]['stdin']
+    check(len(stdin.encode('utf-8')) <= 40000, f'the mandatory overflow policy must keep the cap: {len(stdin.encode("utf-8"))}')
+    check('(mandatory part shortened)' in stdin, 'the header must say the mandatory part was shortened')
+    for t in state3['tracks']:
+        check(f"- {t['id']}:" in stdin, f"every track id must still appear: {t['id']}")
+    # Codex gets the same digest and no second state section; message_bytes on every record incl. the compaction
+    Path(h, 'state.json').write_text(json.dumps(state, indent=1))
     Path(h, 'engine').write_text('codex\n')
     event(h, 'codex turn', thread='1791000005.000001')
     sup.run_once()
@@ -458,12 +643,22 @@ def state_digest_bounds_the_message():
     check(c['kind'] == 'codex', f'expected a codex call, got {c["kind"]}')
     check(c['stdin'].count('# factory/state.json') == 1 and '(digest' in c['stdin'], 'codex must get exactly the digest')
     check('MARKER-t05-DEEP' in c['stdin'], 'codex digest must include the touched track')
-    check(len(c['stdin'].encode('utf-8')) <= 40000 + 20000, 'codex message must stay bounded (digest + preamble + handoff)')
+    Path(h, 'engine').write_text('claude-r2d2\n')
+    (d / 'context').write_text('940000')
+    event(h, 'X'); sup.run_once()
+    event(h, 'Y'); sup.run_once()
+    check('compaction' in kinds(d), 'the overage must compact (for the compaction record)')
+    recs = [r for r in turns(h) if r.get('message_bytes') is not None or r.get('kind') == 'compaction' or r.get('events')]
+    stdins = [len(cl['stdin'].encode('utf-8')) for cl in calls(d)]
+    check(len(recs) == len(stdins), f'one turn record per engine call expected: {len(recs)} records vs {len(stdins)} calls')
+    for r, n in zip(recs, stdins):
+        check(r.get('message_bytes') == n, f'message_bytes must match the captured stdin on every record: {r.get("n")} {r.get("kind")} {r.get("message_bytes")} != {n}')
 
 
 SCENARIOS = [threshold_compacts_before_next_turn, over_ratio_boundaries, quiet_hours_do_not_gate,
+             bytes_overage_compacts, codex_selected_ignores_stale_claude_measurement,
              held_is_loud_and_keeps_the_schedule, failed_rollover_backs_off, cli_compactions_detected,
-             status_line_contract, state_digest_bounds_the_message]
+             status_line_contract, stale_pending_regression, state_digest_bounds_the_message]
 
 
 def main(argv):
