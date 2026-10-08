@@ -3,6 +3,7 @@
 supervisor's stream-json, a controlled clock and fake posters only: no real engine, GitHub or Slack. Every check
 raises (no `assert` in the contracts, so `python -O` cannot skip one). `--only <name>` runs one scenario."""
 import hashlib
+import contextlib
 import json
 import os
 import re
@@ -53,27 +54,59 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 import sys, os, json
 from pathlib import Path
 D = Path(%(dir)r)
-msg = sys.stdin.read() if not sys.stdin.isatty() else ''
 argv = sys.argv[1:]
-with open(D / 'calls.jsonl', 'a') as f:
-    f.write(json.dumps({'argv': argv, 'stdin': msg, 'kind': 'compaction' if '[compaction]' in msg else 'turn'}) + '\n')
 assert '/compact' not in argv, 'obsolete compaction invocation'
 sid = argv[argv.index('--session-id') + 1] if '--session-id' in argv else (argv[argv.index('--resume') + 1] if '--resume' in argv else '')
-if '[compaction]' in msg:
-    if (D / 'fail_compact').exists():
+PERSISTENT = '--input-format' in argv
+
+
+def record(msg):
+    with open(D / 'calls.jsonl', 'a') as f:
+        f.write(json.dumps({'argv': argv, 'stdin': msg, 'kind': 'compaction' if '[compaction]' in msg else 'turn',
+                            'persistent': PERSISTENT, 'pid': os.getpid()}) + '\n')
+
+
+def answer(msg):
+    """The reply records for one request; None when the compaction turn must fail (the process exits 1)."""
+    if '[compaction]' in msg:
+        if (D / 'fail_compact').exists():
+            return None
+        m = Path(os.environ['HYDRA_MEMORY_DIR']) / 'MEMORY.md'
+        m.write_text(m.read_text() + '\nfixture memory flushed ' + sid + '\n')
+        reply = 'compacted\n---HANDOFF---\ntracks: t1\nwaiting on: none\nlast decision: flush\nnext action: resume\nopen question: none'
+        ctx = 20000
+    else:
+        reply = 'REPLY: ok\n---HANDOFF---\ntracks: t1\nwaiting on: nobody\nlast decision: none\nnext action: none\nopen question: none'
+        ctx = int((D / ('context_after' if sid != 'sess-test' and (D / 'context_after').exists() else 'context')).read_text())
+    usage = {'input_tokens': 100, 'cache_creation_input_tokens': 1000, 'cache_read_input_tokens': ctx - 1100, 'output_tokens': 50}
+    return [json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'usage': usage, 'content': [{'type': 'text', 'text': reply}]}}),
+            json.dumps({'type': 'result', 'subtype': 'success', 'result': reply, 'session_id': sid,
+                        'usage': {'input_tokens': usage['input_tokens'] * 3, 'cache_creation_input_tokens': usage['cache_creation_input_tokens'] * 3,
+                                  'cache_read_input_tokens': usage['cache_read_input_tokens'] * 3, 'output_tokens': 150}})]
+
+
+if not PERSISTENT:
+    msg = sys.stdin.read() if not sys.stdin.isatty() else ''
+    record(msg)
+    out = answer(msg)
+    if out is None:
         print('usage limit reached', file=sys.stderr); sys.exit(1)
-    m = Path(os.environ['HYDRA_MEMORY_DIR']) / 'MEMORY.md'
-    m.write_text(m.read_text() + '\nfixture memory flushed ' + sid + '\n')
-    reply = 'compacted\n---HANDOFF---\ntracks: t1\nwaiting on: none\nlast decision: flush\nnext action: resume\nopen question: none'
-    ctx = 20000
+    print('\n'.join(out))
 else:
-    reply = 'REPLY: ok\n---HANDOFF---\ntracks: t1\nwaiting on: nobody\nlast decision: none\nnext action: none\nopen question: none'
-    ctx = int((D / ('context_after' if sid != 'sess-test' and (D / 'context_after').exists() else 'context')).read_text())
-usage = {'input_tokens': 100, 'cache_creation_input_tokens': 1000, 'cache_read_input_tokens': ctx - 1100, 'output_tokens': 50}
-print(json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'usage': usage, 'content': [{'type': 'text', 'text': reply}]}}))
-print(json.dumps({'type': 'result', 'subtype': 'success', 'result': reply, 'session_id': sid,
-                  'usage': {'input_tokens': usage['input_tokens'] * 3, 'cache_creation_input_tokens': usage['cache_creation_input_tokens'] * 3,
-                            'cache_read_input_tokens': usage['cache_read_input_tokens'] * 3, 'output_tokens': 150}}))
+    # the persistent stream-json child (b8): one startup record, then one user envelope per request on stdin
+    print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': sid}), flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        env = json.loads(line)
+        content = env.get('message', {}).get('content')
+        msg = content if isinstance(content, str) else ''.join(c.get('text', '') for c in content or [])
+        record(msg)
+        out = answer(msg)
+        if out is None:
+            print('usage limit reached', file=sys.stderr); sys.exit(1)
+        print('\n'.join(out), flush=True)
 '''
 
 FAKE_CODEX = r'''#!/usr/bin/env python3
@@ -225,6 +258,15 @@ def threshold_compacts_before_next_turn():
     check(cstate(h).get('pending'), 'no pending record after a 3x measurement')
     due, reason = sup.compaction_due()
     check(due and reason == 'tokens', f'compaction_due at 3x over must be (True, "tokens"), got {(due, reason)}')
+    # a tick with no queued event compacts anyway (queued events do not gate it); while the verification is
+    # outstanding no second rollover is due and no second compaction runs
+    sup.run_once()
+    check(kinds(d) == ['turn', 'compaction'], f'a tick without events must compact once: {kinds(d)}')
+    check(cstate(h).get('verify'), 'verify must be set right after the rollover')
+    due2, _ = sup.compaction_due()
+    check(not due2, 'nothing is due while the rollover awaits its verifying turn')
+    sup.run_once()
+    check(kinds(d) == ['turn', 'compaction'], f'no second rollover while verification is outstanding: {kinds(d)}')
     event(h, 'B')
     check(sup.run_once() is True, 'tick with B did not run')
     ks = kinds(d)
@@ -282,6 +324,9 @@ def held_is_loud_and_keeps_the_schedule():
     rc, out = hydra_compact(h, timeout=10)
     check(rc == 1 and 'compaction held' in out, f'no loop + rollover disabled: exit 1 and held expected, got rc={rc} {out[-200:]!r}')
     check(not Path(h, 'COMPACT').exists(), 'no loop + rollover disabled must not write COMPACT')
+    h0, d0 = home(), fakes(context=940000, context_after=90000)
+    rc0, out0 = hydra_compact(h0, timeout=10)
+    check(rc0 == 0 and Path(h0, 'COMPACT').exists(), f'no loop + rollover enabled (the default) must schedule: rc={rc0} {out0[-200:]!r}')
     event(h, 'A'); sup.run_once()
     event(h, 'B'); sup.run_once()
     check(kinds(d) == ['turn', 'turn'], f'a held rollover must make no [compaction] engine call: {kinds(d)}')
@@ -383,11 +428,22 @@ def cli_compactions_detected():
     tdir = transcript_dir(h); tdir.mkdir(parents=True)
     tpath = tdir / 'sess-test.jsonl'
     tpath.write_text(json.dumps(other) + '\n')
+    seen = []
+    real_since = S.cli_compactions_since
+
+    def spy(data, offset):
+        seen.append((len(data), offset))
+        return real_since(data, offset)
+    S.cli_compactions_since = spy
     event(h, 'A'); sup.run_once()
     check(not turns(h)[-1].get('cli_compacted'), 'no boundary yet: the turn must not be flagged')
+    first_len = tpath.stat().st_size
     with tpath.open('a') as f:
         f.write(json.dumps(good) + '\n')
+    added = tpath.stat().st_size - first_len
     event(h, 'B'); sup.run_once()
+    check(seen and seen[-1] == (added, 0), f'the scan must hand the parser only the bytes after the recorded offset: {seen[-1:]} vs ({added}, 0)')
+    S.cli_compactions_since = real_since
     rec = turns(h)[-1]
     check(rec.get('cli_compacted') is True, f'the turn after a boundary must carry cli_compacted: {rec}')
     cli = cstate(h).get('cli_compactions') or []
@@ -491,6 +547,11 @@ def status_line_contract():
           turn={'n': 4, 'at': time.time(), 'engine': 'claude-r2d2', 'events': [], 'kind': 'compaction'})
     line = S.compaction_status_line(h, now=now)
     check(line.startswith('context: 940000 tokens (turn 3)') and line.endswith('; compaction: awaiting verification'), f'awaiting verification: {line}')
+    # a stale pending record still present never supplies the number: the last measured context does
+    write(h, state={'pending': {'reason': 'tokens', 'value': 999999, 'since': '2026-10-08T07:09:40Z'}},
+          turn={'n': 4, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 94586})
+    line = S.compaction_status_line(h, now=now)
+    check(line.startswith('context: 94586 tokens (turn 4)') and '999999' not in line, f'a present stale pending must not supply the number: {line}')
     # the CLI compaction as the newest event; no suffix below the limit
     write(h, state={'last': {'before_tokens': 940000, 'after_tokens': 90000, 'at': '2026-10-08T11:00:00Z', 'ok': True, 'reason': 'tokens'},
                     'cli_compactions': [{'at': '2026-10-08T12:00:00Z', 'turn': 5}]},
@@ -583,6 +644,15 @@ def big_state(n_tracks=24, entry_kb=5):
 
 
 
+def digest_bytes(msg):
+    """The digest section of an engine message: from its header line to its terminator line, inclusive."""
+    check('# factory/state.json (digest' in msg, 'digest header missing')
+    start = msg.index('# factory/state.json (digest')
+    check('## end of state digest' in msg[start:], 'digest terminator line missing')
+    end = msg.index('## end of state digest', start)
+    return len(msg[start:end + len('## end of state digest')].encode('utf-8'))
+
+
 def state_digest_bounds_the_message():
     """Requirement 5: every track's one-line fields, the full entries of the touched tracks only, the newest
     decisions, under 40,000 bytes, for Claude and Codex, message_bytes on every record, both assignee forms, the
@@ -602,6 +672,7 @@ def state_digest_bounds_the_message():
     size = len(stdin.encode('utf-8'))
     check(size < 40000, f'the message must be under 40,000 bytes, got {size}')
     check('# factory/state.json (digest' in stdin, 'digest header missing')
+    check(digest_bytes(stdin) <= 36000, f'the digest section alone must be at most 36,000 bytes: {digest_bytes(stdin)}')
     check(stdin.count('# factory/state.json') == 1, 'exactly one state section')
     for t in state['tracks']:
         check(f"- {t['id']}: now: now of {t['id']}" in stdin, f"track line missing for {t['id']}")
@@ -634,7 +705,7 @@ def state_digest_bounds_the_message():
     sup.run_once()
     stdin = calls(d)[-1]['stdin']
     size = len(stdin.encode('utf-8'))
-    check(size <= 40000, f'the cap must hold under oversized selections, got {size}')
+    check(size < 40000 and digest_bytes(stdin) <= 36000, f'the caps must hold under oversized selections: message {size}, digest {digest_bytes(stdin)}')
     check('(truncated: 3 touched track(s) left out)' in stdin, f'the header must say three selected tracks were left out: {stdin[:200]!r}')
     check('MARKER-t17-DEEP' in stdin, 'the first-selected touched track (by event order) must survive truncation')
     check('MARKER-t05-DEEP' not in stdin, 'the first track in FILE order must not survive ahead of the first-selected one')
@@ -649,7 +720,7 @@ def state_digest_bounds_the_message():
     event(h, 'plain', thread='5.5')
     sup.run_once()
     stdin = calls(d)[-1]['stdin']
-    check(len(stdin.encode('utf-8')) <= 40000, f'the mandatory overflow policy must keep the cap: {len(stdin.encode("utf-8"))}')
+    check(len(stdin.encode('utf-8')) < 40000 and digest_bytes(stdin) <= 36000, f'the mandatory overflow policy must keep the caps: {len(stdin.encode("utf-8"))} / {digest_bytes(stdin)}')
     check('(mandatory part shortened)' in stdin, 'the header must say the mandatory part was shortened')
     for t in state3['tracks']:
         check(f"- {t['id']}:" in stdin, f"every track id must still appear: {t['id']}")
@@ -674,10 +745,57 @@ def state_digest_bounds_the_message():
         check(r.get('message_bytes') == n, f'message_bytes must match the captured stdin on every record: {r.get("n")} {r.get("kind")} {r.get("message_bytes")} != {n}')
 
 
+def persistent_mode_covered():
+    """Requirement 1/3/5 in Claude persistent mode (a fake stream-json child): the digest and message_bytes on the
+    persistent turn record, the child reused across turns, the threshold rollover retiring it and replacing the
+    session id before the next turn, a CLI boundary found in the new session's transcript."""
+    h, d = home(), fakes(context=100000, context_after=90000)
+    Path(h, 'engine').write_text(json.dumps({'acc': 'claude-r2d2', 'mode': 'persistent'}) + '\n')
+    state = big_state()
+    Path(h, 'state.json').write_text(json.dumps(state, indent=1))
+    sup = make(h, d)
+    try:
+        event(h, 'persistent turn A: éè', thread='1791000005.000001')
+        check(sup.run_once() is True, 'persistent turn A did not run')
+        c = calls(d)[-1]
+        check(c.get('persistent') is True, f'the turn must go through the stream-json child: {c.get("argv")}')
+        check(digest_bytes(c['stdin']) <= 36000 and 'MARKER-t05-DEEP' in c['stdin'] and c['stdin'].count('# factory/state.json') == 1,
+              'the persistent turn must carry the digest (touched track in full, one section)')
+        rec = turns(h)[-1]
+        check(rec.get('message_bytes') == len(c['stdin'].encode('utf-8')), f'message_bytes on the persistent record: {rec.get("message_bytes")}')
+        pid_a = c.get('pid')
+        event(h, 'persistent turn B'); sup.run_once()
+        check(calls(d)[-1].get('pid') == pid_a, 'the child must be reused across ordinary turns')
+        check(turns(h)[-1].get('message_bytes') == len(calls(d)[-1]['stdin'].encode('utf-8')), 'message_bytes on every persistent record')
+        # the threshold rollover: the memory turn runs, the old child is retired, the id replaced before the next turn
+        (d / 'context').write_text('940000')
+        event(h, 'persistent turn C'); sup.run_once()
+        check(turns(h)[-1].get('context_tokens') == 940000, f'turn C must measure 940000: {turns(h)[-1]}')
+        event(h, 'persistent turn D'); sup.run_once()
+        ks = [(x['kind'], x.get('pid')) for x in calls(d)]
+        check([k for k, _ in ks] == ['turn', 'turn', 'turn', 'compaction', 'turn'], f'expected the compaction before turn D: {ks}')
+        check(session_id(h) != 'sess-test', 'the rollover must replace the session id in persistent mode')
+        check(ks[-1][1] != pid_a, f'the old child must be retired by the rollover (same pid served turn D): {ks}')
+        crec = [r for r in turns(h) if r.get('kind') == 'compaction']
+        check(crec and crec[-1].get('message_bytes') == len(calls(d)[-2]['stdin'].encode('utf-8')), 'message_bytes on the compaction record')
+        last = cstate(h).get('last') or {}
+        check(last.get('ok') is True and last.get('after_tokens') == 90000, f'the verifying persistent turn must settle the rollover: {last}')
+        # a CLI boundary in the new session's transcript is found in persistent mode
+        tdir = transcript_dir(h); tdir.mkdir(parents=True, exist_ok=True)
+        good = {'type': 'system', 'subtype': 'compact_boundary', 'timestamp': '2026-10-08T13:00:00.000Z'}
+        (tdir / f'{session_id(h)}.jsonl').write_text(json.dumps(good) + '\n')
+        event(h, 'persistent turn E'); sup.run_once()
+        check(turns(h)[-1].get('cli_compacted') is True, 'the persistent turn after a boundary must be flagged')
+        check('(cli)' in status_line(h), f'status must show the CLI compaction in persistent mode: {status_line(h)}')
+    finally:
+        with contextlib.suppress(Exception):
+            sup._retire_persistent('planned', 'acceptance done')
+
+
 SCENARIOS = [threshold_compacts_before_next_turn, over_ratio_boundaries, quiet_hours_do_not_gate,
              bytes_overage_compacts, codex_selected_ignores_stale_claude_measurement,
              held_is_loud_and_keeps_the_schedule, failed_rollover_backs_off, cli_compactions_detected,
-             status_line_contract, stale_pending_regression, state_digest_bounds_the_message]
+             status_line_contract, stale_pending_regression, state_digest_bounds_the_message, persistent_mode_covered]
 
 
 def main(argv):

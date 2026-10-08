@@ -72,6 +72,7 @@ defaults=re.search(r'COMPACTION_DEFAULTS\s*=\s*\{(.*?)\}',src,re.S)
 assert defaults and re.search(r'"rollover_enabled":\s*True',defaults.group(1)),'COMPACTION_DEFAULTS lacks "rollover_enabled": True (requirement 2)'
 assert 'compact_boundary' in src,'compact_boundary detection missing (requirement 3)'
 assert 'message_bytes' in src,'turn records must carry message_bytes (requirement 5)'
+assert 'end of state digest' in src,'the digest terminator line is missing (requirement 5)'
 assert 'compaction: pending (' not in src,'the old status wording must go (requirement 4)'
 cli=Path('manager/hydra').read_text()
 assert 'compaction held' in cli,'hydra compact must report a held outcome (requirement 2)'
