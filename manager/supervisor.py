@@ -102,7 +102,8 @@ CODEX_ROLLOUT_RE = re.compile(r"(/[^\s'\"]*rollout-[^\s'\"]*\.jsonl)")
 DEFAULT_DEV_CHANNEL = "C_DEV"
 THREAD_PRUNE_DAYS = 14
 COMPACTION_DEFAULTS = {"threshold_tokens": 300000, "max_bytes": 50 * 1000 * 1000, "codex_every_turns": 25,
-                       "quiet_hours": [2, 5], "quiet_hours_tz": "local", "over_ratio": 1.25, "retry_after_s": 6 * 3600}
+                       "quiet_hours": [2, 5], "quiet_hours_tz": "local", "over_ratio": 1.25, "retry_after_s": 6 * 3600,
+                       "rollover_enabled": True}
 COMPACTION_MESSAGE = ("[compaction] Compact: write everything from this session that must survive into MEMORY.md "
                       "(facts, decisions, open questions, with dates), update MANAGER-HANDOFF.md, then reply only "
                       "`compacted`.")
@@ -1465,23 +1466,96 @@ def read_compaction_state(home):
     return data if isinstance(data, dict) else {}
 
 
-def compaction_status_line(home):
-    """`last compaction: <at> (<before> -> <after>)` plus `; compaction: pending (...)` when one is scheduled."""
+def _compaction_config(cfg):
+    """`COMPACTION_DEFAULTS` overridden by a `compaction` config dict (or {}); `over_ratio` clamped to >= 1.0
+    with one `log` line (requirement 1, loops/b11.md)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    out = dict(COMPACTION_DEFAULTS)
+    for k in ("threshold_tokens", "max_bytes", "codex_every_turns", "retry_after_s"):
+        if cfg.get(k) is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                out[k] = int(cfg[k])
+    if cfg.get("over_ratio") is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            out["over_ratio"] = float(cfg["over_ratio"])
+    if out["over_ratio"] < 1.0:
+        log(f"compaction.over_ratio {out['over_ratio']} below 1.0; clamped to 1.0")
+        out["over_ratio"] = 1.0
+    if "rollover_enabled" in cfg:
+        out["rollover_enabled"] = bool(cfg["rollover_enabled"])
+    qh = cfg.get("quiet_hours")
+    if isinstance(qh, (list, tuple)) and len(qh) == 2:
+        with contextlib.suppress(TypeError, ValueError):
+            out["quiet_hours"] = [int(qh[0]) % 24, int(qh[1]) % 24]
+    if cfg.get("quiet_hours_tz"):
+        out["quiet_hours_tz"] = str(cfg["quiet_hours_tz"])
+    return out
+
+
+def compaction_config_for(home):
+    return _compaction_config(load_config(home).get("compaction"))
+
+
+def _last_measured_claude_turn(home, engines=None):
+    """(context_tokens, turn) of the last Claude turn that measured a context (never a `compaction` record,
+    requirement 4, loops/b11.md); (None, None) when no Claude turn ever measured one."""
+    for t in reversed(read_jsonl(os.path.join(home, "logs", "turns.jsonl"))):
+        if t.get("context_tokens") is not None and t.get("kind") != "compaction" \
+                and family_of(str(t.get("engine") or ""), engines) == "claude":
+            return t["context_tokens"], t.get("n")
+    return None, None
+
+
+def _held_outcome(rec):
+    return isinstance(rec, dict) and str(rec.get("error") or "").startswith("held:")
+
+
+def compaction_status_line(home, now=None):
+    """Requirement 4, loops/b11.md: one line, one number (the last measured Claude context, never a stale
+    `pending` value), the due limit, the newest of the supervisor's own last compaction and the CLI's own
+    detected compactions, and at most one suffix (`forced` > `held` > `due (<reason>)` > `awaiting
+    verification`). `now` is the clock to compare the failure back-off against (the wall clock by default)."""
     state = read_compaction_state(home)
+    cfg = compaction_config_for(home)
+    limit = int(cfg["over_ratio"] * cfg["threshold_tokens"])
+    ctx, turn_n = _last_measured_claude_turn(home)
+    head = f"context: {ctx} tokens (turn {turn_n})" if ctx is not None else "context: unknown"
     last = state.get("last") or {}
-    if last:
+    cli_list = state.get("cli_compactions") or []
+    cli_last = cli_list[-1] if cli_list else None
+    last_at = parse_iso(last.get("at")) if last else None
+    cli_at = parse_iso(cli_last.get("at")) if cli_last else None
+    use_cli = cli_last is not None and (last_at is None or (cli_at is not None and cli_at > last_at))
+    if use_cli:
+        last_text = f"{cli_last.get('at')} (cli)"
+    elif last:
         after = last.get("after_tokens")
-        shown = after if after is not None else ("failed" if last.get("ok") is False else "unverified")
-        line = f"last compaction: {last.get('at')} ({last.get('before_tokens')} -> {shown})"
+        if _held_outcome(last):
+            shown = "held"
+        elif after is not None:
+            shown = after
+        elif last.get("ok") is False:
+            shown = "failed"
+        else:
+            shown = "unverified"
+        last_text = f"{last.get('at')} ({last.get('before_tokens')} -> {shown})"
     else:
-        line = "last compaction: none"
+        last_text = "none"
+    line = f"{head} | due at {limit} | last compaction: {last_text}"
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    failed = parse_iso(state.get("failed_at"))
+    backoff = bool(failed and (now - failed).total_seconds() < cfg["retry_after_s"])
     pending = state.get("pending") or {}
     if os.path.exists(os.path.join(home, "COMPACT")):
-        line += "; compaction: pending (forced)"
-    elif pending:
-        line += f"; compaction: pending ({pending.get('reason')} {pending.get('value')} over {pending.get('limit')})"
+        line += "; compaction: forced"
+    elif _held_outcome(last) and pending:
+        line += "; compaction: held"
+    elif not state.get("verify") and not backoff and (
+            (ctx is not None and ctx >= limit) or pending.get("reason") == "bytes"):
+        reason = "tokens" if (ctx is not None and ctx >= limit) else "bytes"
+        line += f"; compaction: due ({reason})"
     elif state.get("verify"):
-        line += "; compaction: awaiting the next turn's verification"
+        line += "; compaction: awaiting verification"
     return line
 
 
@@ -2691,23 +2765,7 @@ class Supervisor:
 
     # ---- compaction (loops/b4.md)
     def compaction_config(self):
-        cfg = self.config.get("compaction")
-        cfg = cfg if isinstance(cfg, dict) else {}
-        out = dict(COMPACTION_DEFAULTS)
-        for k in ("threshold_tokens", "max_bytes", "codex_every_turns", "retry_after_s"):
-            if cfg.get(k) is not None:
-                with contextlib.suppress(TypeError, ValueError):
-                    out[k] = int(cfg[k])
-        if cfg.get("over_ratio") is not None:
-            with contextlib.suppress(TypeError, ValueError):
-                out["over_ratio"] = float(cfg["over_ratio"])
-        qh = cfg.get("quiet_hours")
-        if isinstance(qh, (list, tuple)) and len(qh) == 2:
-            with contextlib.suppress(TypeError, ValueError):
-                out["quiet_hours"] = [int(qh[0]) % 24, int(qh[1]) % 24]
-        if cfg.get("quiet_hours_tz"):
-            out["quiet_hours_tz"] = str(cfg["quiet_hours_tz"])
-        return out
+        return _compaction_config(self.config.get("compaction"))
 
     def compaction_state(self):
         return read_compaction_state(self.home)
@@ -2782,38 +2840,49 @@ class Supervisor:
     def last_claude_context_tokens(self):
         """The last measured Claude turn's context_tokens (requirement 4, loops/b7.md); unknown (None) when no
         Claude turn ever measured it. Replaces the old aggregate `input_tokens` lookup."""
-        for t in reversed(self.turns()):
-            if t.get("context_tokens") is not None and t.get("kind") != "compaction" \
-                    and family_of(str(t.get("engine") or ""), self.engines) == "claude":
-                return t["context_tokens"]
-        return None
+        ctx, _ = _last_measured_claude_turn(self.home, self.engines)
+        return ctx
 
     def compaction_pending(self):
         """A compaction is scheduled (by tokens, by bytes, or forced) and has not run yet."""
         return bool(self.compaction_state().get("pending")) or os.path.exists(self.path("COMPACT"))
 
     def compaction_due(self):
-        """(due, reason): forced (`hydra compact`/`COMPACT`) always; otherwise due only for a qualified
-        emergency rollover (requirement 6, loops/b8.md: automatic rollover is emergency-only -- an ordinary
-        token/byte threshold, however far over, no longer schedules one by itself); never twice without
-        consuming the trigger, nor inside the back-off after a failed attempt."""
+        """(due, reason): forced (`hydra compact`/`COMPACT`) always, never guarded; else a qualified emergency
+        rollover (requirement 6, loops/b8.md, unchanged); else an ordinary tokens/bytes overage (requirement 1,
+        loops/b11.md): the last measured Claude context at or above `over_ratio x threshold_tokens`, or a
+        `bytes` pending. Three guards apply to tokens/bytes (never to forced): the failure back-off, an
+        outstanding rollover verification, and the Claude engine family -- a stale Claude measurement never
+        compacts while another engine family is selected."""
         if os.path.exists(self.path("COMPACT")):
             return True, "forced"
         state = self.compaction_state()
-        emergency = state.get("emergency_pending")
-        if not emergency or state.get("verify"):
-            return False, None
         cfg = self.compaction_config()
+        verify_pending = bool(state.get("verify"))
         failed = parse_iso(state.get("failed_at"))
-        if failed and (self.clock_dt() - failed).total_seconds() < cfg["retry_after_s"]:
+        backoff = bool(failed and (self.clock_dt() - failed).total_seconds() < cfg["retry_after_s"])
+        if state.get("emergency_pending"):
+            if verify_pending or backoff:
+                return False, None
+            return True, "emergency"
+        if verify_pending or backoff:
             return False, None
-        return True, "emergency"
+        if family_of(current_engine(self.home), self.engines) != "claude":
+            return False, None
+        ctx = self.last_claude_context_tokens()
+        if ctx is not None and ctx >= cfg["over_ratio"] * cfg["threshold_tokens"]:
+            return True, "tokens"
+        if (state.get("pending") or {}).get("reason") == "bytes":
+            return True, "bytes"
+        return False, None
 
     def schedule_compaction(self, context_tokens):
         """After a Claude turn: context tokens over `threshold_tokens`, or the session file grown by more than
         `max_bytes` since the last compaction (the file never shrinks, so growth is what counts), schedules a
         compaction before the next turn. A turn under both limits clears the schedule; a turn without usage keeps
-        it (requirement 4, loops/b7.md: context_tokens drives scheduling, never aggregate input_tokens)."""
+        it (requirement 4, loops/b7.md: context_tokens drives scheduling, never aggregate input_tokens). Clearing
+        the schedule also resets the held-episode buildlog guard (requirement 2, loops/b11.md): the next overage
+        is a new episode and posts its one held line again."""
         cfg = self.compaction_config()
         state = self.compaction_state()
         at = self.now()
@@ -2831,6 +2900,8 @@ class Supervisor:
         if pending and previous.get("reason") == pending["reason"] and previous.get("since"):
             pending["since"] = previous["since"]
         state["pending"] = pending
+        if pending is None:
+            state["held_posted"] = False
         self.save_compaction_state(state)
         return pending
 
