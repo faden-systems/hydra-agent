@@ -827,6 +827,189 @@ def tracks_summary(state):
     return lines
 
 
+# ----------------------------------------------------------------------------------------------- state digest
+# (requirement 5, loops/b11.md): a bounded per-turn digest of factory/state.json, replacing the whole-file
+# `state_block` prefix. Every cut below is in bytes of UTF-8 on a character boundary, never characters.
+
+DIGEST_MANDATORY_BUDGET = 30000
+DIGEST_BUDGET = 36000
+DIGEST_DECISION_COUNT = 10
+DIGEST_DECISION_DEGRADED_COUNT = 3
+DIGEST_FIELD_CUT = 240
+DIGEST_DECISION_CUT = 600
+_ASSIGNEE_LINE_RE = re.compile(r"^assignee:\s*(\S+)\s*\|\s*track:\s*([A-Za-z0-9_.-]+)\s*$")
+_MENTION_PREFIX_RE = re.compile(r"^(?:<@[^>]+>\s*)+")
+_CONTINUE_LINE_RE = re.compile(r"^continue\s+([A-Za-z0-9_.-]+):")
+
+
+def _utf8_cut(s, limit):
+    """`s` cut to at most `limit` bytes of UTF-8, on a character boundary."""
+    s = s if isinstance(s, str) else str(s)
+    b = s.encode("utf-8")
+    if len(b) <= limit:
+        return s
+    b = b[:limit]
+    while b:
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return ""
+
+
+def _utf8_len(s):
+    return len(s.encode("utf-8"))
+
+
+def _digest_track_field(tr, key):
+    """The collapsed-whitespace string for `key` on track `tr`, or None when absent. `now` falls back to
+    `stage` then `status` as `hydra status` does (loops/b7.md requirement 5)."""
+    if key == "now":
+        now = tr.get("now")
+        if isinstance(now, str) and now.strip():
+            val = now
+        else:
+            legacy = tr.get("stage") or tr.get("status") or tr.get("state") or ""
+            val = legacy if isinstance(legacy, str) else str(legacy)
+    else:
+        val = tr.get(key)
+        val = "" if val is None else (val if isinstance(val, str) else str(val))
+    val = " ".join(val.split())
+    return val or None
+
+
+def _ts_variants(value):
+    if value is None:
+        return set()
+    s = str(value)
+    return {s, s.replace(".", "")}
+
+
+def _contains_ts_value(obj, targets):
+    """A recursive scan of dicts/lists for a string leaf equal to one of `targets`, exact or `.`-stripped
+    (loops/b11.md requirement 5a)."""
+    if not targets:
+        return False
+    if isinstance(obj, dict):
+        return any(_contains_ts_value(v, targets) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_contains_ts_value(v, targets) for v in obj)
+    if isinstance(obj, str):
+        return obj in targets or obj.replace(".", "") in targets
+    return False
+
+
+def _select_touched_tracks(state, events, home):
+    """The ids of the tracks this batch touches, in selection order (loops/b11.md requirement 5): per event,
+    in batch order, rules (a) thread/ts match, (b) `assignee: <name> | track: <id>`, (c) `continue <id>:`, in
+    that order; then (d) `work-status.json`'s track, last; a track already selected is not selected again."""
+    tracks = _track_items(state)
+    track_by_id = {tid: tr for tid, tr in tracks}
+    selected, seen = [], set()
+
+    def consider(tid):
+        if tid in track_by_id and tid not in seen:
+            seen.add(tid)
+            selected.append(tid)
+
+    for ev in events or []:
+        p = _payload(ev)
+        text = p.get("text") or ""
+        targets = _ts_variants(p.get("thread_ts")) | _ts_variants(ev.get("id"))
+        for tid, tr in tracks:
+            if tid not in seen and _contains_ts_value(tr, targets):
+                consider(tid)
+        first_line = text.splitlines()[0] if text else ""
+        stripped = _MENTION_PREFIX_RE.sub("", first_line).strip()
+        m = _ASSIGNEE_LINE_RE.match(stripped)
+        if m:
+            consider(m.group(2))
+        cm = _CONTINUE_LINE_RE.match(text)
+        if cm:
+            consider(cm.group(1))
+    ws = read_work_status(home)
+    if isinstance(ws, dict) and isinstance(ws.get("track"), str):
+        consider(ws["track"])
+    return selected
+
+
+def _digest_mandatory_lines(path, state, tracks, decisions, level):
+    """One `(level in 0..4)` rendering of the digest's mandatory part (header through `waits_on`): level 0 is
+    full; levels 1-4 progressively degrade per requirement 5's order (decisions to 3, then track lines to a
+    120-byte `now`, then 60, then the bare `- <id>` line)."""
+    header = f"# factory/state.json (digest of {path}; read the file before acting on a track)"
+    lines = [header, f"updated: {state.get('updated') if state.get('updated') is not None else '-'}", "## tracks"]
+    for tid, tr in tracks:
+        if not isinstance(tr, dict) or level >= 4:
+            lines.append(f"- {tid}")
+            continue
+        now_cut = DIGEST_FIELD_CUT if level < 2 else (120 if level == 2 else 60)
+        now_val = _digest_track_field(tr, "now") or "-"
+        now_val = _utf8_cut(now_val, now_cut) if now_val != "-" else "-"
+        if level < 2:
+            waits_val = _utf8_cut(_digest_track_field(tr, "waits_on") or "-", DIGEST_FIELD_CUT)
+            next_val = _utf8_cut(_digest_track_field(tr, "next_action") or "-", DIGEST_FIELD_CUT)
+            lines.append(f"- {tid}: now: {now_val} | waits_on: {waits_val} | next_action: {next_val}")
+        else:
+            lines.append(f"- {tid}: now: {now_val}")
+    count = DIGEST_DECISION_COUNT if level == 0 else DIGEST_DECISION_DEGRADED_COUNT
+    kept = decisions[-count:] if count else []
+    lines.append(f"## founder decisions ({len(decisions)}; newest {len(kept)} below, the rest in the file)")
+    for dec in kept:
+        lines.append("- " + _utf8_cut(dec, DIGEST_DECISION_CUT))
+    next_gate = state.get("next_gate")
+    if next_gate is not None:
+        lines.append("## next_gate")
+        lines.append(_utf8_cut(str(next_gate), DIGEST_DECISION_CUT))
+    waits_on = state.get("waits_on")
+    if waits_on is not None:
+        lines.append("## waits_on")
+        lines.append(_utf8_cut(str(waits_on), DIGEST_DECISION_CUT))
+    return lines
+
+
+def build_state_digest(home, repo, events):
+    """`Supervisor.state_digest`'s pure module-level core (loops/b11.md requirement 5): a bounded digest of
+    `factory/state.json` for every engine's prompt, replacing the whole-file `state_block` prefix."""
+    path = state_path(home, repo)
+    state = read_state(home, repo)
+    tracks = _track_items(state)
+    decisions = state.get("founder_decisions_in_force")
+    decisions = [d if isinstance(d, str) else str(d) for d in decisions] if isinstance(decisions, list) else []
+    selected = _select_touched_tracks(state, events, home)
+
+    level = 0
+    mandatory = _digest_mandatory_lines(path, state, tracks, decisions, 0)
+    size = _utf8_len("\n".join(mandatory))
+    if size > DIGEST_MANDATORY_BUDGET:
+        for level in (1, 2, 3, 4):
+            mandatory = _digest_mandatory_lines(path, state, tracks, decisions, level)
+            size = _utf8_len("\n".join(mandatory))
+            if size <= DIGEST_MANDATORY_BUDGET:
+                break
+        if size > DIGEST_MANDATORY_BUDGET:
+            mandatory[0] += " (mandatory part over budget)"
+            log(f"state_digest: mandatory part over budget at {size} bytes even fully degraded")
+        else:
+            mandatory[0] += " (mandatory part shortened)"
+
+    track_by_id = {tid: tr for tid, tr in tracks}
+    remaining = list(selected)
+    digest = None
+    while True:
+        dropped = len(selected) - len(remaining)
+        header = mandatory[0] + (f" (truncated: {dropped} touched track(s) left out)" if dropped else "")
+        mandatory_text = "\n".join([header] + mandatory[1:])
+        sections = [f"### {tid}\n" + json.dumps(track_by_id[tid], indent=1, ensure_ascii=False)
+                    for tid in remaining if tid in track_by_id]
+        touched = "## tracks touched by this batch\n" + ("\n".join(sections) if sections else "none")
+        digest = mandatory_text + "\n" + touched + "\n## end of state digest"
+        if _utf8_len(digest) <= DIGEST_BUDGET or not remaining:
+            break
+        remaining = remaining[:-1]
+    return digest
+
+
 def migrate_track_history(home, repo):
     """Mechanical migration, not a new verdict (requirement 5, loops/b7.md): every track gets a short `now`;
     complete legacy stage text is archived (appended, never overwritten or duplicated) to
@@ -2062,7 +2245,7 @@ class Supervisor:
         self.migrate_tracks()  # before prompt creation (requirement 5, loops/b7.md)
         before = dir_hashes(self.memory_dir)
         message = build_message(events)
-        state_text = self.state_block()
+        state_text = self.state_digest(events)
         if state_text:
             message = state_text + "\n" + message
         notes = []
@@ -3746,10 +3929,10 @@ class Supervisor:
         except ValueError as e:
             log(f"track migration skipped: {e}")
 
-    def state_block(self):
-        """`# factory/state.json` plus its (migrated) content, for every engine's prompt, not only Codex's."""
-        text = read_text(state_path(self.home, self.repo), "{}").rstrip()
-        return f"# factory/state.json\n{text}\n" if text and text != "{}" else ""
+    def state_digest(self, events):
+        """A bounded digest of `factory/state.json` (requirement 5, loops/b11.md), for every engine's prompt
+        (Claude per-turn, Claude persistent, Codex), replacing the whole-file `state_block` prefix."""
+        return build_state_digest(self.home, self.repo, events)
 
     # ---- work-status.json: the manager-owned scheduling input (requirement 16, loops/b7.md)
 
