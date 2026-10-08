@@ -50,6 +50,7 @@ assert '[b11.acceptance] PASS' in evidence,'Evidence lacks the acceptance PASS l
 m=re.search(r'message bytes before:\s*(\d+)',evidence);n=re.search(r'message bytes after:\s*(\d+)',evidence)
 assert m and n,'Evidence lacks the labelled message bytes before/after'
 assert int(n.group(1))<int(m.group(1)),'message bytes after must be below before'
+# equality with the acceptance's measured pair is checked after the acceptance runs (below)
 for label,pat in (('Slack id',r'\b[CUW]0[A-Z0-9]{8,}\b'),('token',r'xox[a-z]-|ghp_[A-Za-z0-9]|sk-ant-|CLAUDE_CODE_OAUTH_TOKEN='),('tailnet address',r'\b100\.\d+\.\d+\.\d+\b'),('hostname',r'\b[a-z0-9-]+\.local\b')):
     assert not re.search(pat,text),f'notes contain a {label}'
 print('[b11] notes ok')
@@ -121,10 +122,19 @@ for n in sorted(nodes):
 print(f'[b11] baseline suite: {len(nodes)} node ids executed and passed against candidate code')
 PY
 "$PYTHON" - "$PYTHON" <<'PY'
-import subprocess,sys
-try: result=subprocess.run([sys.argv[1],'loops/b11.acceptance.py'],timeout=600)
+import re,subprocess,sys
+from pathlib import Path
+try: result=subprocess.run([sys.argv[1],'loops/b11.acceptance.py'],timeout=600,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
 except subprocess.TimeoutExpired: raise SystemExit('[b11] FAIL: loops/b11.acceptance.py timeout')
+sys.stdout.write(result.stdout)
 if result.returncode: raise SystemExit(f'[b11] FAIL: loops/b11.acceptance.py exit {result.returncode}')
+pair=re.search(r'\[b11\.acceptance\] message bytes before: (\d+) after: (\d+)',result.stdout)
+if not pair: raise SystemExit('[b11] FAIL: the acceptance printed no measured message-bytes pair')
+notes=Path('docs/notes/b11.md').read_text()
+m=re.search(r'message bytes before:\s*(\d+)',notes);n=re.search(r'message bytes after:\s*(\d+)',notes)
+if (m.group(1),n.group(1))!=(pair.group(1),pair.group(2)):
+    raise SystemExit(f'[b11] FAIL: notes message bytes {m.group(1)}/{n.group(1)} differ from the measured pair {pair.group(1)}/{pair.group(2)}')
+print(f'[b11] notes message bytes match the acceptance: {pair.group(1)} -> {pair.group(2)}')
 PY
 fence
 echo '[b11] PASS'

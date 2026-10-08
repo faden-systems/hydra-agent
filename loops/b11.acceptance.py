@@ -392,6 +392,9 @@ def cli_compactions_detected():
     check(rec.get('cli_compacted') is True, f'the turn after a boundary must carry cli_compacted: {rec}')
     cli = cstate(h).get('cli_compactions') or []
     check(len(cli) == 1 and cli[0].get('at') == good['timestamp'], f'one CLI compaction record expected: {cli}')
+    scan = cstate(h).get('transcript_scan') or {}
+    check(scan.get('path') == str(tpath) and scan.get('offset') == tpath.stat().st_size,
+          f'transcript_scan must record the path and the offset at the file size after the scan: {scan} vs {tpath.stat().st_size}')
     line = status_line(h)
     check('(cli)' in line and 'last compaction: 2026-10-08T09:40:58' in line, f'status must show the CLI compaction last: {line}')
     event(h, 'C'); sup.run_once()
@@ -400,21 +403,30 @@ def cli_compactions_detected():
     tpath.write_text(json.dumps(good) + '\n')
     event(h, 'C2'); sup.run_once()
     check(len(cstate(h).get('cli_compactions') or []) == 1, 'a rescan after truncation must not duplicate a recorded boundary')
-    # a supervisor rollover: the scan path follows the new session id, a boundary there is found
+    check((cstate(h).get('transcript_scan') or {}).get('offset') == tpath.stat().st_size, 'the offset must follow the truncated file')
+    # a supervisor rollover (the fixture clock runs from 12:00:00Z): a boundary appended to the OLD transcript right
+    # before the rollover tick is found by the [compaction] turn's scan; older than the rollover, it does not replace
+    # the rollover as the status last
     (d / 'context').write_text('940000')
     event(h, 'D'); sup.run_once()
+    with tpath.open('a') as f:
+        f.write(json.dumps(dict(good, timestamp='2026-10-08T11:30:00.000Z')) + '\n')
     event(h, 'E'); sup.run_once()
     check('compaction' in kinds(d), 'overage after the CLI case must compact')
     check(session_id(h) != 'sess-test', 'rollover must replace the session id')
+    cli = cstate(h).get('cli_compactions') or []
+    check(len(cli) == 2 and cli[-1].get('at') == '2026-10-08T11:30:00.000Z', f'the boundary written before the rollover tick must be recorded by the compaction turn: {cli}')
     line = status_line(h)
-    check('(cli)' not in line and '->' in line, f'the newer supervisor compaction must be the status last: {line}')
+    check('(cli)' not in line and '->' in line, f'an older boundary must not replace the newer supervisor compaction as the status last: {line}')
+    # the scan path follows the new session id; a NEWER boundary there becomes the status last
     newpath = tdir / f'{session_id(h)}.jsonl'
-    newpath.write_text(json.dumps(other) + '\n' + json.dumps(dict(good, timestamp='2026-10-08T12:00:00.000Z')) + '\n')
+    newpath.write_text(json.dumps(other) + '\n' + json.dumps(dict(good, timestamp='2026-10-08T13:00:00.000Z')) + '\n')
     event(h, 'F'); sup.run_once()
     cli = cstate(h).get('cli_compactions') or []
-    check(len(cli) == 2 and cli[-1].get('at') == '2026-10-08T12:00:00.000Z', f'a boundary in the new transcript must be found: {cli}')
+    check(len(cli) == 3 and cli[-1].get('at') == '2026-10-08T13:00:00.000Z', f'a boundary in the new transcript must be found: {cli}')
     check(turns(h)[-1].get('cli_compacted') is True, 'the turn after the new-transcript boundary must be flagged')
-    check('(cli)' in status_line(h), f'the newest CLI compaction must now be the status last: {status_line(h)}')
+    check('last compaction: 2026-10-08T13:00:00' in status_line(h) and '(cli)' in status_line(h), f'the newer CLI compaction must now be the status last: {status_line(h)}')
+    check((cstate(h).get('transcript_scan') or {}).get('path') == str(newpath), 'the scan path must follow the new session id')
     # the cap: 51 boundaries keep the newest 50
     with newpath.open('a') as f:
         for i in range(51):
@@ -494,7 +506,8 @@ def stale_pending_regression():
     good = {'type': 'system', 'subtype': 'compact_boundary', 'timestamp': '2026-10-08T09:40:58.542Z'}
     h, d = home(), fakes(context=935607, context_after=94586)
     config(h, rollover_enabled=False)
-    sup = make(h, d)
+    # the clock runs from the diagnosis's pending time, so the held outcome (07:09Z) is older than the CLI boundary (09:40Z)
+    sup = make(h, d, clock=Clock(dt.datetime(2026, 10, 8, 7, 9, 40, tzinfo=dt.timezone.utc)))
     tdir = transcript_dir(h); tdir.mkdir(parents=True)
     tpath = tdir / 'sess-test.jsonl'; tpath.write_text('')
     event(h, 'A'); sup.run_once()
@@ -505,7 +518,9 @@ def stale_pending_regression():
     event(h, 'B'); sup.run_once()
     line = status_line(h)
     check(line.startswith('context: 94586 tokens'), f'status must show the last measured context, not the pending value: {line}')
-    check('(cli)' in line and '; compaction' not in line, f'the CLI compaction last and no suffix: {line}')
+    check('(cli)' in line and 'last compaction: 2026-10-08T09:40:58' in line and '; compaction' not in line, f'the CLI compaction last and no suffix: {line}')
+    held = cstate(h).get('last') or {}
+    check(str(held.get('error', '')).startswith('held:') and str(held.get('at', '')) < '2026-10-08T09:40', f'the held outcome must be older than the boundary: {held}')
     check(not cstate(h).get('pending'), 'a measurement below the threshold clears the stale pending')
     due, _ = sup.compaction_due()
     check(not due, 'scheduling must never act on a stale pending value')
@@ -600,6 +615,8 @@ def state_digest_bounds_the_message():
     check('the next gate text' in stdin and 'the waits text' in stdin, 'next_gate and waits_on missing')
     rec = turns(h)[-1]
     check(rec.get('message_bytes') == size, f'message_bytes must equal the stdin length: {rec.get("message_bytes")} != {size}')
+    check(size < raw, f'the digest must be smaller than the file it replaces: {size} vs {raw}')
+    print(f'[b11.acceptance] message bytes before: {raw} after: {size}')  # the notes carry this pair (requirement 8)
     # the plain assignee form selects too; extra words after the track id do not
     event(h, 'assignee: Hermes | track: t03', thread='7.7')
     event(h, 'assignee: Hermes | track: t04 please', thread='6.6')
@@ -607,19 +624,21 @@ def state_digest_bounds_the_message():
     stdin = calls(d)[-1]['stdin']
     check('MARKER-t03-DEEP' in stdin, 'the plain assignee line must select its track')
     check('MARKER-t04-DEEP' not in stdin, 'an assignee line with extra words must not select')
-    # the cap: four touched tracks of ~15 KB each cannot fit; the last-selected (work-status) goes first
-    state2 = big_state(entry_kb=15)
+    # the cap: four touched tracks of ~16 KB each cannot fit (one does); selection order is EVENT order (t17, t05,
+    # t11, then the work-status track t21), not file order, so t17 survives and t05 (first in file order) is dropped
+    state2 = big_state(entry_kb=16)
     Path(h, 'state.json').write_text(json.dumps(state2, indent=1))
+    event(h, 'continue t17: carry on', thread='8.8')
     event(h, 'again', thread='1791000005.000001')
     event(h, '<@U0FAKE> assignee: Hermes | track: t11\nrun', thread='9.9')
-    event(h, 'continue t17: carry on', thread='8.8')
     sup.run_once()
     stdin = calls(d)[-1]['stdin']
     size = len(stdin.encode('utf-8'))
     check(size <= 40000, f'the cap must hold under oversized selections, got {size}')
-    check('(truncated' in stdin, 'the header must say the digest was truncated')
-    check('MARKER-t05-DEEP' in stdin, 'the first-selected touched track must survive truncation')
-    check('MARKER-t21-DEEP' not in stdin, 'the last-selected touched track must be dropped first')
+    check('(truncated: 3 touched track(s) left out)' in stdin, f'the header must say three selected tracks were left out: {stdin[:200]!r}')
+    check('MARKER-t17-DEEP' in stdin, 'the first-selected touched track (by event order) must survive truncation')
+    check('MARKER-t05-DEEP' not in stdin, 'the first track in FILE order must not survive ahead of the first-selected one')
+    check('MARKER-t21-DEEP' not in stdin, 'the last-selected touched track (work-status) must be dropped first')
     for t in state2['tracks']:
         check(f"- {t['id']}: now:" in stdin, f"track lines are never dropped: {t['id']}")
     # the mandatory part alone over the budget: 80 tracks with long fields and 30 long decisions still fit
