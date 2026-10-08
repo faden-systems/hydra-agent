@@ -1510,6 +1510,31 @@ def _held_outcome(rec):
     return isinstance(rec, dict) and str(rec.get("error") or "").startswith("held:")
 
 
+def cli_compactions_since(data, offset):
+    """Requirement 3, loops/b11.md: the module-level pure parser. `data` is bytes, `offset` the byte position to
+    start from; returns ([{"at": <timestamp or None>}], new_offset) where new_offset is the end of the last
+    complete line consumed (a partial trailing line is left for the next scan, never consumed). Every complete
+    JSON line whose `type` is `system` and whose `subtype` is `compact_boundary` is one record; an invalid line
+    is skipped."""
+    records = []
+    pos = offset
+    while True:
+        nl = data.find(b"\n", pos)
+        if nl == -1:
+            break
+        line = data[pos:nl]
+        pos = nl + 1
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+            records.append({"at": obj.get("timestamp")})
+    return records, pos
+
+
 def compaction_status_line(home, now=None):
     """Requirement 4, loops/b11.md: one line, one number (the last measured Claude context, never a stale
     `pending` value), the due limit, the newest of the supervisor's own last compaction and the CLI's own
@@ -1837,6 +1862,8 @@ class Supervisor:
         self.engine_timeout = engine_timeout
         self.models = load_models(self.home)
         self.memory_dir = memory_dir_for(self.home, self.repo)
+        self._last_message_bytes = None  # requirement 5, loops/b11.md: the exact UTF-8 length of the message
+        # handed to the engine for the most recent invoke()/invoke_codex() call, recorded on every turn.
         self._persistent = None  # loops/b8.md: this instance's own live persistent child, never shared across
         # a real process boundary; a pid recorded on disk that this instance never spawned owns no pipe here
         # and is retired as an orphan the next time something needs to invoke (requirement 9, loops/b8.md).
@@ -2077,14 +2104,19 @@ class Supervisor:
         usage = usage or {}
         is_claude = family_of(engine, self.engines) == "claude"
         compaction = None
+        cli_found = False
         if is_claude:
             self.snapshot_claude_memory()
             compaction = self.verify_compaction(usage.get("context_tokens"))
+            cli_found = self._scan_cli_compactions(n)
         self.append_ledger(n, engine, model, before, transition, compaction=compaction)
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
         record = {"n": n, "at": started, "engine": engine, "model": model, "events": [ev["id"] for ev in events],
-                  "reacted": reacted, "duration_s": round(time.time() - started, 3)}
+                  "reacted": reacted, "duration_s": round(time.time() - started, 3),
+                  "message_bytes": self._last_message_bytes}
+        if is_claude:
+            record["cli_compacted"] = cli_found
         for k in ("tokens", "input_tokens", "context_tokens"):
             if usage.get(k) is not None:
                 record[k] = usage[k]
@@ -2437,6 +2469,7 @@ class Supervisor:
             if handoff_text:
                 preamble = preamble + "\n\n# MANAGER-HANDOFF.md\n" + handoff_text.rstrip()
             message = preamble + "\n\n" + message
+        self._last_message_bytes = len(message.encode("utf-8"))
         if read_engine(self.home, self.engines)["mode"] == "persistent":
             result = self._invoke_persistent(name, spec, message, model)
             if result is not None:
@@ -2712,9 +2745,9 @@ class Supervisor:
         body = message
         if not preamble and message.startswith("[memory]"):
             preamble, _, body = message.partition("\n\n")
-        prefix = ["# MANAGER-HANDOFF.md", (self.read_handoff() or "(none)").rstrip(),
-                  "", "# factory/state.json", read_text(state_path(self.home, self.repo), "{}").rstrip(), ""]
+        prefix = ["# MANAGER-HANDOFF.md", (self.read_handoff() or "(none)").rstrip(), ""]
         full = (preamble + "\n\n" if preamble else "") + "\n".join(prefix) + "\n" + body
+        self._last_message_bytes = len(full.encode("utf-8"))
         last = self.path("logs", "codex-last-message.txt")
         with contextlib.suppress(FileNotFoundError):
             os.remove(last)
@@ -2843,6 +2876,41 @@ class Supervisor:
         ctx, _ = _last_measured_claude_turn(self.home, self.engines)
         return ctx
 
+    def _scan_cli_compactions(self, turn_n):
+        """Requirement 3, loops/b11.md: scan the current session's transcript from the recorded byte offset for
+        new `compact_boundary` records, record them in `logs/compaction.json` (newest 50) and `transcript_scan`
+        (reset to the file's start when the path differs from the recorded one or the file is shorter than the
+        offset). Returns True when a boundary was found (never raises: a missing/unreadable transcript or a
+        scan error is logged once and the caller's turn completes)."""
+        try:
+            path = find_claude_transcript(self.path(".claude"), self.home, self.session_id() or None)
+            if not path:
+                return False
+            state = self.compaction_state()
+            scan = state.get("transcript_scan") or {}
+            size = os.path.getsize(path)
+            offset = scan.get("offset") or 0
+            if scan.get("path") != path or size < offset:
+                offset = 0
+            with open(path, "rb") as f:
+                f.seek(offset)
+                data = f.read()
+            recs, consumed = cli_compactions_since(data, 0)
+            cli_list = list(state.get("cli_compactions") or [])
+            known_at = {r.get("at") for r in cli_list}
+            new_recs = [r for r in recs if (r.get("at") or self.now()) not in known_at]
+            found = bool(new_recs)
+            if found:
+                for r in new_recs:
+                    cli_list.append({"at": r.get("at") or self.now(), "turn": turn_n})
+                state["cli_compactions"] = cli_list[-50:]
+            state["transcript_scan"] = {"path": path, "offset": offset + consumed}
+            self.save_compaction_state(state)
+            return found
+        except OSError as e:
+            log(f"cli compaction scan failed: {e}")
+            return False
+
     def compaction_pending(self):
         """A compaction is scheduled (by tokens, by bytes, or forced) and has not run yet."""
         return bool(self.compaction_state().get("pending")) or os.path.exists(self.path("COMPACT"))
@@ -2962,8 +3030,7 @@ class Supervisor:
     # id replacement, instead of `/compact`. `rollover-intent.json` survives a crash at any point.
 
     def rollover_enabled(self):
-        cfg = self.config.get("compaction")
-        return bool((cfg if isinstance(cfg, dict) else {}).get("rollover_enabled"))
+        return bool(self.compaction_config()["rollover_enabled"])
 
     def rollover_intent_path(self):
         return self.path("rollover-intent.json")
@@ -3021,7 +3088,7 @@ class Supervisor:
         self.persistence_checkpoint("rollover_recovered")
         self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": bool(intent.get("started"))})
 
-    def _finish_rollover_bookkeeping(self, intent, before_dir=None):
+    def _finish_rollover_bookkeeping(self, intent, before_dir=None, message_bytes=None):
         """The durable last/verify state, the one successful-compaction ledger entry and the original
         COMPACT/pending trigger consumption for a single rollover (requirement 22, loops/b7.md: B3). Idempotent:
         safe to call again on an already-finished rollover (restart, or a repeated checkpoint crash) without a
@@ -3047,7 +3114,7 @@ class Supervisor:
                                kind="compaction", compaction=None)
             append_jsonl(self.path("logs", "turns.jsonl"),
                         {"n": turn, "at": time.time(), "engine": name, "model": model, "events": [],
-                         "duration_s": 0.0, "kind": "compaction"})
+                         "duration_s": 0.0, "kind": "compaction", "message_bytes": message_bytes})
 
     def replace_session_id(self, new_id):
         """Atomically replace `$HYDRA_HOME/session-id` with `new_id` (os.replace); raises on write failure without
@@ -3211,9 +3278,13 @@ class Supervisor:
             rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None, "reason": reason,
                    "error": "held: automatic rollover is disabled (compaction.rollover_enabled is false)"}
             state["last"] = rec
-            state["pending"] = None
             with contextlib.suppress(FileNotFoundError):
                 os.remove(self.path("COMPACT"))
+            if not state.get("held_posted"):
+                limit = int(self.compaction_config()["over_ratio"] * self.compaction_config()["threshold_tokens"])
+                self.buildlog(f"hydra-manager: compaction held (rollover disabled): context {before_tokens} over "
+                              f"{limit}; enable compaction.rollover_enabled")
+                state["held_posted"] = True
             self.save_compaction_state(state)
             log(f"compaction held: rollover disabled; session {old_id or '-'} kept")
             return rec
@@ -3231,6 +3302,7 @@ class Supervisor:
             before_dir = dir_hashes(self.memory_dir)
             log(f"compaction ({reason}) on {name}: [compaction] turn")
             rc, out, err, usage = self.invoke(name, spec, COMPACTION_MESSAGE, model)
+            mb = self._last_message_bytes
             if rc != 0:
                 error = f"[compaction] turn failed on {name} (rc={rc}): {(err or out or '').strip()[-200:]}"
             else:
@@ -3246,6 +3318,8 @@ class Supervisor:
                     old_id = self.session_id()  # the compaction turn itself may have just bootstrapped this
                     # id (there was no prior session at all): the actual "old" side of this rollover is whatever
                     # session that turn ran on, not the empty value read before invoke().
+                    self._scan_cli_compactions(n)  # requirement 3, loops/b11.md: the OLD session's transcript,
+                    # before the id below is replaced
                     new_id = str(uuid.uuid4())
                     intent = {"old_id": old_id, "new_id": new_id, "started": False, "turn": n, "reason": reason,
                               "before_tokens": before_tokens, "at": at, "engine": name, "model": model}
@@ -3258,7 +3332,8 @@ class Supervisor:
                         error = f"session replacement failed: {e}"
                     else:
                         self.persistence_checkpoint("rollover_id_replaced")
-                        self._finish_rollover_bookkeeping(intent, before_dir)
+                        self._scan_cli_compactions(n)  # requirement 3: the NEW session's transcript
+                        self._finish_rollover_bookkeeping(intent, before_dir, message_bytes=mb)
                         self.persistence_checkpoint("rollover_state_saved")
                         self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": False})
                         log(f"rollover done: session {old_id} -> {new_id}; the next Claude turn verifies it")
@@ -3268,7 +3343,6 @@ class Supervisor:
                "error": error}
         state["last"] = rec
         state["pending"] = pending or None
-        state["baseline_bytes"] = self.session_file_size()
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("COMPACT"))
         self._compaction_outcome(state, rec)
