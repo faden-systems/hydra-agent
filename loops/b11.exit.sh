@@ -121,6 +121,10 @@ passed={l.split(' ',1)[1].strip() for l in lines if l.startswith('PASSED ')}
 for n in sorted(nodes):
     assert n in passed,f'baseline test did not pass unskipped against candidate code: {n}'
 print(f'[b11] baseline suite: {len(nodes)} node ids executed and passed against candidate code')
+import re
+notes=Path('docs/notes/b11.md').read_text()
+m=re.search(r'(\d+) passed',notes)
+assert m and int(m.group(1))>=len(nodes),f'notes pytest count {m.group(1) if m else None} is below the {len(nodes)} baseline node ids the exit executed'
 PY
 "$PYTHON" - "$PYTHON" <<'PY'
 import re,subprocess,sys

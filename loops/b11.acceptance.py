@@ -336,7 +336,8 @@ def held_is_loud_and_keeps_the_schedule():
     run_ticks(sup, 2)
     held_lines = [t for _, _, t in blog.posted if 'compaction held' in t]
     check(len(held_lines) == 1, f'exactly one held buildlog line per episode, got {held_lines}')
-    check('over' in held_lines[0], f'held line must name the overage: {held_lines[0]}')
+    check('context 940000 over 375000' in held_lines[0] and 'compaction.rollover_enabled' in held_lines[0],
+          f'held line must name the measured context, the limit and the setting: {held_lines[0]}')
     Path(h, 'COMPACT').write_text('')
     sup.run_once()
     check(not Path(h, 'COMPACT').exists(), 'a forced request must be consumed, not retried every tick')
@@ -455,10 +456,25 @@ def cli_compactions_detected():
     check('(cli)' in line and 'last compaction: 2026-10-08T09:40:58' in line, f'status must show the CLI compaction last: {line}')
     event(h, 'C'); sup.run_once()
     check(len(cstate(h).get('cli_compactions') or []) == 1, 'a boundary must be counted once, not on every scan')
+    # a partial boundary line is not consumed; once its newline arrives it is found (offset = consumed, not file size)
+    partial_line = json.dumps(dict(good, timestamp='2026-10-08T10:40:58.542Z'))
+    with tpath.open('a') as f:
+        f.write(partial_line[:20])
+    event(h, 'C-partial'); sup.run_once()
+    check(len(cstate(h).get('cli_compactions') or []) == 1, 'a partial boundary line must not be counted')
+    check((cstate(h).get('transcript_scan') or {}).get('offset') == tpath.stat().st_size - 20, 'the offset must stop before the partial line')
+    with tpath.open('a') as f:
+        f.write(partial_line[20:] + '\n')
+    event(h, 'C-complete'); sup.run_once()
+    cli = cstate(h).get('cli_compactions') or []
+    check(len(cli) == 2 and cli[-1].get('at') == '2026-10-08T10:40:58.542Z', f'the completed boundary line must be found: {cli}')
+    sup_fresh = make(h, d)
+    event(h, 'C-fresh'); sup_fresh.run_once()
+    check(len(cstate(h).get('cli_compactions') or []) == 2, 'a fresh supervisor must rescan from the recorded offset and find nothing new')
     # truncation: the file is rewritten shorter with the same boundary -> rescanned, not duplicated
     tpath.write_text(json.dumps(good) + '\n')
     event(h, 'C2'); sup.run_once()
-    check(len(cstate(h).get('cli_compactions') or []) == 1, 'a rescan after truncation must not duplicate a recorded boundary')
+    check(len(cstate(h).get('cli_compactions') or []) == 2, 'a rescan after truncation must not duplicate a recorded boundary')
     check((cstate(h).get('transcript_scan') or {}).get('offset') == tpath.stat().st_size, 'the offset must follow the truncated file')
     # a supervisor rollover (the fixture clock runs from 12:00:00Z): a boundary appended to the OLD transcript right
     # before the rollover tick is found by the [compaction] turn's scan; older than the rollover, it does not replace
@@ -471,7 +487,7 @@ def cli_compactions_detected():
     check('compaction' in kinds(d), 'overage after the CLI case must compact')
     check(session_id(h) != 'sess-test', 'rollover must replace the session id')
     cli = cstate(h).get('cli_compactions') or []
-    check(len(cli) == 2 and cli[-1].get('at') == '2026-10-08T11:30:00.000Z', f'the boundary written before the rollover tick must be recorded by the compaction turn: {cli}')
+    check(len(cli) == 3 and cli[-1].get('at') == '2026-10-08T11:30:00.000Z', f'the boundary written before the rollover tick must be recorded by the compaction turn: {cli}')
     line = status_line(h)
     check('(cli)' not in line and '->' in line, f'an older boundary must not replace the newer supervisor compaction as the status last: {line}')
     # the scan path follows the new session id; a NEWER boundary there becomes the status last
@@ -479,7 +495,7 @@ def cli_compactions_detected():
     newpath.write_text(json.dumps(other) + '\n' + json.dumps(dict(good, timestamp='2026-10-08T13:00:00.000Z')) + '\n')
     event(h, 'F'); sup.run_once()
     cli = cstate(h).get('cli_compactions') or []
-    check(len(cli) == 3 and cli[-1].get('at') == '2026-10-08T13:00:00.000Z', f'a boundary in the new transcript must be found: {cli}')
+    check(len(cli) == 4 and cli[-1].get('at') == '2026-10-08T13:00:00.000Z', f'a boundary in the new transcript must be found: {cli}')
     check(turns(h)[-1].get('cli_compacted') is True, 'the turn after the new-transcript boundary must be flagged')
     check('last compaction: 2026-10-08T13:00:00' in status_line(h) and '(cli)' in status_line(h), f'the newer CLI compaction must now be the status last: {status_line(h)}')
     check((cstate(h).get('transcript_scan') or {}).get('path') == str(newpath), 'the scan path must follow the new session id')
@@ -611,6 +627,19 @@ def bytes_overage_compacts():
     event(h, 'D'); sup.run_once()
     check(kinds(d).count('compaction') == 2, f'after the back-off the bytes overage is retried: {kinds(d)}')
     check(session_id(h) != 'sess-test', 'the retried rollover must replace the session id')
+    # rollover disabled: a persisting bytes overage with a low measured context is one held episode, one line
+    h2, d2 = home(), fakes(context=100000)
+    config(h2, max_bytes=1000, rollover_enabled=False)
+    blog2 = Poster()
+    sup2 = make(h2, d2, blog=blog2)
+    t2 = transcript_dir(h2); t2.mkdir(parents=True)
+    (t2 / 'sess-test.jsonl').write_text('x' * 5000 + '\n')
+    for name in ('A', 'B', 'C'):
+        event(h2, name); sup2.run_once()
+    check(kinds(d2) == ['turn', 'turn', 'turn'], f'held: no engine compaction call: {kinds(d2)}')
+    held2 = [x for _, _, x in blog2.posted if 'compaction held' in x]
+    check(len(held2) == 1, f'a persisting bytes overage with rollover disabled must post exactly one held line: {held2}')
+    check((cstate(h2).get('pending') or {}).get('reason') == 'bytes', 'the bytes pending must survive low-context turns')
 
 
 def codex_selected_ignores_stale_claude_measurement():
@@ -724,6 +753,26 @@ def state_digest_bounds_the_message():
     check('(mandatory part shortened)' in stdin, 'the header must say the mandatory part was shortened')
     for t in state3['tracks']:
         check(f"- {t['id']}:" in stdin, f"every track id must still appear: {t['id']}")
+    # the degradation order: decisions down to the newest three first, then now cut to 120 (which fits), never 60
+    check('decision number 30' in stdin and 'decision number 28' in stdin and 'decision number 27' not in stdin,
+          'the newest three decisions must remain, the rest dropped')
+    check('n' * 108 in stdin and 'n' * 109 not in stdin, 'every track line must be now cut to 120 bytes')
+    check('w' * 50 not in stdin and 'a' * 50 not in stdin, 'waits_on/next_action must be gone from the shortened lines')
+    # the supported boundary: 400 tracks, 56-byte four-byte-character ids, 30 decisions of 600 four-byte characters
+    state4 = big_state(n_tracks=400, entry_kb=1)
+    for i, t in enumerate(state4['tracks']):
+        t['id'] = chr(0x1F600 + (i % 60)) * 13 + chr(0x1F600 + (i // 60))   # 14 chars x 4 bytes = 56 bytes, unique
+        t['now'] = 'now ' + ('\U0001F4AA' * 60); t['waits_on'] = 'w' * 230; t['next_action'] = 'a' * 230
+    state4['founder_decisions_in_force'] = ['\U0001F4DD' * 600 for _ in range(30)]
+    Path(h, 'state.json').write_text(json.dumps(state4, indent=1, ensure_ascii=False))
+    event(h, 'boundary', thread='5.5')
+    sup.run_once()
+    stdin = calls(d)[-1]['stdin']
+    check(digest_bytes(stdin) <= 36000 and len(stdin.encode('utf-8')) < 40000, f'the supported boundary must fit: digest {digest_bytes(stdin)}')
+    check('over budget' not in stdin, 'the supported boundary must never be over budget')
+    for t in state4['tracks']:
+        check(f"- {t['id']}" in stdin, 'every unicode id must appear')
+    Path(h, 'work-status.json').write_text(json.dumps({'turn': 0, 'mode': 'done', 'track': 't21'}))
     # Codex gets the same digest and no second state section; message_bytes on every record incl. the compaction
     Path(h, 'state.json').write_text(json.dumps(state, indent=1))
     Path(h, 'engine').write_text('codex\n')
@@ -776,6 +825,17 @@ def persistent_mode_covered():
         check([k for k, _ in ks] == ['turn', 'turn', 'turn', 'compaction', 'turn'], f'expected the compaction before turn D: {ks}')
         check(session_id(h) != 'sess-test', 'the rollover must replace the session id in persistent mode')
         check(ks[-1][1] != pid_a, f'the old child must be retired by the rollover (same pid served turn D): {ks}')
+        gone = False
+        for _ in range(50):
+            try:
+                st = Path(f'/proc/{pid_a}/stat').read_text()
+                gone = st.split(')')[-1].split()[0] == 'Z'
+            except FileNotFoundError:
+                gone = True
+            if gone:
+                break
+            time.sleep(0.1)
+        check(gone, f'the retired child {pid_a} must have exited, not leaked')
         crec = [r for r in turns(h) if r.get('kind') == 'compaction']
         check(crec and crec[-1].get('message_bytes') == len(calls(d)[-2]['stdin'].encode('utf-8')), 'message_bytes on the compaction record')
         last = cstate(h).get('last') or {}
