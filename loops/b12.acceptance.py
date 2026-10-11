@@ -335,6 +335,62 @@ def all_out_posts_one_unavailable_line():
     no_downgrade(h)
 
 
+def unavailable_notice_survives_crash_windows():
+    """Crash at the durable episode/queue boundary and after enqueue; receipt dedup survives restart."""
+    class SimulatedCrash(BaseException):
+        pass
+    table = {f'{account}|{model}': 'credits' for account, model in [
+        ('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA),
+        ('claude-r2d2', OPUS), ('claude-l', OPUS)]}
+    for window in ('before-queue', 'after-queue', 'after-receipt'):
+        h, d, poster = home(), fakes(table), Poster()
+        sup = make(h, d)
+        event(h, f'crash window {window}')
+        original = S._queue_notice_once
+        reached = []
+        def crash_queue(home_arg, channel, text, note_id):
+            if not note_id.startswith('unavailable-'):
+                return original(home_arg, channel, text, note_id)
+            ep = json.loads(Path(h, 'logs/unavailable.json').read_text())
+            check(note_id == f"unavailable-{ep['episode_id']}" and ep.get('reasons'),
+                  'episode and reasons must be durable before enqueue')
+            reached.append(note_id)
+            if window != 'before-queue':
+                original(home_arg, channel, text, note_id)
+            if window == 'after-receipt':
+                S.drain_outbox(h, poster)
+                check(S.post_receipt(h, note_id) is not None, 'delivery must have a durable receipt')
+            raise SimulatedCrash()
+        S._queue_notice_once = crash_queue
+        try:
+            try:
+                sup.run_once()
+            except SimulatedCrash:
+                pass
+        finally:
+            S._queue_notice_once = original
+        check(len(reached) == 1, f'crash seam was not reached exactly once: {window} {reached}')
+        check(len(unavailable_lines(h)) == (1 if window == 'after-queue' else 0),
+              f'unexpected pending notice at crash boundary {window}')
+        retry = Path(h, 'logs/retry-after')
+        if retry.exists():
+            retry.unlink()
+        restarted = make(h, d)
+        check(restarted.run_once() is True, f'restart must retry pending event: {window}')
+        S.drain_outbox(h, poster)
+        notices = [(c, t, text) for c, t, text in poster.posted if 'all allowed engines failed' in text]
+        check(len(notices) == 1 and notices[0][0:2] == ('C_DEV', None),
+              f'exactly one eventual top-level delivery across {window}: {notices}')
+        check(S.post_receipt(h, reached[0]) is not None, 'original episode ID must be receipted')
+        if retry.exists():
+            retry.unlink()
+        check(make(h, d).run_once() is True, 'second restarted retry must run')
+        S.drain_outbox(h, poster)
+        check(len([text for _, _, text in poster.posted if 'all allowed engines failed' in text]) == 1,
+              f'a receipted episode must not repost: {window}')
+        no_downgrade(h)
+
+
 def commands_refuse_outside_the_allowlist():
     """Requirement 2 (d) and 5: `hydra engine` and `@manager engine` refuse models outside the ladder with one line
     and change nothing; ladder pairs, the legacy form and a bare mode change are accepted."""
@@ -492,6 +548,41 @@ def legacy_claude_models_config_is_ignored():
     no_downgrade(h)
 
 
+def _policy_diagnostics_worker():
+    # A fresh process prevents other scenarios' once-per-process warnings from consuming this check.
+    captured = []
+    original = S.log
+    S.log = lambda message: captured.append(str(message))
+    try:
+        cfg = {'engine_fallback': {'claude_models': ['claude-sonnet-5']},
+               'engine_policy': {'ladder': [
+                   {'model': 'claude-sonnet-5', 'accounts': ['claude-r2d2']},
+                   {'model': FABLE, 'accounts': ['unknown-second-account']}]}}
+        h, d = home(config=cfg), fakes()
+        for instance in range(2):
+            sup = make(h, d)
+            for turn in range(2):
+                event(h, f'diagnostic {instance}/{turn}')
+                check(sup.run_once() is True, 'diagnostic turn did not run')
+                status(h)
+        legacy = [line for line in captured if 'engine_fallback.claude_models' in line and 'ignor' in line]
+        invalid = [line for line in captured if 'engine_policy ignored:' in line]
+        check(len(legacy) == 1, f'exactly one legacy warning across turns and instances: {legacy}')
+        check(len(invalid) == 1 and 'claude-sonnet-5' in invalid[0]
+              and 'unknown-second-account' not in invalid[0] and 'default ladder is in force' in invalid[0],
+              f'exactly one invalid-policy warning naming the first problem: {invalid}')
+        check(invoked(d) == [('claude-r2d2', FABLE)] * 4, f'invalid policy must use default: {invoked(d)}')
+        no_downgrade(h)
+    finally:
+        S.log = original
+
+
+def policy_diagnostics_once_per_process():
+    code = "import runpy; n=runpy.run_path(%r); n['_policy_diagnostics_worker']()" % str(Path(__file__).resolve())
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=120)
+    check(result.returncode == 0, f'isolated diagnostic contract: {result.stdout} {result.stderr}')
+
+
 def persistent_mode_covered():
     """Requirement 6 (j): in persistent mode a tier-1 child whose start fails with a credits error on both accounts
     falls back to per-turn for the turn (b8) and the ladder lands on codex; nothing below the floor."""
@@ -501,7 +592,16 @@ def persistent_mode_covered():
     try:
         event(h, 'A')
         check(sup.run_once() is True, 'turn A did not run')
-        models = {c['model'] for c in calls(d)}
+        recorded = calls(d)
+        first = [(c['acc'], c['model'], c.get('persistent', False)) for c in recorded[:3]]
+        check(first == [('claude-r2d2', FABLE, True), ('claude-r2d2', FABLE, True),
+                        ('claude-r2d2', FABLE, False)],
+              f'two failed persistent starts must precede the per-turn retry: {first}')
+        check(recorded[0]['stdin'] == recorded[1]['stdin'] == '<persistent start>'
+              and recorded[0]['pid'] != recorded[1]['pid'], 'two distinct persistent children must actually start')
+        check(recorded[2]['stdin'] and recorded[2]['stdin'] != '<persistent start>',
+              'the per-turn retry must receive the manager message')
+        models = {c['model'] for c in recorded}
         check(models <= LADDER_MODELS, f'only ladder models started in persistent mode: {models}')
         check(invoked(d)[-1] == ('codex', ASTRA), f'the ladder lands on codex: {invoked(d)}')
         att = attempts(h)
@@ -512,6 +612,63 @@ def persistent_mode_covered():
             sup._retire_persistent('planned', 'acceptance done')
         except Exception:
             pass
+
+
+
+def configured_ladder_controls_execution_and_commands():
+    """A valid override controls account membership, order and both command surfaces."""
+    ladder = [{'model': 'gpt6', 'accounts': ['codex']},
+              {'model': 'opus5.5', 'accounts': ['claude-l']}]
+    cfg = {'engine_policy': {'ladder': ladder}}
+    h = home(engine={'acc': 'codex', 'model': ASTRA}, config=cfg)
+    d = fakes({f'codex|{ASTRA}': 'usage_limit'})
+    sup = make(h, d)
+    event(h, 'custom ladder')
+    check(sup.run_once() is True, 'custom-ladder turn did not run')
+    expected = [('codex', ASTRA), ('claude-l', OPUS)]
+    check(invoked(d) == expected, f'override order/account membership ignored: {invoked(d)}')
+    check([(a['engine'], a['model']) for a in attempts(h)] == expected,
+          f'custom ladder attempt records disagree: {attempts(h)}')
+    no_downgrade(h, {ASTRA, OPUS})
+    # Same approved model, excluded account; also an approved model excluded entirely.
+    for acc, model in [('claude-r2d2', OPUS), ('claude-l', FABLE)]:
+        before = Path(h, 'engine').read_bytes()
+        runtime = Path(h, 'engine-runtime.json').read_bytes()
+        rc, out, err = hydra(h, 'engine', f'acc={acc}', f'model={model}')
+        check(rc == 2 and "not on the manager's allowlist" in err, f'custom console refusal: {rc} {out} {err}')
+        check(Path(h, 'engine').read_bytes() == before and Path(h, 'engine-runtime.json').read_bytes() == runtime,
+              'custom console refusal changed configuration/runtime')
+        poster = Poster()
+        br = make_bridge(h, poster)
+        slack(br, f'<@U_MANAGER> engine acc={acc} model={model}', str(time.time_ns()))
+        check(poster.posted and "not on the manager's allowlist" in poster.posted[-1][2],
+              f'custom Slack refusal: {poster.posted}')
+        check(Path(h, 'engine').read_bytes() == before and Path(h, 'engine-runtime.json').read_bytes() == runtime,
+              'custom Slack refusal changed configuration/runtime')
+    rc, out, err = hydra(h, 'engine', 'acc=claude-l', 'model=opus5.5')
+    check(rc == 0 and engine_file(h)['acc'] == 'claude-l' and engine_file(h)['model'] == OPUS,
+          f'custom console allowed pair: {rc} {out} {err}')
+    poster = Poster()
+    slack(make_bridge(h, poster), '<@U_MANAGER> engine acc=codex model=gpt6', 'custom-allowed')
+    check(poster.posted[-1][2] == f'engine: codex ({ASTRA})' and engine_file(h)['acc'] == 'codex',
+          f'custom Slack allowed pair: {poster.posted}')
+
+
+def documentation_and_help():
+    """Requirement 5: published instructions cover the policy and runnable help marks coder aliases."""
+    readme = (ROOT / 'manager/README.md').read_text().lower()
+    for topic in ('floor', FABLE, ASTRA, OPUS, 'engine_policy', 'ladder', 'engine policy:',
+                  'all allowed engines failed', 'gpt6.1', 'sol6.1', 'gpt-6.1-sol'):
+        check(topic.lower() in readme, f'README omits policy topic {topic!r}')
+    check('coder' in readme and ('refus' in readme or 'not allowed' in readme),
+          'README must explain that coder aliases are refused for the manager')
+    rc, out, err = hydra(home(), '--help')
+    check(rc == 0, f'help command failed: {rc} {err}')
+    for alias in ('fable5.1', 'opus5.5', 'gpt6', 'gpt6.1', 'sol6.1'):
+        check(alias in out, f'help omits {alias}')
+    check('sonnet5' not in out and 'haiku4.5' not in out, 'help advertises removed aliases')
+    check('coder' in out.lower() and ('refus' in out.lower() or 'not allowed' in out.lower()),
+          'help must identify coder-only aliases and their manager restriction')
 
 
 def models_json_aliases():
@@ -565,7 +722,7 @@ SCENARIOS = [fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus5
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,
-             attach_refuses_outside_the_allowlist]
+             attach_refuses_outside_the_allowlist, configured_ladder_controls_execution_and_commands, documentation_and_help, policy_diagnostics_once_per_process, unavailable_notice_survives_crash_windows]
 
 
 def main(argv):
