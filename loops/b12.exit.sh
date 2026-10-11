@@ -100,6 +100,10 @@ for file in files:
     for node in before.body:
         if isinstance(node,ast.FunctionDef) and f'{file}::{node.name}' in exempt:
             continue
+        if file == 'tests/manager/test_memory.py' and isinstance(node,ast.FunctionDef) and node.name == 'test_switch_to_codex_and_back_lists_the_other_familys_files':
+            literals=[n for n in ast.walk(node) if isinstance(n,ast.Constant) and n.value == 'gpt-5.6-sol']
+            assert len(literals)==3,'baseline memory migration no longer matches exactly three literals'
+            for literal in literals: literal.value='gpt-6-astra'
         d=ast.dump(node,include_attributes=False)
         assert d in retained,f'baseline regression statement changed: {file}:{node.lineno}';retained.remove(d)
 print('[b12] baseline test statements preserved (eleven named exemptions)')
@@ -112,6 +116,22 @@ trap 'rm -rf "$MIX"' EXIT
 tar --exclude=.git --exclude=.venv --exclude=__pycache__ --exclude=.pytest_cache -cf - . | tar -xf - -C "$MIX"
 rm -rf "$MIX/tests/manager"
 git archive "$BASE" tests/manager | tar -x -C "$MIX" || fail 'baseline tests not extracted'
+# Literal-only model migration; all memory assertions remain in the baseline run.
+"$PYTHON" - "$MIX/tests/manager/test_memory.py" <<'PYMIGRATE'
+import ast,sys
+from pathlib import Path
+p=Path(sys.argv[1]);source=p.read_text();tree=ast.parse(source)
+fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='test_switch_to_codex_and_back_lists_the_other_familys_files')
+literals=[n for n in ast.walk(fn) if isinstance(n,ast.Constant) and n.value=='gpt-5.6-sol']
+assert len(literals)==3,'baseline memory migration no longer matches exactly three literals'
+# AST columns are UTF-8 byte offsets; preserve the remainder of the source verbatim.
+lines=source.encode().splitlines(keepends=True)
+for n in sorted(literals,key=lambda n:(n.lineno,n.col_offset),reverse=True):
+    assert n.lineno==n.end_lineno,'unexpected multiline model literal'
+    line=lines[n.lineno-1]
+    lines[n.lineno-1]=line[:n.col_offset]+b'"gpt-6-astra"'+line[n.end_col_offset:]
+p.write_bytes(b''.join(lines))
+PYMIGRATE
 DESELECT=()
 for t in $EXEMPT; do DESELECT+=(--deselect "$t"); done
 (cd "$MIX" && "$PYTHON" -m pytest --rootdir=. -q --collect-only -p no:cacheprovider "${DESELECT[@]}" tests/manager) >"$MIX/nodes.txt" || fail 'baseline collection'

@@ -501,6 +501,31 @@ def status_line_contract():
     check(len(policy_line(h4)) <= 400 and policy_line(h4).endswith('...'), f'bounded with an ellipsis: {len(policy_line(h4))} {policy_line(h4)[-20:]!r}')
 
 
+    # Each non-ladder field independently exceeds the entire line budget.
+    long_acc = 'claude-' + '界🙂' * 240
+    custom = {'engine_policy': {'ladder': [{'model': FABLE, 'accounts': [long_acc]},
+                {'model': OPUS, 'accounts': ['claude-r2d2']}]},
+              'engines': {long_acc: {'bin': '/unused/fake-claude'}}}
+    active = policy_line(home(engine={'acc': long_acc, 'model': FABLE}, config=custom))
+    check('active tier 1/2 ' + long_acc[:37] + '... (' + FABLE + ')' in active,
+          f'active account cap preserves tier and model: {active!r}')
+    check(len(active) <= 400 and 'engine_policy ignored' not in active, f'long valid account: {active!r}')
+    stale_pair = {'acc': long_acc, 'model': 'obsolete-' + '界🙂' * 240}
+    stale = policy_line(home(engine=stale_pair))
+    label = S.engine_label(stale_pair)
+    check('(configured ' + label[:57] + '... is outside the ladder; the next turn starts at tier 1)' in stale,
+          f'stale label cap preserves recovery text: {stale!r}')
+    check(len(stale) <= 400, f'long stale label: {stale!r}')
+    bad_home = home(config={'engine_policy': {'ladder': [{'model': FABLE, 'accounts': [long_acc]}]}})
+    ignored = policy_line(bad_home)
+    marker = ' (engine_policy ignored: '
+    check(marker in ignored and ignored.endswith('...)'), f'diagnostic cap preserves suffix: {ignored!r}')
+    reason = ignored.split(marker, 1)[1][:-1]
+    check(len(reason) == 80 and long_acc[:20] in reason, f'diagnostic retains first problem in 80 code points: {reason!r}')
+    check(len(ignored) <= 400 and 'floor ' + OPUS in ignored and 'active tier 1/3' in ignored,
+          f'long ignored-policy reason: {ignored!r}')
+
+
 def ladder_rotation_from_a_selected_lower_tier():
     """Requirement 1 (g): a deliberately selected lower tier falls back downward first, then wraps to the top."""
     h = home(engine={'acc': 'codex', 'model': ASTRA})
