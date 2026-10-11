@@ -297,10 +297,12 @@ def all_out_posts_one_unavailable_line():
     text = lines[0]['text']
     check(text.startswith('manager unavailable: all allowed engines failed ('), f'wording: {text!r}')
     check(lines[0].get('thread_ts') is None and lines[0].get('channel') == 'C_DEV', f'the line is top level in the dev channel: {lines[0]}')
-    for step in ('tier 1 claude-r2d2 (claude-fable-5-1): credits', 'tier 1 claude-l (claude-fable-5-1): credits',
-                 'tier 2 codex (gpt-6-astra): usage_limit', 'tier 3 claude-r2d2 (claude-opus-5-5): credits',
-                 'tier 3 claude-l (claude-opus-5-5): credits'):
-        check(step in text, f'the reasons must name every step: missing {step!r} in {text!r}')
+    expected = '; '.join((
+        f'tier 1 claude-r2d2 ({FABLE}): credits', f'tier 1 claude-l ({FABLE}): credits',
+        f'tier 2 codex ({ASTRA}): usage_limit', f'tier 3 claude-r2d2 ({OPUS}): credits',
+        f'tier 3 claude-l ({OPUS}): credits'))
+    check(text == f'manager unavailable: all allowed engines failed ({expected})',
+          f'exact ordered reasons and separators: {text!r}')
     check(not any('unavailable' in t for _, _, t in poster.posted), f'no per-thread unavailable note any more: {poster.posted}')
     check(eid not in S.handled_ids(h), 'the event stays pending for the retry')
     check(os.path.exists(os.path.join(h, 'logs', 'retry-after')), 'retry-after must be written')
@@ -718,7 +720,80 @@ def attach_refuses_outside_the_allowlist():
     check(argv[argv.index('--model') + 1] == OPUS, f'attach runs the configured ladder model: {argv}')
 
 
-SCENARIOS = [fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+def unavailable_reason_contract():
+    """Exercise the real turn/error/notice path; only engine invocation and eligibility inputs are fake."""
+    ladder = [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA),
+              ('claude-r2d2', OPUS), ('claude-l', OPUS)]
+    labels = [f'tier {tier} {acc} ({model}): ' for tier, (acc, model) in zip((1, 1, 2, 3, 3), ladder)]
+
+    def run(replies, expected, expected_calls, *, skip=None, custom=None):
+        cfg = {'engine_fallback': {'claude_models': []}}
+        specs = None
+        if custom:
+            cfg['engine_policy'] = {'ladder': [{'model': ASTRA, 'accounts': custom}]}
+            cfg['engines'] = {name: {'kind': 'codex', 'bin': '/unused/fake-codex'} for name in custom}
+        h = home(engine={'acc': custom[0], 'model': ASTRA} if custom else None, config=cfg)
+        d = fakes()
+        if custom:
+            specs = {name: {'kind': 'codex', 'bin': str(d / 'codex'), 'cred': None} for name in custom}
+        sup = (S.Supervisor(home=h, engines=specs, poster=Poster(), buildlog_poster=Poster(),
+                           clock=Clock(dt.datetime(2026, 10, 11, 19, tzinfo=dt.timezone.utc)))
+               if custom else make(h, d))
+        observed = []
+        def invoke(name, spec, message, model, preamble=''):
+            observed.append((name, model))
+            rc, error = replies[(name, model)]
+            return rc, '', error, {}
+        sup.invoke = invoke
+        original_identity = S.credential_identity
+        if skip == 'over budget':
+            sup.over_budget = lambda name: name == 'claude-l'
+        elif skip in ('unverified credential', 'identity mismatch'):
+            def identity(hh, name, spec, observed=None):
+                if name == 'claude-l':
+                    return {'automatic_allowed': False, 'mismatch': skip == 'identity mismatch'}
+                return original_identity(hh, name, spec, observed=observed)
+            S.credential_identity = identity
+        try:
+            event(h, 'failure reason contract')
+            check(sup.run_once() is True, 'reason turn did not run')
+        finally:
+            S.credential_identity = original_identity
+        check(observed == expected_calls, f'wrong attempts for reasons: {observed!r}')
+        lines = unavailable_lines(h)
+        wanted = 'manager unavailable: all allowed engines failed (' + expected[:1000] + ')'
+        check(len(lines) == 1 and lines[0]['text'] == wanted,
+              f'exact reason contract: expected {wanted!r}, got {lines!r}')
+        check(lines[0].get('channel') == 'C_DEV' and lines[0].get('thread_ts') is None,
+              'reason notice must be top level')
+        # Encoding must round-trip: limits count code points, never slices of UTF-8 bytes.
+        check(lines[0]['text'].encode('utf-8').decode('utf-8') == wanted, 'broken Unicode boundary')
+        no_downgrade(h)
+
+    error = '界🙂é' * 45 + 'UNTRUNCATED_SENTINEL'
+    outcomes = [(1, 'out of usage credits'), (1, 'usage limit reached'),
+                (1, 'HTTP 401 Unauthorized'), (1, '429 Too Many Requests'), (1, error)]
+    reasons = ['credits', 'usage_limit', 'auth', 'rate_limit', 'other: ' + error[:80]]
+    run(dict(zip(ladder, outcomes)), '; '.join(l + r for l, r in zip(labels, reasons)), ladder)
+    for why in ('unverified credential', 'over budget', 'identity mismatch'):
+        reasons = ['credits', 'skipped: ' + why, 'credits', 'credits', 'skipped: ' + why]
+        run({pair: (1, 'out of usage credits') for pair in ladder},
+            '; '.join(l + r for l, r in zip(labels, reasons)), [ladder[i] for i in (0, 2, 3)], skip=why)
+    reasons = ['prompt_too_long', 'skipped: skipped Claude family', 'auth',
+               'skipped: skipped Claude family', 'skipped: skipped Claude family']
+    run({ladder[0]: (1, 'Prompt is too long for this model'), ladder[2]: (1, 'HTTP 401 Unauthorized')},
+        '; '.join(l + r for l, r in zip(labels, reasons)), [ladder[0], ladder[2]])
+    for rc, reason in ((17, 'crash'), (124, 'timeout')):
+        # An uncertain attempt terminates traversal immediately; no later tier is falsely called failed.
+        run({ladder[0]: (rc, 'unstructured process failure')}, labels[0] + reason, [ladder[0]])
+    names = [f'codex{i:02d}' for i in range(12)]
+    long_reasons = '; '.join(f'tier 1 {name} ({ASTRA}): other: {error[:80]}' for name in names)
+    check(len(long_reasons) > 1000, 'Unicode total-bound fixture must exceed the limit')
+    run({(name, ASTRA): (1, error) for name in names}, long_reasons,
+        [(name, ASTRA) for name in names], custom=names)
+
+
+SCENARIOS = [unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,
