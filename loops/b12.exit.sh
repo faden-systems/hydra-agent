@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="${BASE_REF:?set BASE_REF to the full SHA of main at launch (contains the merged b12 spec)}"
+BASE="${BASE_REF:?set BASE_REF to the full SHA of the acceptance base (launch main or recorded rebase main tip)}"
 SPEC="${SPEC_REF:-$BASE}"
 fail() { echo "[b12] FAIL: $*"; exit 1; }
 [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] || fail 'BASE_REF must be a full immutable commit SHA'
 [[ "$SPEC" =~ ^[0-9a-f]{40}$ ]] || fail 'SPEC_REF must be a full immutable commit SHA'
 git rev-parse --verify "$BASE" >/dev/null || fail "missing base $BASE"
 git rev-parse --verify "$SPEC" >/dev/null || fail "missing spec commit $SPEC"
-git merge-base --is-ancestor "$BASE" HEAD || fail 'candidate does not descend from the launch base'
-git merge-base --is-ancestor "$SPEC" "$BASE" || fail 'the merged spec is not an ancestor of the launch base'
+git merge-base --is-ancestor "$BASE" HEAD || fail 'candidate does not descend from the acceptance base'
+git merge-base --is-ancestor "$SPEC" "$BASE" || fail 'the merged spec is not an ancestor of the acceptance base'
 git merge-base --is-ancestor 421b7bd9c2f4387bf306b1e573e22087b1f69f44 "$BASE" || fail 'base predates the merged b11 spec'
 FROZEN="loops/b12.md loops/b12.exit.sh loops/b12.acceptance.py"
 for f in $FROZEN; do git show "$SPEC:$f" | cmp -s - <(git show "$BASE:$f") || fail "exit-owned file differs between SPEC_REF and BASE_REF: $f"; done

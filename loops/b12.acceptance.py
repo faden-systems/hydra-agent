@@ -340,6 +340,11 @@ def commands_refuse_outside_the_allowlist():
     and change nothing; ladder pairs, the legacy form and a bare mode change are accepted."""
     h = home(engine={'acc': 'claude-r2d2', 'model': FABLE})
     before = Path(h, 'engine').read_bytes()
+    runtime_path = Path(h, 'engine-runtime.json')
+    runtime_path.write_text(json.dumps({'configured': {'acc': 'claude-r2d2', 'model': FABLE},
+        'effective': {'acc': 'codex', 'model': ASTRA}, 'episode_id': 'b12-preserve',
+        'active': True, 'since': '2026-10-11T18:00:00Z', 'reason': 'credits'}) + '\n')
+    runtime_before = runtime_path.read_bytes()
     for args in (('acc=claude-l', 'model=claude-sonnet-5'), ('model=opus5',), ('acc=codex', 'model=gpt6.1'),
                  ('acc=codex', 'model=gpt-5.6-sol'), ('acc=claude-l', 'model=claude-haiku-4-5-20251001')):
         rc, out, err = hydra(h, 'engine', *args)
@@ -348,10 +353,11 @@ def commands_refuse_outside_the_allowlist():
               f'the refusal is one line with the floor: {err!r}')
         check(len([l for l in err.strip().splitlines() if l.strip()]) == 1, f'exactly one line: {err!r}')
         check(Path(h, 'engine').read_bytes() == before, f'engine file changed by a refused command {args}')
+        check(runtime_path.read_bytes() == runtime_before, f'runtime file changed by a refused command {args}')
     rc, out, err = hydra(h, 'engine', 'model=sonnet5')
     check(rc == 2 and 'unknown model' in err and 'sonnet5 ->' not in err and 'fable5.1' in err, f'sonnet5 is no alias any more: {err!r}')
     check(Path(h, 'engine').read_bytes() == before, 'engine file changed by an unknown alias')
-    check(not S.read_engine_runtime(h).get('configured'), f'a refused command must not touch engine-runtime.json: {S.read_engine_runtime(h)}')
+    check(runtime_path.read_bytes() == runtime_before, 'runtime file changed by an unknown alias')
     rc, out, err = hydra(h, 'engine', 'acc=claude-l', 'model=fable5.1')
     check(rc == 0 and out.strip() == 'engine: claude-l (claude-fable-5-1)', f'a ladder pair is accepted: {rc} {out!r} {err!r}')
     rc, out, err = hydra(h, 'engine', 'acc=codex')
@@ -368,12 +374,16 @@ def commands_refuse_outside_the_allowlist():
     poster = Poster()
     br = make_bridge(h, poster)
     before = Path(h, 'engine').read_bytes()
+    runtime_path.write_bytes(runtime_before)
     slack(br, '<@U_MANAGER> engine acc=claude-l model=claude-sonnet-5', '20.0')
     reply = poster.posted[-1][2]
     check("not on the manager's allowlist" in reply and 'nothing changed' in reply and '\n' not in reply.strip(), f'Slack refusal: {reply!r}')
     check(Path(h, 'engine').read_bytes() == before, 'engine file changed by a refused Slack command')
+    check(runtime_path.read_bytes() == runtime_before, 'runtime file changed by a refused Slack command')
     slack(br, '<@U_MANAGER> engine acc=codex model=gpt6.1', '20.1')
     check("not on the manager's allowlist" in poster.posted[-1][2], f'a coder alias is refused in Slack: {poster.posted[-1][2]!r}')
+    check(Path(h, 'engine').read_bytes() == before and runtime_path.read_bytes() == runtime_before,
+          'both files must remain byte-identical after the refused coder alias in Slack')
     slack(br, '<@U_MANAGER> engine acc=claude-r2d2 model=fable5.1', '20.2')
     check(poster.posted[-1][2] == 'engine: claude-r2d2 (claude-fable-5-1)', f'an allowed Slack command: {poster.posted[-1][2]!r}')
     slack(br, '<@U_MANAGER> engine acc=claude-l model=claude-sonnet-5', '20.3', user='U_OPERATOR')
@@ -411,15 +421,25 @@ def status_line_contract():
     check(line2.startswith('engine policy: floor claude-opus-5-5; active tier 1/2 codex (gpt-6-astra); ladder gpt-6-astra [codex] > claude-opus-5-5 [claude-l]'), f'configured ladder: {line2!r}')
     for bad, needle in (({'ladder': [{'model': FABLE, 'accounts': ['nope']}]}, 'nope'),
                         ({'ladder': [{'model': ASTRA, 'accounts': ['claude-l']}]}, 'family'),
+                        ({'ladder': [{'model': 'claude-sonnet-5', 'accounts': ['claude-l']}]}, 'claude-sonnet-5'),
+                        ({'ladder': [{'model': 'gpt-6.1-sol', 'accounts': ['codex']}]}, 'gpt-6.1-sol'),
                         ({'ladder': []}, 'empty'),
                         ({'ladder': 'fable5.1'}, 'list')):
         h3 = home(config={'engine_policy': bad})
         line3 = policy_line(h3)
         check('engine_policy ignored' in line3 and 'floor claude-opus-5-5; active tier 1/3' in line3, f'invalid config {bad} -> default ladder with the reason: {line3!r}')
         check(needle in line3, f'the reason names the problem ({needle!r}): {line3!r}')
-    # a long configured ladder is cut at 400 characters
-    many = [{'model': FABLE, 'accounts': ['claude-r2d2', 'claude-l']}] * 12 + [{'model': OPUS, 'accounts': ['claude-r2d2']}]
-    h4 = home(config={'engine_policy': {'ladder': many}})
+    # Repeating a pair is invalid, not a valid way to reach the display limit.
+    repeated = [{'model': FABLE, 'accounts': ['claude-r2d2']}] * 2
+    duplicate = policy_line(home(config={'engine_policy': {'ladder': repeated}}))
+    check('engine_policy ignored' in duplicate and 'floor claude-opus-5-5' in duplicate,
+          f'a repeated account/model pair rejects the entire override: {duplicate!r}')
+    # Distinct known custom engines give a valid long ladder without repeating pairs.
+    names = [f'claude-control-account-{i:02d}' for i in range(12)]
+    many = [{'model': FABLE, 'accounts': names}, {'model': OPUS, 'accounts': ['claude-r2d2']}]
+    h4 = home(config={'engine_policy': {'ladder': many},
+                      'engines': {name: {'bin': '/unused/fake-claude'} for name in names}})
+    check('engine_policy ignored' not in policy_line(h4), 'the truncation fixture must be a valid ladder')
     check(len(policy_line(h4)) <= 400 and policy_line(h4).endswith('...'), f'bounded with an ellipsis: {len(policy_line(h4))} {policy_line(h4)[-20:]!r}')
 
 
@@ -437,8 +457,10 @@ def ladder_rotation_from_a_selected_lower_tier():
     sup2 = make(h2, d2)
     event(h2, 'A')
     check(sup2.run_once() is True, 'turn A did not run')
-    check(invoked(d2) == [('claude-l', OPUS), ('claude-r2d2', FABLE)],
-          f"from the floor's last account the rotation wraps to tier 1 (tier 3 has no step after claude-l): {invoked(d2)}")
+    expected = [('claude-l', OPUS), ('claude-r2d2', OPUS), ('claude-r2d2', FABLE)]
+    check(invoked(d2) == expected, f'finish every account in the selected tier before wrapping upward: {invoked(d2)}')
+    check([(a['engine'], a['model']) for a in attempts(h2)] == expected,
+          f'all three rotation attempts must be recorded: {attempts(h2)}')
     no_downgrade(h2)
 
 
