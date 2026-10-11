@@ -2359,10 +2359,18 @@ class Supervisor:
         runtime = read_engine_runtime(self.home)
         primary = pair
         configured = runtime.get("configured")
+        ladder = self.engine_ladder()
         if runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict) and configured.get("acc"):
-            primary = {"acc": configured.get("acc"), "model": configured.get("model")}
+            # During a fallback episode the rotation starts at the configured primary's tier (so a fallback to a
+            # lower tier recovers upward); within that tier the persisted engine file's step goes first, so an
+            # account that just failed is not retried before the one that served (an explicit re-selection
+            # rewrites both and therefore starts, and closes the episode, on the selected pair).
+            conf = {"acc": configured.get("acc"), "model": configured.get("model")}
+            tier = ladder_position(conf, ladder)
+            if tier is None or ladder_position(pair, ladder) != tier:
+                primary = conf
         started_pair = dict(pair)
-        order = self._ladder_rotation(primary, ladder_steps(self.engine_ladder(), self.engines))
+        order = self._ladder_rotation(primary, ladder_steps(ladder, self.engines))
         current = order[0][1] if order else pair["acc"]
         errors, reasons = [], []
         persist_switch = False  # a quota, auth or budget move is persisted; a plain or session-level failure is not

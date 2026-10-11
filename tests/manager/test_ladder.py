@@ -142,7 +142,8 @@ def test_fable_out_lands_on_astra_then_opus(home, tmp_path):
     fk.table(dict(ALL_OUT, **{f"claude-r2d2|{OPUS}": "ok"}))
     queue_event(home, "B")
     assert sup.run_once() is True
-    assert fk.invoked()[3:] == [("codex", ASTRA), ("claude-r2d2", OPUS)]
+    # during the episode the rotation starts at the configured primary (tier 1), then walks toward the floor
+    assert fk.invoked()[3:] == [("claude-r2d2", FABLE), ("claude-l", FABLE), ("codex", ASTRA), ("claude-r2d2", OPUS)]
     assert "active tier 3/3 claude-r2d2 (claude-opus-5-5)" in policy_line(home)
     no_downgrade(home)
 
