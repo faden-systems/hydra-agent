@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 BASE="${BASE_REF:?set BASE_REF to the full SHA of the acceptance base (launch main or recorded rebase main tip)}"
-SPEC="${SPEC_REF:-$BASE}"
+SPEC="${SPEC_REF:?set SPEC_REF to the recorded full spec-merge SHA}"
 fail() { echo "[b12] FAIL: $*"; exit 1; }
 [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] || fail 'BASE_REF must be a full immutable commit SHA'
 [[ "$SPEC" =~ ^[0-9a-f]{40}$ ]] || fail 'SPEC_REF must be a full immutable commit SHA'
@@ -25,8 +25,9 @@ fence() {
 }
 fence
 test -f docs/notes/b12.md || fail 'docs/notes/b12.md missing'
+unset PYTHONOPTIMIZE
 PYTHON="${PYTHON:-python3}"
-PYTHON=$("$PYTHON" -c 'import sys; print(sys.executable)') || fail 'cannot resolve the Python interpreter'
+PYTHON=$("$PYTHON" -c 'import sys; sys.exit("optimized Python disables exit gates") if sys.flags.optimize else print(sys.executable)') || fail 'cannot resolve the Python interpreter'
 [[ "$PYTHON" = /* ]] || fail "interpreter path is not absolute: $PYTHON"
 # Notes gate (requirement 8): real headings with bodies, evidence content, no Slack ids / tokens / hostnames.
 "$PYTHON" - <<'PY' || fail 'notes gate'

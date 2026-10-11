@@ -438,12 +438,18 @@ def commands_refuse_outside_the_allowlist():
         'effective': {'acc': 'codex', 'model': ASTRA}, 'episode_id': 'b12-preserve',
         'active': True, 'since': '2026-10-11T18:00:00Z', 'reason': 'credits'}) + '\n')
     runtime_before = runtime_path.read_bytes()
-    for args in (('acc=claude-l', 'model=claude-sonnet-5'), ('model=opus5',), ('acc=codex', 'model=gpt6.1'),
-                 ('acc=codex', 'model=gpt-5.6-sol'), ('acc=claude-l', 'model=claude-haiku-4-5-20251001')):
+    def refusal(model, current):
+        return (f"model {model} is not on the manager's allowlist (floor {OPUS}); allowed: "
+                f"{FABLE} on claude-r2d2, claude-l; {ASTRA} on codex; {OPUS} on claude-r2d2, claude-l"
+                f"; nothing changed (engine: {current})")
+    for args, model in ((('acc=claude-l', 'model=claude-sonnet-5'), 'claude-sonnet-5'),
+                        (('model=opus5',), 'claude-opus-5'), (('acc=codex', 'model=gpt6.1'), 'gpt-6.1-sol'),
+                        (('acc=codex', 'model=gpt-5.6-sol'), 'gpt-5.6-sol'),
+                        (('acc=claude-l', 'model=claude-haiku-4-5-20251001'), 'claude-haiku-4-5-20251001')):
         rc, out, err = hydra(h, 'engine', *args)
         check(rc == 2, f'hydra engine {args} must exit 2, got {rc} {out!r} {err!r}')
-        check("not on the manager's allowlist" in err and 'floor claude-opus-5-5' in err and 'nothing changed' in err,
-              f'the refusal is one line with the floor: {err!r}')
+        check(out == '' and err == refusal(model, f'claude-r2d2 ({FABLE})') + '\n',
+              f'the complete console refusal differs: {out!r} {err!r}')
         check(len([l for l in err.strip().splitlines() if l.strip()]) == 1, f'exactly one line: {err!r}')
         check(Path(h, 'engine').read_bytes() == before, f'engine file changed by a refused command {args}')
         check(runtime_path.read_bytes() == runtime_before, f'runtime file changed by a refused command {args}')
@@ -470,15 +476,23 @@ def commands_refuse_outside_the_allowlist():
     runtime_path.write_bytes(runtime_before)
     slack(br, '<@U_MANAGER> engine acc=claude-l model=claude-sonnet-5', '20.0')
     reply = poster.posted[-1][2]
-    check("not on the manager's allowlist" in reply and 'nothing changed' in reply and '\n' not in reply.strip(), f'Slack refusal: {reply!r}')
+    check(reply == refusal('claude-sonnet-5', f'claude-l ({FABLE}) [persistent]'), f'Slack refusal: {reply!r}')
     check(Path(h, 'engine').read_bytes() == before, 'engine file changed by a refused Slack command')
     check(runtime_path.read_bytes() == runtime_before, 'runtime file changed by a refused Slack command')
     slack(br, '<@U_MANAGER> engine acc=codex model=gpt6.1', '20.1')
-    check("not on the manager's allowlist" in poster.posted[-1][2], f'a coder alias is refused in Slack: {poster.posted[-1][2]!r}')
+    check(poster.posted[-1][2] == refusal('gpt-6.1-sol', f'claude-l ({FABLE}) [persistent]'),
+          f'a coder alias is refused in Slack: {poster.posted[-1][2]!r}')
     check(Path(h, 'engine').read_bytes() == before and runtime_path.read_bytes() == runtime_before,
           'both files must remain byte-identical after the refused coder alias in Slack')
+    slack(br, '<@U_MANAGER> engine model=sonnet5', '20.15')
+    reply = poster.posted[-1][2]
+    check('unknown model' in reply and 'sonnet5 ->' not in reply and 'fable5.1' in reply
+          and '\n' not in reply and reply.endswith(f'; nothing changed (engine: claude-l ({FABLE}) [persistent])'),
+          f'unknown sonnet5 alias in Slack: {reply!r}')
+    check(Path(h, 'engine').read_bytes() == before and runtime_path.read_bytes() == runtime_before,
+          'both files must remain byte-identical after an unknown Slack alias')
     slack(br, '<@U_MANAGER> engine acc=claude-r2d2 model=fable5.1', '20.2')
-    check(poster.posted[-1][2] == 'engine: claude-r2d2 (claude-fable-5-1)', f'an allowed Slack command: {poster.posted[-1][2]!r}')
+    check(poster.posted[-1][2] == 'engine: claude-r2d2 (claude-fable-5-1) [persistent]', f'an allowed Slack command: {poster.posted[-1][2]!r}')
     slack(br, '<@U_MANAGER> engine acc=claude-l model=claude-sonnet-5', '20.3', user='U_OPERATOR')
     check('not authorized' in poster.posted[-1][2] and engine_file(h)['acc'] == 'claude-r2d2', 'an operator is still refused first')
     no_downgrade(h)
@@ -944,7 +958,48 @@ def persistent_model_switch_replaces_child():
         sup._retire_persistent('planned', 'acceptance done')
 
 
-SCENARIOS = [alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+def explicit_primary_reselection_closes_episode():
+    """Requirement 4 and the exempted b8 regression: a stored mode never masks explicit recovery."""
+    for surface in ('console', 'slack'):
+        h = home(engine={'acc': 'claude-r2d2', 'model': FABLE, 'mode': 'per-turn'},
+                 config={'engine_fallback': {'claude_models': []}})
+        d = fakes({f'claude-r2d2|{FABLE}': 'credits'})
+        sup = make(h, d)
+        sup.run_engines('open fallback', [])
+        runtime = S.read_engine_runtime(h)
+        episode = runtime.get('episode_id')
+        check(episode and runtime.get('active') is True, 'fallback episode did not open')
+        check(runtime['configured'].get('mode') == 'per-turn', 'fixture lost stored mode')
+        check(invoked(d) == [('claude-r2d2', FABLE), ('claude-l', FABLE)], 'fallback fixture order')
+        if surface == 'console':
+            rc, out, err = hydra(h, 'engine', 'acc=claude-r2d2', 'model=fable5.1', 'mode=per-turn')
+            check(rc == 0, f'explicit console selection failed: {out!r} {err!r}')
+        else:
+            poster = Poster()
+            br = make_bridge(h, poster)
+            slack(br, '<@U_MANAGER> engine acc=claude-r2d2 model=fable5.1 mode=per-turn', '41.0')
+            check(poster.posted[-1][2] == f'engine: claude-r2d2 ({FABLE}) [per-turn]', 'explicit Slack selection failed')
+        check(engine_file(h) == {'acc': 'claude-r2d2', 'model': FABLE, 'mode': 'per-turn'}, 'selection not persisted')
+        set_table(d, {})
+        sup = make(h, d)  # A fresh supervisor observes the explicit selection.
+        sup.run_engines('recover primary', [])
+        check(invoked(d)[-1] == ('claude-r2d2', FABLE), 'explicit primary not invoked')
+        runtime = S.read_engine_runtime(h)
+        check(runtime.get('active') is False, f'episode stayed active: {runtime}')
+        expected = f'fallback ended (episode {episode}): back on tier 1/3 claude-r2d2 ({FABLE})'
+        ended = [it for it in S.read_outbox(h) if 'fallback ended' in it.get('text', '')]
+        check(len(ended) == 1 and ended[0]['text'] == expected, f'ended notice: {ended}')
+        receipt = Poster()
+        S.drain_outbox(h, receipt)
+        sup = make(h, d)
+        sup.run_engines('healthy after restart', [])
+        S.drain_outbox(h, receipt)
+        check([t for _, _, t in receipt.posted if 'fallback ended' in t] == [expected], 'restart repeated the ended notice')
+        check(S.read_engine_runtime(h).get('active') is False, 'restart reopened the episode')
+        no_downgrade(h)
+
+
+SCENARIOS = [explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,
