@@ -133,15 +133,20 @@ def test_dir_hashes_and_files_changed(tmp_path):
 # ----------------------------------------------------------------------------------------------- the engine file and models
 
 def test_parse_engine_command_aliases_legacy_and_full_ids():
-    assert S.parse_engine_command("acc=claude-l model=sonnet5") == {"acc": "claude-l", "model": "claude-sonnet-5"}
+    """The grammar is unchanged by b12 (the ladder is enforced by the commands, not by parsing)."""
+    assert S.parse_engine_command("acc=claude-l model=opus5.5") == {"acc": "claude-l", "model": "claude-opus-5-5"}
     assert S.parse_engine_command("acc=codex") == {"acc": "codex", "model": "gpt-6-astra"}
     assert S.parse_engine_command("acc=codex model=sol") == {"acc": "codex", "model": "gpt-5.6-sol"}
+    assert S.parse_engine_command("acc=codex model=gpt6.1") == {"acc": "codex", "model": "gpt-6.1-sol"}
+    assert S.parse_engine_command("acc=codex model=sol6.1") == {"acc": "codex", "model": "gpt-6.1-sol"}
     assert S.parse_engine_command("acc=codex model=astra") == S.parse_engine_command("acc=codex model=gpt6")
     assert S.parse_engine_command("claude-r2d2") == {"acc": "claude-r2d2", "model": "claude-fable-5-1"}
     assert S.parse_engine_command("acc=claude-l model=claude-opus-5") == {"acc": "claude-l", "model": "claude-opus-5"}
-    assert S.parse_engine_command("acc=claude-l model=claude-opus-5-5")["model"] == "claude-opus-5-5", "a full id of the family passes as-is"
-    assert S.parse_engine_command("model=haiku4.5", current={"acc": "claude-l", "model": "x"}) == {"acc": "claude-l", "model": "claude-haiku-4-5-20251001"}
+    assert S.parse_engine_command("acc=claude-l model=claude-sonnet-5")["model"] == "claude-sonnet-5", "a full id of the family passes as-is"
+    assert S.parse_engine_command("model=opus5", current={"acc": "claude-l", "model": "x"}) == {"acc": "claude-l", "model": "claude-opus-5"}
     assert S.parse_engine_command("ACC=Codex") == {"acc": "codex", "model": "gpt-6-astra"}
+    with pytest.raises(S.BadEngine, match="unknown model"):
+        S.parse_engine_command("acc=claude-l model=sonnet5")
 
 
 @pytest.mark.parametrize("bad,needle", [
@@ -149,6 +154,8 @@ def test_parse_engine_command_aliases_legacy_and_full_ids():
     ("acc=codex model=fable5.1", "claude family"),
     ("acc=nope", "unknown engine"),
     ("acc=claude-l model=zzz", "unknown model"),
+    ("acc=claude-l model=sonnet5", "unknown model"),
+    ("acc=claude-l model=haiku4.5", "unknown model"),
     ("model=sonnet5", "missing account"),
     ("acc=claude-l foo=bar", "unknown parameter"),
     ("claude-l codex", "unexpected word"),
@@ -159,7 +166,8 @@ def test_parse_engine_command_rejects_with_a_reason(bad, needle):
         S.parse_engine_command(bad)
     assert needle in str(e.value)
     if "model" in bad and "acc=c" in bad:
-        assert "sonnet5" in str(e.value) or "gpt6" in str(e.value), "the rejection lists the valid aliases"
+        assert "fable5.1" in str(e.value) or "gpt6" in str(e.value), "the rejection lists the valid aliases"
+        assert "sonnet5 ->" not in str(e.value) and "haiku4.5 ->" not in str(e.value)
 
 
 def test_read_engine_legacy_json_and_upgrade(home, ok_engine, poster):
@@ -184,9 +192,13 @@ def test_read_engine_legacy_json_and_upgrade(home, ok_engine, poster):
 def test_models_json_is_extendable_from_home(home):
     open(os.path.join(home, "models.json"), "w").write(json.dumps({"claude": {"aliases": {"next": "claude-next-1"}}}))
     models = S.load_models(home)
-    assert models["claude"]["aliases"]["next"] == "claude-next-1" and models["claude"]["aliases"]["sonnet5"] == "claude-sonnet-5"
+    assert models["claude"]["aliases"]["next"] == "claude-next-1" and models["claude"]["aliases"]["opus5.5"] == "claude-opus-5-5"
+    assert "sonnet5" not in models["claude"]["aliases"] and "haiku4.5" not in models["claude"]["aliases"]
     assert S.family_default_model("claude", models) == "claude-fable-5-1" and S.family_default_model("codex") == "gpt-6-astra"
     assert S.resolve_model("claude", "next", models) == "claude-next-1"
+    # a home alias is subject to the same allowlist (by full id): it never extends the manager ladder
+    with pytest.raises(S.BadEngine, match="not on the manager's allowlist"):
+        S.enforce_engine_policy({"acc": "claude-l", "model": "claude-next-1"}, S.manager_ladder({}, models))
 
 
 def test_carry_model_on_switch():
@@ -201,14 +213,14 @@ def test_carry_model_on_switch():
 def test_turn_exports_memory_dir_stamps_header_snapshots_and_ledgers(home, poster, tmp_path):
     d = str(tmp_path / "cl"); os.makedirs(d)
     cl = recording_engine(d, memory_line="the founder prefers small boxes", shared_line="2026-09-30 12:00Z claude: VM is hydra-manager")
-    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-sonnet-5"}))
+    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-opus-5-5"}))
     sup = S.Supervisor(home=home, engines=engines(cl), poster=poster)
     assert sup.memory_dir == os.path.join(home, "manager-memory"), "no repo: the memory folder lives in HYDRA_HOME"
     queue_event(home, "first")
     assert sup.run_once() is True
     c = calls(d)[-1]
     assert c["env"]["HYDRA_HOME"] == home and c["env"]["HYDRA_MEMORY_DIR"] == sup.memory_dir
-    assert c["argv"][c["argv"].index("--model") + 1] == "claude-sonnet-5", "the model id comes from the JSON engine file"
+    assert c["argv"][c["argv"].index("--model") + 1] == "claude-opus-5-5", "the model id comes from the JSON engine file"
     assert c["stdin"].startswith("[memory] last turn: none. your last turn on claude: none.\n")
     assert c["stdin"].count("[memory]") == 3 and "Manager turn. 1 event" in c["stdin"]
     mem = sup.memory_dir
@@ -219,11 +231,11 @@ def test_turn_exports_memory_dir_stamps_header_snapshots_and_ledgers(home, poste
     assert re.match(r"updated_at: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\nengine: claude-r2d2\n\ntracks: t1\n", hand)
     assert os.path.islink(os.path.join(home, "MANAGER-HANDOFF.md")) and open(os.path.join(home, "MANAGER-HANDOFF.md")).read() == hand
     rows = ledger(sup)
-    assert len(rows) == 1 and rows[0]["turn"] == 1 and rows[0]["engine"] == "claude-r2d2" and rows[0]["model"] == "claude-sonnet-5"
+    assert len(rows) == 1 and rows[0]["turn"] == 1 and rows[0]["engine"] == "claude-r2d2" and rows[0]["model"] == "claude-opus-5-5"
     assert rows[0]["files_written"] == ["MANAGER-HANDOFF.md", "MEMORY.md", "claude/MEMORY.md"], "files written from the hash diff"
     assert rows[0]["handoff_sha"] and re.match(r"\d{4}-\d\d-\d\dT", rows[0]["at"])
     turn = S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))[-1]
-    assert turn["model"] == "claude-sonnet-5" and turn["engine"] == "claude-r2d2"
+    assert turn["model"] == "claude-opus-5-5" and turn["engine"] == "claude-r2d2"
     # the manager's own reply is mirrored into the channel log
     mirror = S.read_jsonl(os.path.join(home, "mirror", "C_DEV.jsonl"))
     assert mirror[-1]["user"] == "manager" and mirror[-1]["turn"] == 1 and "REPLY: ok" in mirror[-1]["text"] and mirror[-1]["thread_ts"] == "1.0"
@@ -242,10 +254,10 @@ def test_switch_to_codex_and_back_lists_the_other_familys_files(home, poster, tm
     cx = recording_engine(dcx, name="codex", shared_line="codex shared", notes_line="codex note")
     sup = S.Supervisor(home=home, engines=engines(cl, cl, cx), poster=poster)
     queue_event(home, "one"); assert sup.run_once() is True
-    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "codex", "model": "gpt-5.6-sol"}))
+    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "codex", "model": "gpt-6-astra"}))
     queue_event(home, "two"); assert sup.run_once() is True
     c = calls(dcx)[-1]
-    assert c["argv"][c["argv"].index("-m") + 1] == "gpt-5.6-sol" and c["argv"][0] == "exec"
+    assert c["argv"][c["argv"].index("-m") + 1] == "gpt-6-astra" and c["argv"][0] == "exec"
     assert c["env"]["HYDRA_MEMORY_DIR"] == sup.memory_dir and "CLAUDE_CODE_OAUTH_TOKEN" not in c["env"]
     lines = [l for l in c["stdin"].splitlines() if l.startswith("[memory]")]
     assert len(lines) == 3 and lines[0].endswith("(turn 1). your last turn on codex: none.")
@@ -253,7 +265,7 @@ def test_switch_to_codex_and_back_lists_the_other_familys_files(home, poster, tm
     assert c["stdin"].index("[memory]") < c["stdin"].index("# MANAGER-HANDOFF.md") < c["stdin"].index("Manager turn.")
     assert "engine: claude-r2d2" in c["stdin"], "codex gets the stamped handoff on stdin"
     rows = ledger(sup)
-    assert rows[-1]["engine"] == "codex" and rows[-1]["model"] == "gpt-5.6-sol"
+    assert rows[-1]["engine"] == "codex" and rows[-1]["model"] == "gpt-6-astra"
     assert set(rows[-1]["files_written"]) == {"MANAGER-HANDOFF.md", "MEMORY.md", "codex/NOTES.md"}, "no claude snapshot on a codex turn"
     assert open(os.path.join(sup.memory_dir, "MANAGER-HANDOFF.md")).read().splitlines()[1] == "engine: codex"
     open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-l", "model": "claude-fable-5-1"}))
@@ -268,24 +280,28 @@ def test_switch_to_codex_and_back_lists_the_other_familys_files(home, poster, tm
 
 
 def test_auto_switch_carries_the_model_alias_or_uses_the_family_default(home, poster, tmp_path):
+    """b12: an automatic switch takes the next LADDER step's model; the alias is no longer carried."""
     dq = str(tmp_path / "q"); os.makedirs(dq); dcx = str(tmp_path / "cx"); os.makedirs(dcx)
     quota = fake_engine(dq, "quota"); cx = recording_engine(dcx, name="codex")
-    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-sonnet-5"}))
+    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-opus-5-5"}))
     sup = S.Supervisor(home=home, engines=engines(quota, quota, cx), poster=poster)
     queue_event(home, "hi"); assert sup.run_once() is True
-    assert "engine: codex (gpt-6-astra)" in poster.texts, "sonnet5 has no codex twin: the family default, said in the note"
+    assert [(a["engine"], a["model"]) for a in S.read_jsonl(os.path.join(home, "logs", "attempts.jsonl"))] == [
+        ("claude-r2d2", "claude-opus-5-5"), ("claude-l", "claude-opus-5-5"), ("claude-r2d2", "claude-fable-5-1"),
+        ("claude-l", "claude-fable-5-1"), ("codex", "gpt-6-astra")], "the floor tier, then wrap to the top"
+    assert "engine: codex (gpt-6-astra)" in poster.texts
     assert json.load(open(os.path.join(home, "engine"))) == {"acc": "codex", "model": "gpt-6-astra"}
     assert calls(dcx)[-1]["argv"][calls(dcx)[-1]["argv"].index("-m") + 1] == "gpt-6-astra"
     assert ledger(sup)[-1]["model"] == "gpt-6-astra" and S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))[-1]["model"] == "gpt-6-astra"
-    # within the family the alias is kept
+    # within a tier the other account runs the same tier model
     home2 = str(tmp_path / "home2"); from conftest import make_home; make_home(home2)
     dok = str(tmp_path / "ok"); os.makedirs(dok); ok = recording_engine(dok)
-    open(os.path.join(home2, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-opus-5"}))
+    open(os.path.join(home2, "engine"), "w").write(json.dumps({"acc": "claude-r2d2", "model": "claude-opus-5-5"}))
     p2 = poster.__class__(); sup2 = S.Supervisor(home=home2, engines=engines(quota, ok), poster=p2)
     queue_event(home2, "hi"); assert sup2.run_once() is True
-    assert "engine: claude-l (claude-opus-5)" in p2.texts
-    assert json.load(open(os.path.join(home2, "engine"))) == {"acc": "claude-l", "model": "claude-opus-5"}
-    assert calls(dok)[-1]["argv"][calls(dok)[-1]["argv"].index("--model") + 1] == "claude-opus-5"
+    assert "engine: claude-l (claude-opus-5-5)" in p2.texts
+    assert json.load(open(os.path.join(home2, "engine"))) == {"acc": "claude-l", "model": "claude-opus-5-5"}
+    assert calls(dok)[-1]["argv"][calls(dok)[-1]["argv"].index("--model") + 1] == "claude-opus-5-5"
 
 
 def test_existing_handoff_at_the_old_path_moves_into_the_memory_folder(home, ok_engine, poster):

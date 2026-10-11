@@ -68,19 +68,29 @@ def test_engine_pause_resume_logs_tail(home):
 
 
 def test_engine_acc_model_round_trip_and_rejection(home):
-    r = run(home, "engine", "acc=claude-l", "model=sonnet5")
-    assert r.returncode == 0 and r.stdout.strip() == "engine: claude-l (claude-sonnet-5)", r.stdout + r.stderr
-    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-sonnet-5"}
-    assert run(home, "engine").stdout.strip() == "engine: claude-l (claude-sonnet-5)"
+    """b12: the grammar and its reasons are unchanged; a pair outside the manager ladder is refused, exit 2."""
+    r = run(home, "engine", "acc=claude-l", "model=opus5.5")
+    assert r.returncode == 0 and r.stdout.strip() == "engine: claude-l (claude-opus-5-5)", r.stdout + r.stderr
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-opus-5-5"}
+    assert run(home, "engine").stdout.strip() == "engine: claude-l (claude-opus-5-5)"
+    before = open(os.path.join(home, "engine")).read()
     r = run(home, "engine", "acc=codex", "model=fable5.1")
     assert r.returncode == 2 and "claude family" in r.stderr and "gpt6" in r.stderr
-    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-sonnet-5"}, "rejected: nothing changes"
     r = run(home, "engine", "model=zzz")
     assert r.returncode == 2 and "unknown model" in r.stderr
-    assert run(home, "engine", "model=haiku4.5").returncode == 0
-    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-haiku-4-5-20251001"}
-    assert run(home, "engine", "acc=codex", "model=sol").stdout.strip() == "engine: codex (gpt-5.6-sol)"
-    assert "engine: codex (gpt-5.6-sol)" in run(home, "status").stdout
+    r = run(home, "engine", "model=sonnet5")
+    assert r.returncode == 2 and "unknown model" in r.stderr and "sonnet5 ->" not in r.stderr
+    for args in (("acc=claude-l", "model=claude-sonnet-5"), ("model=haiku4.5",), ("acc=codex", "model=sol"),
+                 ("acc=codex", "model=gpt6.1")):
+        r = run(home, "engine", *args)
+        assert r.returncode == 2 and "not on the manager's allowlist" in r.stderr and "floor claude-opus-5-5" in r.stderr \
+            or "unknown model" in r.stderr, (args, r.stderr)
+        assert r.stderr.strip().endswith("nothing changed (engine: claude-l (claude-opus-5-5))"), r.stderr
+        assert open(os.path.join(home, "engine")).read() == before, "rejected: nothing changes"
+    assert run(home, "engine", "acc=codex").stdout.strip() == "engine: codex (gpt-6-astra)"
+    status = run(home, "status").stdout
+    assert "engine: codex (gpt-6-astra)" in status
+    assert "engine policy: floor claude-opus-5-5; active tier 2/3 codex (gpt-6-astra);" in status
 
 
 def test_attach_uses_the_configured_model(home, tmp_path):
@@ -91,8 +101,12 @@ def test_attach_uses_the_configured_model(home, tmp_path):
     os.chmod(script, 0o755)
     open(os.path.join(home, "config.json"), "w").write(json.dumps({"engines": {"claude-r2d2": {"bin": script}, "claude-l": {"bin": script}}}))
     open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-l", "model": "claude-opus-5"}))
+    r = run(home, "attach")
+    assert r.returncode == 2 and "not on the manager's allowlist" in r.stderr, r.stdout + r.stderr
+    assert not (d / "calls.jsonl").exists(), "a refused attach starts no process"
+    open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-l", "model": "claude-opus-5-5"}))
     assert run(home, "attach").returncode == 0
-    assert json.loads(open(d / "calls.jsonl").read().strip())["argv"] == ["--resume", "sess-test", "--model", "claude-opus-5"]
+    assert json.loads(open(d / "calls.jsonl").read().strip())["argv"] == ["--resume", "sess-test", "--model", "claude-opus-5-5"]
 
 
 def test_attach_takes_and_releases_the_lock(home, tmp_path):

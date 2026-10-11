@@ -142,26 +142,35 @@ def test_engine_command(bridge, home, poster):
 
 
 def test_engine_command_acc_and_model(bridge, home, poster):
-    bridge.handle_message(msg("<@U_MANAGER> engine acc=claude-l model=sonnet5", ts="14.0"))
-    assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-sonnet-5"}
-    assert poster.posted[-1][2] == "engine: claude-l (claude-sonnet-5)"
-    bridge.handle_message(msg("<@U_MANAGER> engine model=opus5", ts="14.1"))
-    assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-opus-5"}, "model alone keeps the account"
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=claude-l model=opus5.5", ts="14.0"))
+    assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-opus-5-5"}
+    assert poster.posted[-1][2] == "engine: claude-l (claude-opus-5-5)"
+    bridge.handle_message(msg("<@U_MANAGER> engine model=fable5.1", ts="14.1"))
+    assert S.read_engine(home) == {"acc": "claude-l", "model": "claude-fable-5-1"}, "model alone keeps the account"
     # wrong family and unknown alias: rejected with the valid list, nothing changes
     before = open(os.path.join(home, "engine")).read()
     bridge.handle_message(msg("<@U_MANAGER> engine acc=claude-l model=sol", ts="14.2"))
-    assert "codex family" in poster.posted[-1][2] and "sonnet5" in poster.posted[-1][2] and "nothing changed" in poster.posted[-1][2]
+    assert "codex family" in poster.posted[-1][2] and "fable5.1" in poster.posted[-1][2] and "nothing changed" in poster.posted[-1][2]
     bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=zzz", ts="14.3"))
     assert "unknown model" in poster.posted[-1][2] and "gpt6" in poster.posted[-1][2]
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=claude-l model=sonnet5", ts="14.31"))
+    assert "unknown model" in poster.posted[-1][2] and "sonnet5 ->" not in poster.posted[-1][2]
+    # b12: below the floor or a coder-only model: refused with the allowlist, nothing changes
+    for i, target in enumerate(("acc=claude-l model=claude-sonnet-5", "model=opus5", "acc=codex model=gpt-5.6-sol",
+                                "acc=codex model=gpt6.1")):
+        bridge.handle_message(msg(f"<@U_MANAGER> engine {target}", ts=f"14.4{i}"))
+        reply = poster.posted[-1][2]
+        assert "not on the manager's allowlist (floor claude-opus-5-5)" in reply and "\n" not in reply, reply
+        assert reply.endswith("; nothing changed (engine: claude-l (claude-fable-5-1))"), reply
     assert open(os.path.join(home, "engine")).read() == before
     # the operator is refused for the new form too
-    bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=gpt6", user="U_OPERATOR", ts="14.4"))
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=gpt6", user="U_OPERATOR", ts="14.5"))
     assert "not authorized" in poster.posted[-1][2] and open(os.path.join(home, "engine")).read() == before
-    # a full id of the right family and codex aliases
-    bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=gpt-5.6-sol", ts="14.5"))
-    assert S.read_engine(home) == {"acc": "codex", "model": "gpt-5.6-sol"}
-    bridge.handle_message(msg("<@U_MANAGER> status", ts="14.6"))
-    assert "engine: codex (gpt-5.6-sol)" in poster.posted[-1][2]
+    # a full id on the ladder and codex aliases
+    bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=gpt-6-astra", ts="14.6"))
+    assert S.read_engine(home) == {"acc": "codex", "model": "gpt-6-astra"}
+    bridge.handle_message(msg("<@U_MANAGER> status", ts="14.7"))
+    assert "engine: codex (gpt-6-astra)" in poster.posted[-1][2]
 
 
 def test_digest_now_queues_a_timer_event(bridge, home, poster):
