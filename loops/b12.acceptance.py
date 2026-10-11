@@ -952,7 +952,10 @@ SCENARIOS = [alias_remapping_cannot_extend_allowlist, failure_success_persistenc
 
 
 def main(argv):
-    only = argv[argv.index('--only') + 1] if '--only' in argv else None
+    if argv and (len(argv) != 2 or argv[0] != '--only' or argv[1] not in {fn.__name__ for fn in SCENARIOS}):
+        print('[b12.acceptance] FAIL: use --only with a known scenario name, or no arguments')
+        return 2
+    only = argv[1] if argv else None
     for fn in SCENARIOS:
         if only and fn.__name__ != only:
             continue
