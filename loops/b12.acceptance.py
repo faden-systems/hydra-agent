@@ -282,7 +282,34 @@ def astra_out_lands_on_opus55():
 def all_out_posts_one_unavailable_line():
     """Requirement 3: every step fails -> one top-level line naming every step, the normal back-off, no downgrade,
     no second line inside the episode, the episode closed by the next served turn."""
+    # Replace only the supervisor's wall clock; subprocess and heartbeat scheduling keep real time.
+    original_time = S.time
+    wall = [1791745200.0]
+    class WallClock:
+        def time(self):
+            return wall[0]
+        def __getattr__(self, name):
+            return getattr(original_time, name)
+    S.time = WallClock()
+    try:
+        _all_out_with_clock(wall)
+    finally:
+        S.time = original_time
+
+
+def _all_out_with_clock(wall):
     h = home()
+    retry = Path(h, 'logs/retry-after')
+    def expire_retry():
+        deadline = float(retry.read_text())
+        check(deadline == wall[0] + S.RETRY_AFTER_S,
+              f'retry deadline must be failure time plus RETRY_AFTER_S: {deadline}, {wall[0]}')
+        wall[0] = deadline - 1
+        count = len(calls(d))
+        check(sup.run_once() is False and len(calls(d)) == count,
+              'the tick immediately before the deadline must not invoke an engine')
+        wall[0] = deadline + 1
+        check(retry.exists(), 'the expired deadline stays on disk until the supervisor handles it')
     table = {f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits', f'codex|{ASTRA}': 'usage_limit',
              f'claude-r2d2|{OPUS}': 'credits', f'claude-l|{OPUS}': 'credits'}
     d = fakes(table)
@@ -310,19 +337,19 @@ def all_out_posts_one_unavailable_line():
     check(ep.get('episode_id') and lines[0].get('id') == f"unavailable-{ep['episode_id']}", f'the notice id is bound to the episode: {ep} {lines[0].get("id")}')
     n = len(calls(d))
     check(sup.run_once() is False and len(calls(d)) == n, 'a tick inside the back-off makes no engine call')
-    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    expire_retry()
     check(sup.run_once() is True, 'the retry after the back-off must run')
     check(len(calls(d)) == 2 * n, f'the retry tries the whole ladder again: {len(calls(d))} calls')
     check(len(unavailable_lines(h)) == 1, 'a failing retry inside the episode posts no second line')
     no_downgrade(h)
     # a fresh supervisor (restart) inside the same episode queues nothing new either
-    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    expire_retry()
     sup2 = make(h, d, poster=poster)
     check(sup2.run_once() is True, 'the restarted retry must run')
     check(len(unavailable_lines(h)) == 1, 'a restart inside the episode must not duplicate the line')
     # recovery closes the episode; no "available again" line
     set_table(d, {})
-    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    expire_retry()
     check(sup2.run_once() is True, 'the recovering turn must run')
     check(eid in S.handled_ids(h), 'the pending event is served by the recovering turn')
     ep = json.loads(Path(h, 'logs', 'unavailable.json').read_text())
@@ -347,7 +374,7 @@ def unavailable_notice_survives_crash_windows():
     for window in ('before-queue', 'after-queue', 'after-receipt'):
         h, d, poster = home(), fakes(table), Poster()
         sup = make(h, d)
-        event(h, f'crash window {window}')
+        eid = event(h, f'crash window {window}')
         original = S._queue_notice_once
         reached = []
         def crash_queue(home_arg, channel, text, note_id):
@@ -377,6 +404,8 @@ def unavailable_notice_survives_crash_windows():
         retry = Path(h, 'logs/retry-after')
         if retry.exists():
             retry.unlink()
+        if window == 'before-queue':
+            set_table(d, {})  # Recovery must not erase the durable, not-yet-enqueued notice.
         restarted = make(h, d)
         check(restarted.run_once() is True, f'restart must retry pending event: {window}')
         S.drain_outbox(h, poster)
@@ -386,7 +415,13 @@ def unavailable_notice_survives_crash_windows():
         check(S.post_receipt(h, reached[0]) is not None, 'original episode ID must be receipted')
         if retry.exists():
             retry.unlink()
-        check(make(h, d).run_once() is True, 'second restarted retry must run')
+        if window == 'before-queue':
+            check(eid in S.handled_ids(h), 'the first restart must serve the pending event')
+            ep = json.loads(Path(h, 'logs/unavailable.json').read_text())
+            check(ep.get('episode_id') is None, 'immediate recovery must close the unavailable episode')
+            check(make(h, d).run_once() is False, 'the served event must not replay on another restart')
+        else:
+            check(make(h, d).run_once() is True, 'second restarted retry must run')
         S.drain_outbox(h, poster)
         check(len([text for _, _, text in poster.posted if 'all allowed engines failed' in text]) == 1,
               f'a receipted episode must not repost: {window}')
