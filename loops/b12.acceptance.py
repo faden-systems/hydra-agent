@@ -853,7 +853,98 @@ def unavailable_reason_contract():
         [(name, ASTRA) for name in names], custom=names)
 
 
-SCENARIOS = [unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+def alias_remapping_cannot_extend_allowlist():
+    """Home aliases resolve before policy checks on config, both commands and invocation."""
+    for alias, disallowed in [('fable5.1', 'claude-sonnet-5'), ('opus5.5', 'claude-opus-5')]:
+        cfg = {'engine_policy': {'ladder': [{'model': alias, 'accounts': ['claude-r2d2']}]}}
+        h, d = home(config=cfg), fakes()
+        Path(h, 'models.json').write_text(json.dumps({'claude': {'aliases': {alias: disallowed}}}))
+        models = S.load_models(h)
+        check(S.resolve_model('claude', alias, models) == disallowed, 'alias fixture did not remap')
+        ladder = S.manager_ladder(cfg, models, engines(d))
+        check([t['model'] for t in ladder] == [FABLE, ASTRA, OPUS],
+              f'remapped disallowed model must invalidate the whole override: {ladder}')
+        check('ignored' in policy_line(h) and disallowed in policy_line(h), 'diagnostic must name resolved model')
+        runtime = Path(h, 'engine-runtime.json')
+        runtime.write_text(json.dumps({'configured': {'acc': 'claude-r2d2', 'model': FABLE}}))
+        before = Path(h, 'engine').read_bytes(), runtime.read_bytes()
+        rc, out, err = hydra(h, 'engine', 'acc=claude-r2d2', f'model={alias}')
+        check(rc == 2 and "not on the manager's allowlist" in err and 'nothing changed' in err,
+              f'remapped alias console refusal: {rc} {out!r} {err!r}')
+        check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before, 'console refusal changed state')
+        poster = Poster()
+        slack(make_bridge(h, poster), f'<@U_MANAGER> engine acc=claude-r2d2 model={alias}', str(time.time_ns()))
+        check(poster.posted and "not on the manager's allowlist" in poster.posted[-1][2]
+              and 'nothing changed' in poster.posted[-1][2], f'remapped alias Slack refusal: {poster.posted}')
+        check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before, 'Slack refusal changed state')
+        eid = event(h, 'remapped alias turn')
+        check(make(h, d).run_once() is True and eid in S.handled_ids(h), 'default ladder must serve the event')
+        check(invoked(d) == [('claude-r2d2', FABLE)], f'alias must not alter immutable default invocation: {invoked(d)}')
+        no_downgrade(h)
+
+
+def failure_success_persistence_matrix():
+    """Auth persists a successful fallback; transient errors leave both state files unchanged."""
+    for reason in ('auth', 'rate_limit', 'other'):
+        h, d = home(), fakes({f'claude-r2d2|{FABLE}': reason})
+        primary = {'acc': 'claude-r2d2', 'model': FABLE}
+        winner = {'acc': 'claude-l', 'model': FABLE}
+        runtime = Path(h, 'engine-runtime.json')
+        runtime.write_text(json.dumps({'configured': primary}))
+        before = Path(h, 'engine').read_bytes(), runtime.read_bytes()
+        eid = event(h, f'failure-success {reason}')
+        check(make(h, d).run_once() is True and eid in S.handled_ids(h), f'{reason}: event not served')
+        check(invoked(d) == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'{reason}: wrong attempts {invoked(d)}')
+        att = attempts(h)
+        check(len(att) == 2 and att[0]['classification'] == reason and att[1]['success'] is True,
+              f'{reason}: wrong attempt classification {att}')
+        notices = [it['text'] for it in S.read_outbox(h) if 'fallback started' in it.get('text', '')]
+        state = json.loads(runtime.read_text())
+        if reason == 'auth':
+            check(engine_file(h) == winner, 'auth fallback must persist winner in engine file')
+            check(state.get('configured') == primary and state.get('effective') == winner
+                  and state.get('active') is True and state.get('episode_id') and state.get('reason') == att[0]['reason'],
+                  f'auth fallback runtime state: {state}')
+            check(len(notices) == 1 and f'claude-l ({FABLE})' in notices[0], f'auth fallback notice: {notices}')
+        else:
+            check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before,
+                  f'{reason}: transient fallback persisted state')
+            check(not notices and not state.get('active') and not state.get('episode_id'),
+                  f'{reason}: transient fallback started an episode')
+        no_downgrade(h)
+
+
+def persistent_model_switch_replaces_child():
+    """Successful Opus and Fable turns must reach distinct children with matching model argv."""
+    h, d = home(engine={'acc': 'claude-r2d2', 'model': OPUS, 'mode': 'persistent'}), fakes()
+    sup = make(h, d)
+    try:
+        first_id = event(h, 'B12_OPUS_DELIVERY')
+        check(sup.run_once() is True and first_id in S.handled_ids(h), 'Opus persistent turn not served')
+        first = calls(d)
+        check(len(first) == 2 and first[0].get('persistent') and first[0]['stdin'] == '<persistent start>'
+              and first[1]['pid'] == first[0]['pid'] and 'B12_OPUS_DELIVERY' in first[1]['stdin'],
+              f'Opus must receive the first message on its live child: {first}')
+        rc, out, err = hydra(h, 'engine', 'acc=claude-r2d2', 'model=fable5.1')
+        check(rc == 0 and engine_file(h).get('mode') == 'persistent', f'explicit switch: {rc} {out} {err}')
+        second_id = event(h, 'B12_FABLE_DELIVERY')
+        check(sup.run_once() is True and second_id in S.handled_ids(h), 'Fable persistent turn not served')
+        recorded = calls(d)
+        check(len(recorded) == 4, f'exactly two child starts and two delivered messages: {recorded}')
+        for start, delivered, model, marker in ((recorded[0], recorded[1], OPUS, 'B12_OPUS_DELIVERY'),
+                                                 (recorded[2], recorded[3], FABLE, 'B12_FABLE_DELIVERY')):
+            check(start.get('persistent') and start['stdin'] == '<persistent start>'
+                  and delivered.get('persistent') and delivered['pid'] == start['pid']
+                  and marker in delivered['stdin'], f'wrong child delivery for {model}')
+            check(start['model'] == delivered['model'] == model
+                  and start['argv'][start['argv'].index('--model') + 1] == model, f'wrong child argv for {model}')
+        check(recorded[0]['pid'] != recorded[2]['pid'], 'model switch reused the Opus child')
+        no_downgrade(h)
+    finally:
+        sup._retire_persistent('planned', 'acceptance done')
+
+
+SCENARIOS = [alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,
