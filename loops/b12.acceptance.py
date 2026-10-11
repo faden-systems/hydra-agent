@@ -999,7 +999,63 @@ def explicit_primary_reselection_closes_episode():
         no_downgrade(h)
 
 
-SCENARIOS = [explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+def filtered_engine_accounts():
+    """Requirement 1: missing/unexecutable accounts never become invocation steps."""
+    for variant in ('absent', 'no-bin', 'none'):
+        h = home(config={'engine_fallback': {'claude_models': []}})
+        d = fakes()
+        emap = engines(d)
+        if variant == 'absent':
+            del emap['claude-r2d2']
+            expected = [(1, 'claude-l', FABLE), (2, 'codex', ASTRA), (3, 'claude-l', OPUS)]
+        elif variant == 'no-bin':
+            del emap['claude-r2d2']['bin']
+            expected = [(1, 'claude-l', FABLE), (2, 'codex', ASTRA), (3, 'claude-l', OPUS)]
+        else:
+            emap = {'claude-l': {'cred': 'claude-l.env'}}
+            expected = []
+        steps = S.ladder_steps(S.MANAGER_LADDER, emap)
+        check(steps == expected, f'{variant}: filtered steps {steps}')
+        sup = S.Supervisor(home=h, engines=emap, poster=Poster(), buildlog_poster=Poster())
+        if expected:
+            sup.run_engines('filtered accounts', [])
+            check(invoked(d) == [('claude-l', FABLE)], f'{variant}: traversal {invoked(d)}')
+        else:
+            try:
+                sup.run_engines('no executable accounts', [])
+            except S.AllEnginesFailed:
+                pass
+            else:
+                raise Fail('no executable accounts must raise AllEnginesFailed')
+            check(calls(d) == [] and attempts(h) == [], 'empty ladder invoked or recorded an engine')
+        no_downgrade(h)
+
+
+def mode_only_commands_enforce_policy():
+    """Requirement 2: changing only mode cannot bypass stale/custom pair enforcement."""
+    for model, cfg in [('claude-sonnet-5', {}),
+                       (FABLE, {'engine_policy': {'ladder': [{'model': ASTRA, 'accounts': ['codex']}]}})]:
+        h = home(engine={'acc': 'claude-r2d2', 'model': model}, config=cfg)
+        runtime = Path(h, 'engine-runtime.json')
+        runtime.write_text(json.dumps({'configured': {'acc': 'claude-r2d2', 'model': model},
+                                      'active': True, 'episode_id': 'preserve-mode-refusal'}) + '\n')
+        before = Path(h, 'engine').read_bytes(), runtime.read_bytes()
+        poster = Poster()
+        br = make_bridge(h, poster)
+        for mode in ('persistent', 'per-turn'):
+            rc, out, err = hydra(h, 'engine', f'mode={mode}')
+            check(rc == 2 and "not on the manager's allowlist" in err and 'nothing changed' in err,
+                  f'mode-only console bypass: {rc} {out!r} {err!r}')
+            check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before, 'mode-only console changed files')
+            slack(br, f'<@U_MANAGER> engine mode={mode}', str(time.time_ns()))
+            reply = poster.posted[-1][2]
+            check("not on the manager's allowlist" in reply and 'nothing changed' in reply and '\n' not in reply,
+                  f'mode-only Slack bypass: {reply!r}')
+            check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before, 'mode-only Slack changed files')
+        no_downgrade(h)
+
+
+SCENARIOS = [filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,
