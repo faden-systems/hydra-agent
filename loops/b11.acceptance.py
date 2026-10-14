@@ -701,11 +701,14 @@ def codex_selected_ignores_stale_claude_measurement():
     Path(h, 'engine').write_text('codex\n')
     due, _ = sup.compaction_due()
     check(not due, 'nothing is due while Codex is selected')
+    line = status_line(h)
+    check('; compaction: due' not in line and 'context: 940000 tokens' in line, f'status applies the same guard: no due suffix while Codex is selected: {line}')
     event(h, 'B'); sup.run_once()
     check(kinds(d) == ['turn', 'codex'], f'the Codex turn must run without a compaction: {kinds(d)}')
     Path(h, 'engine').write_text('claude-r2d2\n')
     due, reason = sup.compaction_due()
     check(due and reason == 'tokens', 'back on Claude the overage is due again')
+    check(status_line(h).endswith('; compaction: due (tokens)'), f'back on Claude status shows due again: {status_line(h)}')
 
 
 def big_state(n_tracks=24, entry_kb=5):
@@ -774,6 +777,29 @@ def state_digest_bounds_the_message():
     stdin = calls(d)[-1]['stdin']
     check('MARKER-t03-DEEP' in stdin, 'the plain assignee line must select its track')
     check('MARKER-t04-DEEP' not in stdin, 'an assignee line with extra words must not select')
+    # rule (a) in full: a ts nested anywhere in the entry, the event id when there is no payload.thread_ts, and a
+    # `.`-stripped ts; the sections appear in event (selection) order
+    for t in state['tracks']:
+        if t['id'] == 't07':
+            t['meta'] = {'refs': [{'slack': '9191919191.000001'}]}
+        if t['id'] == 't08':
+            t['links'] = ['x', {'origin': '9292929292.000002'}]
+        if t['id'] == 't09':
+            t['notes'] = {'ts_compact': '9393939393000003'}
+    Path(h, 'state.json').write_text(json.dumps(state, indent=1))
+    event(h, 'nested', thread='9191919191.000001')
+    S.append_event(h, {'id': '9292929292.000002', 'source': 'slack', 'at': time.time(),
+                       'payload': {'channel': 'C_DEV', 'user': 'U_FOUNDER', 'text': 'by id', 'instructs': True}})
+    event(h, 'stripped', thread='9393939393.000003')
+    sup.run_once()
+    stdin = calls(d)[-1]['stdin']
+    for tid in ('t07', 't08', 't09'):
+        check(f'MARKER-{tid}-DEEP' in stdin, f'rule (a) must select {tid} (nested value / event id / dot-stripped ts)')
+    pos = [stdin.index(f'### {tid}') for tid in ('t07', 't08', 't09')]
+    check(pos == sorted(pos), f'the full entries must appear in event order t07, t08, t09: {pos}')
+    for t in state['tracks']:
+        if t['id'] not in ('t07', 't08', 't09', 't21'):
+            check(f"MARKER-{t['id']}-DEEP" not in stdin, f"untouched track {t['id']} must not be in full")
     # the cap: four touched tracks of ~16 KB each cannot fit (one does); selection order is EVENT order (t17, t05,
     # t11, then the work-status track t21), not file order, so t17 survives and t05 (first in file order) is dropped
     state2 = big_state(entry_kb=16)
@@ -914,7 +940,7 @@ argv = sys.argv[1:]
 
 def norm(p):
     base, _, q = p.partition('?')
-    params = sorted(kv for kv in q.split('&') if kv and not kv.startswith('since='))
+    params = sorted(kv for kv in q.split('&') if kv and not kv.startswith(('since=', 'per_page=')))
     return base + ('?' + '&'.join(params) if params else '')
 
 
@@ -966,7 +992,7 @@ class FakeGitHub:
     @staticmethod
     def norm(p):
         base, _, q = p.partition('?')
-        params = sorted(kv for kv in q.split('&') if kv and not kv.startswith('since='))
+        params = sorted(kv for kv in q.split('&') if kv and not kv.startswith(('since=', 'per_page=')))
         return base + ('?' + '&'.join(params) if params else '')
 
     def set(self, path, data):
@@ -1330,6 +1356,8 @@ def timer_source_isolation():
                 cdir.chmod(0o755)
             tick(None, 'coder readable again, unchanged: no wake')
             check(not (snapshot(h).get('failures') or {}).get('coder'), 'the coder streak resets on success')
+            child.kill(); child.wait()
+            tick(('coder b97-logs', 'dead'), 'the launcher died after the recovery')
         finally:
             with contextlib.suppress(Exception):
                 child.kill(); child.wait()
