@@ -514,3 +514,10 @@ creates `/srv/hydra/manager/venv` with `slack_bolt` and `slack_sdk`, installs bo
 without replacing other settings. Then (a human, over SSH, never through Slack):
 `credentials/slack.env`, `allowlist.json`, add the `#dev` channel id to the existing
 `config.json`, verify the configured clone/memory, and `systemctl restart hydra-manager hydra-bridge`.
+
+The main-head timer reason is suppressed only for a fully verified supervisor persistence range in
+`faden-systems/faden`. Verification checks the complete linear ancestry and each commit’s identity,
+message and managed paths, including rename origins. Mixed ranges, unknown identities, merges,
+missing or truncated responses and API failures retain the normal head wake immediately. PR and
+issue changes remain observable. Bounds are 100 commits and fewer than 100 files per commit;
+metadata identity follows the trusted repository convention and is not cryptographic attestation.
