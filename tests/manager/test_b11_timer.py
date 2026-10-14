@@ -153,9 +153,11 @@ def test_s_daily_digest_once_per_local_date_and_no_catch_up():
         rec, _ = tick(); assert not rec["woke"]
         clock.advance(120)
         rec, ev = tick(); assert reasons(rec) == ["daily digest"] and ev["payload"]["digest"] is True
+        assert ev["payload"]["channel"] == sup.dev_channel
         rec, _ = tick(); assert not rec["woke"]
         clock.advance(24 * 3600)
         rec, ev = tick(); assert reasons(rec) == ["daily digest"] and ev["payload"]["digest"] is True
+        assert ev["payload"]["channel"] == sup.dev_channel
     finally:
         dog.close()
     h, d, gh, dog, coder, clock, sup, tick = timer_setup(start=dt.datetime(2026, 10, 8, 20, 0, 0, tzinfo=dt.timezone.utc))  # 13:00 PDT

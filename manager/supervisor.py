@@ -4632,7 +4632,7 @@ class Supervisor:
         payload = {"text": text or ("timer: " + TIMER_BARE_REASON), "instructs": False}
         if digest:
             payload["digest"] = True
-            payload["channel"] = load_config(self.home).get("dev_channel")
+            payload["channel"] = load_config(self.home).get("dev_channel") or self.dev_channel
         return append_event(self.home, new_event("timer", payload, event_id=eid))
 
     def timer_snapshot_path(self):
