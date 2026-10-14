@@ -544,9 +544,17 @@ def cli_compactions_detected():
     event(h, 'G'); sup.run_once()
     cli = cstate(h).get('cli_compactions') or []
     check(len(cli) == 50 and cli[-1].get('at') == '2026-10-09T00:00:50.000Z', f'the newest 50 must be kept: {len(cli)} {cli[-1:]}')
-    # an unreadable transcript never fails a turn
+    # an unreadable transcript never fails a turn and is logged exactly once per unreadable episode
     newpath.unlink(); newpath.mkdir()
-    event(h, 'H'); check(sup.run_once() is True, 'an unreadable transcript must not fail the turn')
+    logged, orig_log = [], S.log
+    S.log = lambda m: logged.append(str(m))
+    try:
+        for name in ('H', 'H2', 'H3'):
+            event(h, name); check(sup.run_once() is True, 'an unreadable transcript must not fail the turn')
+    finally:
+        S.log = orig_log
+    diag = [m for m in logged if 'transcript' in m.lower()]
+    check(len(diag) == 1, f'exactly one diagnostic for one unreadable-transcript episode across three turns, got {diag}')
     check(turns(h)[-1].get('events') == [turns(h)[-1]['events'][0]] if turns(h)[-1].get('events') else True, 'turn recorded')
     # a missing transcript never fails a turn
     h2, d2 = home(), fakes(context=100000)
@@ -1066,7 +1074,7 @@ class Ticker:
     def __init__(self, sup, h, clock, every_s=60):
         self.sup, self.h, self.clock, self.every_s, self.n = sup, h, clock, every_s, 0
 
-    def __call__(self, expect, label, forbid=()):
+    def __call__(self, expect, label, forbid=(), exact=()):
         self.clock.advance(self.every_s)
         before = len(S.pending_events(self.h)); checks_before = len(checks_log(self.h))
         rec = self.sup.timer_tick()
@@ -1090,6 +1098,9 @@ class Ticker:
         for f in forbid:
             check(f not in text, f'{label}: reason {f!r} must not appear in the event text {text!r}')
         check(rec['reasons'] and all(r in text for r in rec['reasons']), f'{label}: the record reasons must be the event text reasons: {rec} vs {text!r}')
+        check(text == 'timer: ' + '; '.join(rec['reasons']), f'{label}: the event text is exactly "timer: " + the reasons joined by "; ": {text!r} vs {rec["reasons"]}')
+        for clause in exact:
+            check(clause in rec['reasons'], f'{label}: the exact reason clause {clause!r} must be one of {rec["reasons"]}')
         return ev
 
 
@@ -1118,30 +1129,39 @@ def timer_gating_sources():
         check(not any(c['kind'] != 'turn' for c in calls(d)) and calls(d) == [], f'the change check must not call an engine: {calls(d)}')
         # GitHub: main HEAD, the open set, the per-PR fields, issues updated since the last check
         gh.repo(FADEN_REPO, head=sha('f2'), prs=[pr(261, sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))])
-        tick(('faden main', sha('f1')[:7], sha('f2')[:7]), 'main head change', forbid=('hydra-agent', 'PR #261'))
+        tick('faden main', 'main head change', forbid=('hydra-agent', 'PR #261'), exact=[f"faden main {sha('f1')[:7]} -> {sha('f2')[:7]}"])
         tick(None, 'unchanged after head')
         gh.repo(HYDRA_REPO, head=sha('h1'), prs=[pr(70, sha('q1'))])
-        tick('hydra-agent PR #70', 'new open PR', forbid=('faden',))
+        tick('hydra-agent PR #70', 'new open PR', forbid=('faden',), exact=['hydra-agent PR #70 opened'])
         tick(None, 'unchanged after new PR')
         cur = dict(head=sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))
-        for field, kw in (('head', dict(head=sha('p2'))), ('updated_at', dict(updated='2026-10-08T01:00:00Z')),
-                          ('labels', dict(labels=('loop', 'approved'))), ('comments', dict(comments=3)),
-                          ('comments', dict(review_comments=2)), ('reviews', dict(reviews=('APPROVED', 'CHANGES_REQUESTED'))),
-                          ('checks', dict(checks=('success', 'failure')))):
+        transitions = (
+            ('head', dict(head=sha('p2')), f"faden PR #261 head {sha('p1')[:7]} -> {sha('p2')[:7]}"),
+            ('updated_at', dict(updated='2026-10-08T01:00:00Z'), 'faden PR #261 updated_at 2026-10-08T00:00:00Z -> 2026-10-08T01:00:00Z'),
+            ('labels', dict(labels=('loop', 'approved')), 'faden PR #261 labels loop -> approved,loop'),
+            ('comments', dict(comments=3), 'faden PR #261 comments 0 -> 3'),
+            ('comments', dict(review_comments=2), 'faden PR #261 comments 3 -> 5'),
+            ('reviews', dict(reviews=('APPROVED', 'CHANGES_REQUESTED')), 'faden PR #261 reviews 1 APPROVED -> 2 CHANGES_REQUESTED'),
+            ('checks', dict(checks=('success', 'failure')), 'faden PR #261 checks success -> failure,success'),
+            ('checks', dict(checks=('success', None)), 'faden PR #261 checks failure,success -> pending,success'))
+        for field, kw, clause in transitions:
             cur.update(kw)
             p = pr(261, **cur)
             gh.repo(FADEN_REPO, head=sha('f2'), prs=[p])
-            tick(('faden PR #261', field), f'PR {field} change')
+            tick(('faden PR #261', field), f'PR {field} change', exact=[clause])
             tick(None, f'unchanged after PR {field}')
         gh.repo(FADEN_REPO, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:30:00Z', 'title': 'x'},
                                                       {'number': 59, 'updated_at': '2026-10-08T12:30:00Z', 'pull_request': {'url': 'u'}}])
-        tick('faden issue #58', 'issue updated since the last check', forbid=('#59',))
+        tick('faden issue #58', 'issue updated since the last check', forbid=('#59',), exact=['faden issue #58 updated'])
         tick(None, 'the same issue list again does not wake (cumulative map)')
         gh.repo(FADEN_REPO, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:45:00Z', 'title': 'x'}])
         tick('faden issue #58', 'issue updated again')
         gh.repo(FADEN_REPO, head=sha('f2'), prs=[], issues=[])
-        tick('faden PR #261', 'PR closed (left the open set)')
+        tick('faden PR #261', 'PR closed (left the open set)', exact=['faden PR #261 closed'])
         check(all(a[1].startswith(('repos/', 'user')) for a in gh.calls()), f'gh is called with REST paths only: {gh.calls()[:3]}')
+        # the bounded observation contract: every list call is one page of 100, never --paginate
+        lists = [a[1] for a in gh.calls() if any(k in a[1] for k in ('/pulls?', '/issues?', '/reviews', '/check-runs'))]
+        check(lists and all('per_page=100' in path for path in lists), f'every list call carries per_page=100: {[p for p in lists if "per_page=100" not in p][:3]}')
         # coder runs
         child = subprocess.Popen(['sleep', '300'])
         try:
@@ -1287,6 +1307,7 @@ def timer_source_isolation():
     """Requirement 10: every source is independently guarded: an unreadable coder directory, an invalid
     work-status.json, an invalid engine-runtime.json and a missing systemctl each keep their snapshot entry, never
     stop the other sources, wake once on the third consecutive failure and reset on recovery."""
+    check(os.geteuid() != 0, 'the acceptance must run unprivileged: the unreadable-directory case relies on chmod 0 being enforced')
     h, d, gh, dog, coder, clock, sup, tick = timer_setup()
     cfg_path = Path(h, 'config.json')
     try:
@@ -1393,6 +1414,13 @@ def timer_max_silence():
             tick(None, 'right after the forced wake nothing is due')
             clock.advance(900)
             tick(None, 'the silence clock restarted at the forced wake')
+            # an ordinary turn restarts the silence clock too: the check that observes a new turn record is the reference
+            event(h, 'a founder message', thread='4.4'); check(sup.run_once() is True, 'the ordinary turn must run')
+            tick(None, 'the check after an ordinary turn: nothing to wake for')
+            clock.advance(1200)
+            tick(None, 'twenty minutes after the turn was observed, thirty-five since the forced wake: under the limit')
+            clock.advance(700)
+            tick(('timer: max silence', 'in flight', 'b98-logs'), 'max silence counted from the observed turn')
             child.kill(); child.wait()
             tick(('coder b98-logs', 'dead'), 'the run ended')
             clock.advance(1800 + 120)
@@ -1416,7 +1444,7 @@ def timer_max_silence():
         line = next((l for l in S.status_text(h).splitlines() if l.startswith('timer: ')), '')
         check('last wake' in line and 'max silence' in line, f'status shows the last wake reason: {line!r}')
         rows = checks_log(h)
-        check(len(rows) == tick.n and sum(1 for r in rows if r['woke']) == 8, f'eight wakes in {len(rows)} checks expected: {[r["reasons"] for r in rows if r["woke"]]}')
+        check(len(rows) == tick.n and sum(1 for r in rows if r['woke']) == 9, f'nine wakes in {len(rows)} checks expected: {[r["reasons"] for r in rows if r["woke"]]}')
     finally:
         dog.close()
 
@@ -1504,15 +1532,22 @@ def timer_interval_config():
     check(S.TIMER_DEFAULTS['every_s'] == 900, 'TIMER_DEFAULTS.every_s must be 900')
     sup = make(h, fakes())
     check(sup.add_timer_event(now=1000.0)['id'] == 'timer-1', 'the default slot is 900 s (baseline contract)')
+    check(sup.add_timer_event(now=1500.0) is None, 'the same 900 s slot is not queued twice (baseline contract)')
     Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 120, 'max_silence_s': 10}}))
     cfg = S.timer_config(h)
     check(cfg['every_s'] == 120 and cfg['max_silence_s'] == 120, f'every_s 120 and max_silence_s clamped up to it: {cfg}')
     ev = sup.add_timer_event(now=1000000.0)
-    check(ev and ev['id'] == f'timer-{int(1000000.0 // 120)}', f'the slot id must use the configured every_s without a restart: {ev}')
+    check(ev and ev['id'] == f'timer-120-{int(1000000.0 // 120)}', f'a non-default interval carries its identity in the id: {ev}')
     Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 5}}))
     check(S.timer_config(h)['every_s'] == 30, 'every_s below 30 is clamped to 30')
     ev = sup.add_timer_event(now=1000120.0)
-    check(ev and ev['id'] == f'timer-{int(1000120.0 // 30)}', f'a changed interval is re-read: {ev}')
+    check(ev and ev['id'] == f'timer-30-{int(1000120.0 // 30)}', f'a changed interval is re-read: {ev}')
+    # the collision regression: slot 1 was handled under 900 s; under 30 s the same slot number is a different event
+    Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 30}}))
+    ev = sup.add_timer_event(now=30.0)
+    check(ev and ev['id'] == 'timer-30-1', f'the same slot number under another interval is a distinct event: {ev}')
+    Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 900}}))
+    check(sup.add_timer_event(now=1000.0) is None, 'back on 900 s the already-queued timer-1 is still not queued twice')
     Path(h, 'config.json').write_text('{not json')
     check(S.timer_config(h)['every_s'] == 900, 'an unreadable config falls back to the defaults')
 

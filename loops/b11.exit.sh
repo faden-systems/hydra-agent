@@ -28,8 +28,14 @@ test -f docs/notes/b11.md || fail 'docs/notes/b11.md missing'
 PYTHON="${PYTHON:-python3}"
 PYTHON=$("$PYTHON" -c 'import sys; print(sys.executable)') || fail 'cannot resolve the Python interpreter'
 [[ "$PYTHON" = /* ]] || fail "interpreter path is not absolute: $PYTHON"
+# The gates below use assert; an optimising interpreter would skip them. Refuse PYTHONOPTIMIZE and a forced -O.
+unset PYTHONOPTIMIZE
+"$PYTHON" -c 'import sys; raise SystemExit(1 if sys.flags.optimize else 0)' || fail 'the interpreter runs with optimization on; the exit gates need assert'
+[[ "$(id -u)" != 0 ]] || fail 'run the exit unprivileged, never as root (the acceptance relies on file permissions)'
 # Notes gate (requirement 8): real headings with bodies, evidence content, no Slack ids / tokens / hostnames.
 "$PYTHON" - <<'PY' || fail 'notes gate'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import re,sys
 from pathlib import Path
 text=Path('docs/notes/b11.md').read_text()
@@ -58,6 +64,8 @@ PY
 "$PYTHON" -c 'import pytest, slack_bolt, slack_sdk' || fail 'install pytest, slack_bolt and slack_sdk in the selected Python environment'
 # Seams of requirements 2, 3, 5, 10 and 11 (the acceptance exercises their behaviour; these are the names it relies on).
 "$PYTHON" - <<'PY' || fail 'required seams missing'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import ast,re
 from pathlib import Path
 src=Path('manager/supervisor.py').read_text()
@@ -93,6 +101,8 @@ PY
 # Baseline regression preservation: every baseline tests/manager statement stays structurally identical, except the
 # two named tests of requirement 7 that contradict this spec; those may be absent. No duplicate definitions.
 "$PYTHON" - "$BASE" $EXEMPT <<'PY'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import ast,subprocess,sys
 from pathlib import Path
 base=sys.argv[1];exempt=set(sys.argv[2:])
@@ -125,6 +135,8 @@ for t in $EXEMPT; do DESELECT+=(--deselect "$t"); done
 (cd "$MIX" && "$PYTHON" -m pytest --rootdir=. -q -rA -p no:cacheprovider "${DESELECT[@]}" tests/manager) >"$MIX/run.txt" 2>&1 || { tail -n 40 "$MIX/run.txt"; fail 'baseline suite fails against candidate code'; }
 "$PYTHON" - "$MIX/nodes.txt" "$MIX/run.txt" <<'PY'
 import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
+import sys
 from pathlib import Path
 nodes={l.strip() for l in Path(sys.argv[1]).read_text().splitlines() if l.startswith('tests/manager/') and '::' in l}
 assert nodes,'empty baseline node set'
@@ -139,6 +151,8 @@ m=re.search(r'(\d+) passed',notes)
 assert m and int(m.group(1))>=len(nodes),f'notes pytest count {m.group(1) if m else None} is below the {len(nodes)} baseline node ids the exit executed'
 PY
 "$PYTHON" - "$PYTHON" <<'PY'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import re,subprocess,sys
 from pathlib import Path
 try: result=subprocess.run([sys.argv[1],'loops/b11.acceptance.py'],timeout=900,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
