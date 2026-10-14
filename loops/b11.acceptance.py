@@ -1132,6 +1132,7 @@ class Ticker:
 
 def timer_setup(every_s=60, start=None):
     h, d = home(), fakes(context=100000)
+    Path(h, 'logs', 'persistence.json').write_text(json.dumps({'status': 'no_repo'}))
     gh, dog = FakeGitHub(), Dogfood()
     coder = Path(tempfile.mkdtemp(prefix='b11-coder-'))
     Path(h, 'config.json').write_text(json.dumps({'timer': {
@@ -1221,7 +1222,7 @@ def timer_gating_sources():
         clock.advance(3600)
         tick(None, 'waiting on L with no deadline never wakes, an hour later')
         now_epoch = sup.clock_epoch()
-        Path(h, 'work-status.json').write_text(json.dumps({'turn': 3, 'mode': 'waiting', 'track': 'b12', 'who': 'Hermes', 'deadline': int(now_epoch) + 30, 'since': int(now_epoch)}))
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 3, 'mode': 'waiting', 'track': 'b12', 'who': 'Hermes', 'deadline': int(now_epoch) + 90, 'since': int(now_epoch)}))
         tick(None, 'an operator deadline in the future does not wake')
         tick('work-status deadline', 'operator deadline passed')
         Path(h, 'work-status.json').write_text(json.dumps({'turn': 4, 'mode': 'continue', 'track': 'b12', 'next_action': 'x', 'deadline': int(now_epoch) - 10}))
@@ -1365,6 +1366,9 @@ def timer_source_isolation():
         tick(None, 'invalid work-status 1'); tick(None, 'invalid work-status 2')
         tick('check failing: work-status', 'invalid work-status 3')
         tick(None, 'invalid work-status 4: no second wake')
+        ws.write_text('   \n')
+        tick(None, 'empty JSON continues the failure streak')
+        check(snapshot(h).get('failures', {}).get('work-status') == 5, 'empty JSON must be a source failure')
         ws.write_text(json.dumps({'turn': 1, 'mode': 'done'}))
         tick(None, 'work-status readable again')
         check(not (snapshot(h).get('failures') or {}).get('work-status'), 'the work-status streak resets on success')
@@ -1392,6 +1396,8 @@ def timer_daily_digest():
     """Requirement 10: the daily digest fires once per local date at timer.digest_at (America/Los_Angeles by
     default), with digest: true in the payload; a snapshot initialised after that time does not catch up."""
     h, d, gh, dog, coder, clock, sup, tick = timer_setup(start=dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc))  # 05:00 PDT
+    cfg = json.loads(Path(h, 'config.json').read_text()); cfg['dev_channel'] = 'C_DIGEST'
+    Path(h, 'config.json').write_text(json.dumps(cfg))
     try:
         tick('snapshot initialised', 'first check', forbid=('daily digest',))
         target = dt.datetime(2026, 10, 8, 13, 58, 0, tzinfo=dt.timezone.utc)
@@ -1400,6 +1406,7 @@ def timer_daily_digest():
         clock.advance(120)
         ev = tick('timer: daily digest', 'digest at 07:00 local')
         check(ev['payload'].get('digest') is True, f'the digest event carries digest: true: {ev["payload"]}')
+        check(ev['payload'].get('channel') == 'C_DIGEST', 'daily digest must route to the configured dev channel')
         tick(None, 'no second digest the same date')
         clock.advance(6 * 3600)
         tick(None, 'nor six hours later')
@@ -1466,13 +1473,13 @@ def timer_max_silence():
         tick(None, 'a PR by someone else is not the manager in flight')
         now_epoch = int(sup.clock_epoch())
         Path(h, 'work-status.json').write_text(json.dumps({'turn': 2, 'mode': 'waiting', 'track': 'b12', 'who': 'Hermes', 'deadline': now_epoch + 10 * 24 * 3600, 'since': now_epoch}))
-        tick(None, 'a new waiting record is not itself a reason')
+        tick(('timer: max silence', 'in flight', 'Hermes'), 'already elapsed silence becomes due when operator work is in flight')
         clock.advance(1800 + 120)
         tick(('timer: max silence', 'in flight', 'Hermes'), 'max silence with an operator deadline')
         line = next((l for l in S.status_text(h).splitlines() if l.startswith('timer: ')), '')
         check('last wake' in line and 'max silence' in line, f'status shows the last wake reason: {line!r}')
         rows = checks_log(h)
-        check(len(rows) == tick.n and sum(1 for r in rows if r['woke']) == 9, f'nine wakes in {len(rows)} checks expected: {[r["reasons"] for r in rows if r["woke"]]}')
+        check(len(rows) == tick.n and sum(1 for r in rows if r['woke']) == 10, f'ten wakes in {len(rows)} checks expected: {[r["reasons"] for r in rows if r["woke"]]}')
     finally:
         dog.close()
 
@@ -1486,6 +1493,7 @@ def timer_service_loop():
     def configure(every_s):
         Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': every_s, 'github_repos': [], 'coder_logs_glob': str(coder / '*-logs')}}))
     configure(60)
+    Path(h, 'logs', 'persistence.json').write_text(json.dumps({'status': 'no_repo'}))
     start = dt.datetime(2026, 10, 8, 15, 0, 0, tzinfo=dt.timezone.utc)
     clock = Clock(start)
     stop = threading.Event()
