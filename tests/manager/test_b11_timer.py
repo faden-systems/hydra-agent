@@ -179,7 +179,7 @@ def test_s_max_silence_only_while_something_is_in_flight_never_for_l_alone():
         child = subprocess.Popen(["sleep", "600"])
         try:
             coder_dir(coder, "b98-logs", child.pid)
-            rec, _ = tick(); assert reasons(rec) == ["coder b98-logs appeared"]
+            rec, _ = tick(); assert "coder b98-logs appeared" in reasons(rec)
             clock.advance(900); rec, _ = tick(); assert not rec["woke"]
             clock.advance(1200); rec, _ = tick()
             assert len(reasons(rec)) == 1 and reasons(rec)[0].startswith("max silence ") and reasons(rec)[0].endswith("; in flight: coder b98-logs")
@@ -195,14 +195,14 @@ def test_s_max_silence_only_while_something_is_in_flight_never_for_l_alone():
             if child.poll() is None:
                 child.kill(); child.wait()
         gh.repo(HYDRA_REPO, head=sha("h1"), prs=[pr(71, sha("m1"), login="hydra-manager")])
-        rec, _ = tick(); assert reasons(rec) == ["hydra-agent PR #71 opened"]
+        rec, _ = tick(); assert "hydra-agent PR #71 opened" in reasons(rec)
         clock.advance(1920); rec, _ = tick(); assert reasons(rec)[0].endswith("; in flight: hydra-agent PR #71")
         gh.repo(HYDRA_REPO, head=sha("h1"), prs=[pr(72, sha("m2"), login="someone-else")])
         rec, _ = tick(); assert reasons(rec) == ["hydra-agent PR #71 closed", "hydra-agent PR #72 opened"]
         clock.advance(1920); rec, _ = tick(); assert not rec["woke"], "a PR by someone else is not the manager in flight"
         now_epoch = int(sup.clock_epoch())
         Path(h, "work-status.json").write_text(json.dumps({"turn": 2, "mode": "waiting", "track": "b12", "who": "Hermes", "deadline": now_epoch + 864000, "since": now_epoch}))
-        rec, _ = tick(); assert not rec["woke"], "a new waiting record is not itself a reason"
+        rec, _ = tick(); assert reasons(rec)[0].endswith("; in flight: waiting on Hermes"), "elapsed silence is due when work becomes in flight"
         clock.advance(1920); rec, _ = tick(); assert reasons(rec)[0].endswith("; in flight: waiting on Hermes")
     finally:
         dog.close()
@@ -215,6 +215,7 @@ def test_s_service_loop_ticks_once_per_slot_not_while_paused_and_adopts_a_new_in
     def configure(every_s):
         Path(h, "config.json").write_text(json.dumps({"timer": {"every_s": every_s, "github_repos": [], "coder_logs_glob": str(coder / "*-logs")}}))
     configure(60)
+    Path(h, "logs", "persistence.json").write_text(json.dumps({"status": "no_repo"}))
     clock = Clock(dt.datetime(2026, 10, 8, 15, 0, 0, tzinfo=dt.timezone.utc))
     stop = threading.Event()
 

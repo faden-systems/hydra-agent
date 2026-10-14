@@ -1730,8 +1730,6 @@ def _timer_strict_json(path):
         return {}
     with open(path, encoding="utf-8") as f:
         raw = f.read()
-    if not raw.strip():
-        return {}
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError(f"{path}: not a JSON object")
@@ -4634,6 +4632,7 @@ class Supervisor:
         payload = {"text": text or ("timer: " + TIMER_BARE_REASON), "instructs": False}
         if digest:
             payload["digest"] = True
+            payload["channel"] = load_config(self.home).get("dev_channel")
         return append_event(self.home, new_event("timer", payload, event_id=eid))
 
     def timer_snapshot_path(self):
@@ -4824,12 +4823,7 @@ class Supervisor:
             ok("work-status")
             ws_snap = dict(snap.get("work_status") or {})
             deadline = _ws_num(work_status.get("deadline")) if work_status.get("mode") in ("idle", "waiting") else None
-            # a deadline counts as passed once it lies at or before the previous check's time (a deadline set
-            # inside the current interval is not fired by the very next check, as the acceptance pins); so the
-            # wake comes at most two intervals after the deadline
-            prev_at = parse_iso((snap.get("last_check") or {}).get("at"))
-            prev_epoch = prev_at.timestamp() if prev_at else None
-            if deadline is not None and prev_epoch is not None and deadline <= prev_epoch \
+            if deadline is not None and deadline <= now_epoch \
                     and ws_snap.get("fired_deadline") != deadline:
                 reasons.append(f"work-status deadline {now_iso(deadline)} passed")
                 ws_snap["fired_deadline"] = deadline
@@ -4842,8 +4836,7 @@ class Supervisor:
         else:
             ok("persistence")
             triple = {k: pers.get(k) for k in ("status", "error", "pending_local_sha")}
-            # `no_repo` (no faden clone configured, written by every turn then) is as quiet as `synced`
-            if "persistence" in snap and triple != snap["persistence"] and triple.get("status") not in ("synced", "no_repo"):
+            if "persistence" in snap and triple != snap["persistence"] and triple.get("status") != "synced":
                 reasons.append(f"persistence status {triple.get('status')}")
             snap["persistence"] = triple
         # (e) the dogfood
@@ -4898,13 +4891,10 @@ class Supervisor:
             snap["last_turn_n"] = newest_n
             snap["last_turn_seen_at"] = now_epoch
         in_flight = self._timer_in_flight(snap, work_status)
-        if in_flight != (snap.get("in_flight") or []):
-            snap["in_flight"], snap["in_flight_since"] = in_flight, now_epoch  # the silence of THIS in-flight set
         if fresh:
             reasons.insert(0, "snapshot initialised")
         else:
-            ref = max(float(snap.get("last_wake_at") or 0), float(snap.get("last_turn_seen_at") or 0),
-                      float(snap.get("in_flight_since") or 0))
+            ref = max(float(snap.get("last_wake_at") or 0), float(snap.get("last_turn_seen_at") or 0))
             silence = now_epoch - ref
             if in_flight and ref and silence >= cfg["max_silence_s"]:
                 reasons.append(f"max silence {int(silence)}s; in flight: {', '.join(in_flight)}")

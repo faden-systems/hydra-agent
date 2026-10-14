@@ -352,6 +352,7 @@ class Ticker:
 
 def timer_setup(every_s=60, start=None, dogfood=True, repos=True):
     h, d = home(), fakes(context=100000)
+    Path(h, "logs", "persistence.json").write_text(json.dumps({"status": "no_repo"}))
     gh, dog = FakeGitHub(), Dogfood()
     coder = Path(tempfile.mkdtemp(prefix="b11t-coder-"))
     timer = {"every_s": every_s, "gh_bin": str(gh.bin), "coder_logs_glob": str(coder / "*-logs")}
