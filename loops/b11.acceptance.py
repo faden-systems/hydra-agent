@@ -23,7 +23,7 @@ import supervisor as S  # noqa: E402
 
 HYDRA = str(ROOT / 'manager' / 'hydra')
 THRESHOLD = 300000
-FADEN, HYDRA = 'faden-systems/faden', 'faden-systems/hydra-agent'
+FADEN_REPO, HYDRA_REPO = 'faden-systems/faden', 'faden-systems/hydra-agent'
 
 
 class Fail(Exception):
@@ -172,9 +172,9 @@ class Clock:
         self.now = self.now + dt.timedelta(seconds=seconds)
 
 
-def make(h, d, clock=None, blog=None, poster=None):
+def make(h, d, clock=None, blog=None, poster=None, sleep=None):
     return S.Supervisor(home=h, engines=engines(d), poster=poster or Poster(), buildlog_poster=blog or Poster(),
-                        clock=clock or Clock(dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc)))
+                        clock=clock or Clock(dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc)), sleep=sleep)
 
 
 def config(h, **cfg):
@@ -299,9 +299,18 @@ def threshold_boundaries():
     check(compacts(450000, over_ratio=2.0), '1.5x with over_ratio 2.0 configured must still compact (over_ratio is retired)')
     check(compacts(350000, threshold_tokens=340000), 'a configured threshold_tokens is the due limit')
     check(not compacts(350000, threshold_tokens=350000), 'a context at a configured threshold_tokens does not compact')
-    h = home(); config(h, over_ratio=2.0)
-    sup = make(h, fakes())
-    check('over_ratio' not in sup.compaction_config(), f'compaction_config must not return over_ratio: {sup.compaction_config()}')
+    h, d = home(), fakes(context=100000)
+    config(h, over_ratio=2.0)
+    logged, orig = [], S.log
+    S.log = lambda m: logged.append(str(m))
+    try:
+        sup = make(h, d)
+        check('over_ratio' not in sup.compaction_config(), f'compaction_config must not return over_ratio: {sup.compaction_config()}')
+        event(h, 'A'); sup.run_once(); run_ticks(sup, 3); sup.compaction_config(); S.compaction_config_for(h)
+    finally:
+        S.log = orig
+    retired = [m for m in logged if 'over_ratio' in m and 'retired' in m]
+    check(len(retired) == 1, f'exactly one over_ratio retirement log line per supervisor start, got {retired}')
     check('over_ratio' not in S.COMPACTION_DEFAULTS, 'COMPACTION_DEFAULTS must not carry over_ratio')
 
 
@@ -340,8 +349,14 @@ def held_is_loud_and_keeps_the_schedule():
     run_ticks(sup, 2)
     held_lines = [t for _, _, t in blog.posted if 'compaction held' in t]
     check(len(held_lines) == 1, f'exactly one held buildlog line per episode, got {held_lines}')
-    check('context 940000 over 375000' in held_lines[0] and 'compaction.rollover_enabled' in held_lines[0],
-          f'held line must name the measured context, the limit and the setting: {held_lines[0]}')
+    check(f'context 940000 over {THRESHOLD}' in held_lines[0] and 'compaction.rollover_enabled' in held_lines[0],
+          f'held line must name the measured context, the limit (threshold_tokens) and the setting: {held_lines[0]}')
+    hc, dc = home(), fakes(context=940000, context_after=90000)
+    config(hc, rollover_enabled=False, threshold_tokens=500000)
+    blogc = Poster(); supc = make(hc, dc, blog=blogc)
+    event(hc, 'A'); supc.run_once(); event(hc, 'B'); supc.run_once()
+    heldc = [t for _, _, t in blogc.posted if 'compaction held' in t]
+    check(len(heldc) == 1 and 'context 940000 over 500000' in heldc[0], f'the held line names the configured threshold: {heldc}')
     Path(h, 'COMPACT').write_text('')
     sup.run_once()
     check(not Path(h, 'COMPACT').exists(), 'a forced request must be consumed, not retried every tick')
@@ -383,6 +398,25 @@ def held_is_loud_and_keeps_the_schedule():
     finally:
         loop.close()
     check(rc == 1 and 'compacted at' not in out, f'live loop + failed rollover: exit 1 expected, got rc={rc} {out[-200:]!r}')
+    # an outcome without a new session id (ok null, an error not starting `held:`): seeded by a stub loop that
+    # consumes COMPACT and writes that form, since the engine seam cannot produce it
+    h4, d4 = home(), fakes(context=940000, context_after=90000)
+    sup4 = make(h4, d4)
+    S.write_text(S.compaction_state_path(h4), json.dumps({'last': {'before_tokens': 940000, 'after_tokens': None, 'at': '2026-10-08T09:00:00Z', 'ok': True, 'reason': 'tokens'}}))
+
+    def seeded_run_once():
+        if Path(h4, 'COMPACT').exists():
+            Path(h4, 'COMPACT').unlink()
+            S.write_text(S.compaction_state_path(h4), json.dumps({'last': {'before_tokens': 940000, 'after_tokens': None, 'at': '2026-10-08T12:00:00Z', 'ok': None, 'reason': 'forced', 'error': 'rollover left no session id'}}))
+            return True
+        return False
+    sup4.run_once = seeded_run_once
+    loop = LiveLoop(sup4, h4)
+    try:
+        rc, out = hydra_compact(h4, timeout=60)
+    finally:
+        loop.close()
+    check(rc == 1 and 'compaction unverified' in out and 'compacted at' not in out, f'live loop + unverified outcome: exit 1 and `compaction unverified` expected, got rc={rc} {out[-200:]!r}')
 
 
 def failed_rollover_backs_off():
@@ -1053,8 +1087,8 @@ def timer_setup(every_s=60, start=None):
     Path(h, 'config.json').write_text(json.dumps({'timer': {
         'every_s': every_s, 'gh_bin': str(gh.bin), 'coder_logs_glob': str(coder / '*-logs'),
         'dogfood': {'unit': 'fitflow-dogfood', 'health_url': dog.url, 'checkout': str(dog.checkout), 'systemctl_bin': str(dog.systemctl)}}}))
-    gh.repo(FADEN, head=sha('f1'), prs=[pr(261, sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))])
-    gh.repo(HYDRA, head=sha('h1'))
+    gh.repo(FADEN_REPO, head=sha('f1'), prs=[pr(261, sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))])
+    gh.repo(HYDRA_REPO, head=sha('h1'))
     clock = Clock(start or dt.datetime(2026, 10, 8, 15, 0, 0, tzinfo=dt.timezone.utc))   # 08:00 PDT, past the digest time
     sup = make(h, d, clock=clock)
     return h, d, gh, dog, coder, clock, sup, Ticker(sup, h, clock, every_s)
@@ -1070,10 +1104,10 @@ def timer_gating_sources():
         tick(None, 'unchanged')
         check(not any(c['kind'] != 'turn' for c in calls(d)) and calls(d) == [], f'the change check must not call an engine: {calls(d)}')
         # GitHub: main HEAD, the open set, the per-PR fields, issues updated since the last check
-        gh.repo(FADEN, head=sha('f2'), prs=[pr(261, sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))])
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[pr(261, sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))])
         tick(('faden main', sha('f1')[:7], sha('f2')[:7]), 'main head change', forbid=('hydra-agent', 'PR #261'))
         tick(None, 'unchanged after head')
-        gh.repo(HYDRA, head=sha('h1'), prs=[pr(70, sha('q1'))])
+        gh.repo(HYDRA_REPO, head=sha('h1'), prs=[pr(70, sha('q1'))])
         tick('hydra-agent PR #70', 'new open PR', forbid=('faden',))
         tick(None, 'unchanged after new PR')
         cur = dict(head=sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))
@@ -1083,16 +1117,16 @@ def timer_gating_sources():
                           ('checks', dict(checks=('success', 'failure')))):
             cur.update(kw)
             p = pr(261, **cur)
-            gh.repo(FADEN, head=sha('f2'), prs=[p])
+            gh.repo(FADEN_REPO, head=sha('f2'), prs=[p])
             tick(('faden PR #261', field), f'PR {field} change')
             tick(None, f'unchanged after PR {field}')
-        gh.repo(FADEN, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:30:00Z', 'title': 'x'},
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:30:00Z', 'title': 'x'},
                                                       {'number': 59, 'updated_at': '2026-10-08T12:30:00Z', 'pull_request': {'url': 'u'}}])
         tick('faden issue #58', 'issue updated since the last check', forbid=('#59',))
         tick(None, 'the same issue list again does not wake (cumulative map)')
-        gh.repo(FADEN, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:45:00Z', 'title': 'x'}])
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:45:00Z', 'title': 'x'}])
         tick('faden issue #58', 'issue updated again')
-        gh.repo(FADEN, head=sha('f2'), prs=[], issues=[])
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[], issues=[])
         tick('faden PR #261', 'PR closed (left the open set)')
         check(all(a[1].startswith(('repos/', 'user')) for a in gh.calls()), f'gh is called with REST paths only: {gh.calls()[:3]}')
         # coder runs
@@ -1195,22 +1229,22 @@ def timer_check_failures():
     h, d, gh, dog, coder, clock, sup, tick = timer_setup()
     try:
         tick('snapshot initialised', 'first check')
-        gh.fail([f'repos/{FADEN}/'])
-        gh.repo(HYDRA, head=sha('h2'))
+        gh.fail([f'repos/{FADEN_REPO}/'])
+        gh.repo(HYDRA_REPO, head=sha('h2'))
         tick(('hydra-agent main', sha('h2')[:7]), 'the other repo is still read while faden fails', forbid=('check failing',))
         tick(None, 'second consecutive failure: no wake')
-        tick(f'check failing: github:{FADEN}', 'third consecutive failure wakes once')
+        tick(f'check failing: github:{FADEN_REPO}', 'third consecutive failure wakes once')
         tick(None, 'fourth failure: no wake')
         tick(None, 'fifth failure: no wake')
         snap = snapshot(h)
-        check((snap.get('failures') or {}).get(f'github:{FADEN}') == 5, f'the snapshot counts the failure streak: {snap.get("failures")}')
-        check(snap.get('github', {}).get(FADEN, {}).get('head') == sha('f1'), f'the failing source keeps its previous snapshot entry: {snap.get("github", {}).get(FADEN)}')
+        check((snap.get('failures') or {}).get(f'github:{FADEN_REPO}') == 5, f'the snapshot counts the failure streak: {snap.get("failures")}')
+        check(snap.get('github', {}).get(FADEN_REPO, {}).get('head') == sha('f1'), f'the failing source keeps its previous snapshot entry: {snap.get("github", {}).get(FADEN_REPO)}')
         gh.fail([])
         tick(None, 'recovery with unchanged data: no wake')
-        check(not (snapshot(h).get('failures') or {}).get(f'github:{FADEN}'), 'a success resets the streak')
-        gh.fail([f'repos/{FADEN}/'])
+        check(not (snapshot(h).get('failures') or {}).get(f'github:{FADEN_REPO}'), 'a success resets the streak')
+        gh.fail([f'repos/{FADEN_REPO}/'])
         tick(None, 'new streak 1'); tick(None, 'new streak 2')
-        tick(f'check failing: github:{FADEN}', 'new streak 3 wakes again')
+        tick(f'check failing: github:{FADEN_REPO}', 'new streak 3 wakes again')
         gh.fail([])
         tick(None, 'recovered')
         pers = Path(h, 'logs', 'persistence.json'); pers.write_text('{not json')
@@ -1285,11 +1319,11 @@ def timer_max_silence():
         finally:
             with contextlib.suppress(Exception):
                 child.kill(); child.wait()
-        gh.repo(HYDRA, head=sha('h1'), prs=[pr(71, sha('m1'), login='hydra-manager')])
+        gh.repo(HYDRA_REPO, head=sha('h1'), prs=[pr(71, sha('m1'), login='hydra-manager')])
         tick('hydra-agent PR #71', 'the manager opened a PR')
         clock.advance(1800 + 120)
         tick(('timer: max silence', 'in flight', 'PR #71'), 'max silence with an open PR by the manager')
-        gh.repo(HYDRA, head=sha('h1'), prs=[pr(72, sha('m2'), login='someone-else')])
+        gh.repo(HYDRA_REPO, head=sha('h1'), prs=[pr(72, sha('m2'), login='someone-else')])
         tick(('PR #71', 'PR #72'), 'the manager PR closed, another opened')
         clock.advance(1800 + 120)
         tick(None, 'a PR by someone else is not the manager in flight')
@@ -1306,6 +1340,76 @@ def timer_max_silence():
         dog.close()
 
 
+def timer_service_loop():
+    """Requirement 10/11: the service loop itself calls timer_tick once per elapsed every_s slot on the supervisor's
+    clock, never while paused, and adopts a changed interval without a restart (driven through the injected sleep)."""
+    h, d = home(), fakes(context=100000)
+    coder = Path(tempfile.mkdtemp(prefix='b11-coder-'))
+
+    def configure(every_s):
+        Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': every_s, 'github_repos': [], 'coder_logs_glob': str(coder / '*-logs')}}))
+    configure(60)
+    start = dt.datetime(2026, 10, 8, 15, 0, 0, tzinfo=dt.timezone.utc)
+    clock = Clock(start)
+    stop = threading.Event()
+
+    class Stop(BaseException):
+        pass
+
+    def fake_sleep(seconds):
+        if stop.is_set():
+            raise Stop()
+        clock.advance(max(float(seconds), 1.0))
+    sup = make(h, d, clock=clock, sleep=fake_sleep)
+    ticks = []
+    real = sup.timer_tick
+
+    def spy(now=None):
+        ticks.append(sup.clock_epoch())
+        return real(now)
+    sup.timer_tick = spy
+    errors = []
+
+    def run():
+        try:
+            sup.loop(sleep_s=5)
+        except Stop:
+            pass
+        except BaseException as e:  # noqa: BLE001 - surfaced by the contract
+            errors.append(repr(e))
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    def wait_clock(seconds, label):
+        target = clock.now + dt.timedelta(seconds=seconds)
+        deadline = time.time() + 120
+        while clock.now < target and time.time() < deadline and t.is_alive():
+            time.sleep(0.02)
+        check(t.is_alive() and not errors, f'{label}: the loop must keep running: {errors}')
+        check(clock.now >= target, f'{label}: the loop must sleep through the injected sleep (clock did not advance)')
+    try:
+        wait_clock(600, 'ten minutes at 60 s')
+        n = len(ticks)
+        check(9 <= n <= 12, f'about ten timer_tick calls in ten minutes at every_s 60, got {n}')
+        slots = [int(ts // 60) for ts in ticks]
+        check(len(slots) == len(set(slots)), f'at most one timer_tick per slot: {slots}')
+        Path(h, 'PAUSE').write_text('acceptance\n')
+        wait_clock(300, 'paused')
+        check(len(ticks) == n, f'no timer_tick while paused: {len(ticks) - n} call(s)')
+        Path(h, 'PAUSE').unlink()
+        configure(120)
+        wait_clock(600, 'ten minutes at 120 s')
+        m = len(ticks) - n
+        check(4 <= m <= 6, f'about five timer_tick calls in ten minutes at every_s 120 (re-read without a restart), got {m}')
+        rows = checks_log(h)
+        check(len(rows) == len(ticks), f'every loop-driven tick appends its check record: {len(rows)} rows vs {len(ticks)} calls')
+        check(sum(1 for r in rows if r['woke']) == 1 and rows[0]['reasons'] == ['snapshot initialised'], f'only the initialising check wakes with nothing changing: {[r["reasons"] for r in rows if r["woke"]]}')
+        check(len([r for r in turns(h) if r.get('events')]) == 1, 'exactly one turn (the initialising wake) ran')
+    finally:
+        stop.set()
+        t.join(10)
+
+
 def timer_interval_config():
     """Requirement 11: timer.every_s (and the other timer keys) come from config.json, re-read each time, clamped;
     the module has no TIMER_EVERY_S / TIMER_TEXT constants."""
@@ -1314,7 +1418,7 @@ def timer_interval_config():
     h = home()
     cfg = S.timer_config(h)
     for k, v in (('every_s', 900), ('digest_at', '07:00'), ('digest_tz', 'America/Los_Angeles'), ('max_silence_s', 14400),
-                 ('gh_bin', 'gh'), ('github_repos', [FADEN, HYDRA]), ('coder_logs_glob', '/srv/hydra/coder/*-logs')):
+                 ('gh_bin', 'gh'), ('github_repos', [FADEN_REPO, HYDRA_REPO]), ('coder_logs_glob', '/srv/hydra/coder/*-logs')):
         check(cfg.get(k) == v, f'timer default {k} must be {v!r}, got {cfg.get(k)!r}')
     check(S.TIMER_DEFAULTS['every_s'] == 900, 'TIMER_DEFAULTS.every_s must be 900')
     sup = make(h, fakes())
@@ -1336,7 +1440,8 @@ SCENARIOS = [threshold_compacts_before_next_turn, threshold_boundaries, quiet_ho
              bytes_overage_compacts, codex_selected_ignores_stale_claude_measurement,
              held_is_loud_and_keeps_the_schedule, failed_rollover_backs_off, cli_compactions_detected,
              status_line_contract, stale_pending_regression, state_digest_bounds_the_message, persistent_mode_covered,
-             timer_gating_sources, timer_check_failures, timer_daily_digest, timer_max_silence, timer_interval_config]
+             timer_gating_sources, timer_check_failures, timer_daily_digest, timer_max_silence, timer_service_loop,
+             timer_interval_config]
 
 
 def main(argv):
