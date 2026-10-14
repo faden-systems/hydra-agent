@@ -1746,11 +1746,11 @@ def _pr_fields(pr):
             "comments": pr.get("comments"), "reviews": pr.get("reviews"), "checks": pr.get("checks")}
 
 
-def _github_reasons(repo, old, new):
+def _github_reasons(repo, old, new, persistence_only=False):
     """The exact reason clauses between two observations of one repository (requirement 10a)."""
     name = repo.rsplit("/", 1)[-1]
     reasons = []
-    if old.get("head") != new.get("head"):
+    if old.get("head") != new.get("head") and not persistence_only:
         reasons.append(f"{name} main {_short_sha(old.get('head'))} -> {_short_sha(new.get('head'))}")
     old_prs, new_prs = old.get("prs") or {}, new.get("prs") or {}
     for num in sorted(set(old_prs) | set(new_prs), key=lambda x: int(x) if str(x).isdigit() else 0):
@@ -4645,6 +4645,68 @@ class Supervisor:
             raise RuntimeError(f"gh api {path}: rc={p.returncode}: {(p.stderr or '').strip()[:200]}")
         return json.loads(p.stdout or "null")
 
+    def _timer_persistence_only(self, cfg, repo, old, new):
+        """Verify a bounded, complete persistence-only range; uncertainty always retains the wake.
+
+        Identity is the trusted repository's supervisor convention, not a signature. Never use a net
+        diff: a product change followed by its revert must still wake the manager.
+        """
+        if repo != "faden-systems/faden" or old == new:
+            return False
+        valid_sha = lambda v: isinstance(v, str) and re.fullmatch(r"[0-9a-f]{40}", v) is not None
+        if not valid_sha(old) or not valid_sha(new):
+            return False
+
+        def managed(path):
+            return (isinstance(path, str) and not any(x in ("", ".", "..") for x in path.split("/"))
+                    and (path in MANAGED_REPO_PATHS or any(path.startswith(p) for p in MANAGED_REPO_PREFIXES)))
+
+        try:
+            comparison = self._timer_gh(cfg, f"repos/{repo}/compare/{old}...{new}?per_page=100")
+            commits = comparison["commits"]
+            count = comparison["total_commits"]
+            if (comparison["status"] != "ahead" or comparison["merge_base_commit"]["sha"] != old
+                    or type(count) is not int or not 1 <= count <= 100
+                    or type(comparison["ahead_by"]) is not int or comparison["ahead_by"] != count
+                    or type(comparison["behind_by"]) is not int or comparison["behind_by"] != 0
+                    or not isinstance(commits, list) or len(commits) != count):
+                return False
+            parent, seen = old, {old}
+            for entry in commits:
+                head = entry["sha"]
+                if (not valid_sha(head) or head in seen or not isinstance(entry["parents"], list)
+                        or len(entry["parents"]) != 1 or entry["parents"][0]["sha"] != parent):
+                    return False
+                detail = self._timer_gh(cfg, f"repos/{repo}/commits/{head}?per_page=100")
+                if (detail["sha"] != head or not isinstance(detail["parents"], list)
+                        or len(detail["parents"]) != 1 or detail["parents"][0]["sha"] != parent):
+                    return False
+                meta = detail["commit"]
+                if not re.fullmatch(r"manager: turn [1-9][0-9]*\n?", meta["message"]):
+                    return False
+                for key in ("author", "committer"):
+                    if meta[key]["name"] != "hydra-manager" or meta[key]["email"] != "manager@hydra.local":
+                        return False
+                files = detail["files"]
+                if not isinstance(files, list) or not 1 <= len(files) < 100:
+                    return False
+                for file in files:
+                    if (file["status"] not in ("added", "modified", "removed", "renamed")
+                            or not managed(file["filename"])):
+                        return False
+                    if file["status"] == "renamed" and not managed(file.get("previous_filename")):
+                        return False
+                    if "previous_filename" in file and not managed(file["previous_filename"]):
+                        return False
+                seen.add(head)
+                parent = head
+            return parent == new
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError, OSError,
+                RuntimeError, subprocess.SubprocessError):
+            # A failed verification is not a failed GitHub observation: wake immediately, and let
+            # the independently collected PR/issue changes appear in the same timer event.
+            return False
+
     def _timer_github_repo(self, cfg, repo, previous, at_dt):
         """One repository's observation (requirement 10a). The issues cursor is this repo's previous successful
         check (`last_ok`), a day before this check for a fresh snapshot; the cumulative issues map keeps the
@@ -4799,7 +4861,8 @@ class Supervisor:
                 continue
             ok(source)
             if repo in github:
-                reasons.extend(_github_reasons(repo, github[repo], obs))
+                persistence_only = self._timer_persistence_only(cfg, repo, github[repo].get("head"), obs.get("head"))
+                reasons.extend(_github_reasons(repo, github[repo], obs, persistence_only=persistence_only))
             github[repo] = obs
         snap["github"] = github
         # (b) coder runs
