@@ -185,12 +185,26 @@ def test_forced_compaction_runs_on_the_next_tick_even_without_events(home, tmp_p
     assert rec["reason"] == "forced" and rec["ok"] is True and rec["before_tokens"] == 1000
 
 
-def test_hydra_compact_cli_schedules(home):
+def test_hydra_compact_cli_schedules_and_status_shows_forced(home):
+    """Replaces test_hydra_compact_cli_schedules (loops/b11.md requirements 2 and 4: with no live loop and rollover
+    enabled by default the CLI schedules; status shows the one-number line with `; compaction: forced`, never the
+    old `compaction: pending (` wording)."""
     r = subprocess.run([sys.executable, HYDRA, "compact"], env={**os.environ, "HYDRA_HOME": home},
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and "scheduled" in r.stdout and os.path.exists(os.path.join(home, "COMPACT"))
-    assert "compaction: pending" in subprocess.run([sys.executable, HYDRA, "status"], env={**os.environ, "HYDRA_HOME": home},
-                                                   capture_output=True, text=True, timeout=60).stdout
+    status = subprocess.run([sys.executable, HYDRA, "status"], env={**os.environ, "HYDRA_HOME": home},
+                            capture_output=True, text=True, timeout=60).stdout
+    line = next(l for l in status.splitlines() if l.startswith("context: "))
+    assert line.endswith("; compaction: forced") and "due over 300000" in line
+    assert "compaction: pending (" not in status
+
+
+def test_hydra_compact_cli_held_without_loop_when_disabled(home):
+    S.write_text(os.path.join(home, "config.json"), json.dumps({"compaction": {"rollover_enabled": False}}))
+    r = subprocess.run([sys.executable, HYDRA, "compact"], env={**os.environ, "HYDRA_HOME": home},
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1 and r.stdout.startswith("compaction held:")
+    assert not os.path.exists(os.path.join(home, "COMPACT"))
 
 
 def test_hydra_compact_waits_for_a_live_loop(home, tmp_path):
