@@ -25,13 +25,32 @@ def rollover_engine(dir_, memory_write=True, handoff=HANDOFF, fail=False):
     return exe
 
 
-def test_held_by_default_records_diagnostic_without_engine_call(home, tmp_path):
+def test_held_when_rollover_disabled_records_diagnostic_without_engine_call(home, tmp_path):
+    """Replaces test_held_by_default_records_diagnostic_without_engine_call (loops/b11.md requirement 2: rollover is
+    on by default; an explicit `false` holds, keeps the schedule and makes no engine call)."""
     exe = rollover_engine(str(tmp_path))
+    S.write_text(os.path.join(home, "config.json"), json.dumps({"compaction": {"rollover_enabled": False}}))
+    S.write_text(S.compaction_state_path(home), json.dumps({"pending": {"reason": "tokens", "value": 940000, "limit": 300000, "since": "x"}}))
+    S.write_text(os.path.join(home, "COMPACT"), "test\n")
     sup = S.Supervisor(home=home, engines=engines(exe), poster=lambda *a: None)
     old = S.read_text(os.path.join(home, "session-id")).strip()
     sup.run_compaction("force")
     assert S.read_text(os.path.join(home, "session-id")).strip() == old
-    assert "held" in sup.compaction_state()["last"]["error"].lower()
+    state = sup.compaction_state()
+    assert state["last"]["error"].startswith("held: automatic rollover is disabled") and state["last"]["ok"] is None
+    assert state["pending"], "a held outcome keeps the schedule"
+    assert not os.path.exists(os.path.join(home, "COMPACT")), "a forced request is consumed, not retried every tick"
+    assert not os.path.exists(os.path.join(home, "logs", "attempts.jsonl")) or not any(
+        "compaction" in str(r) for r in S.read_jsonl(os.path.join(home, "logs", "attempts.jsonl"))), "no engine call"
+
+
+def test_rollover_is_enabled_by_default(home, tmp_path):
+    exe = rollover_engine(str(tmp_path))
+    sup = S.Supervisor(home=home, engines=engines(exe), poster=lambda *a: None)
+    assert sup.rollover_enabled() is True
+    old = S.read_text(os.path.join(home, "session-id")).strip()
+    sup.run_compaction("force")
+    assert S.read_text(os.path.join(home, "session-id")).strip() != old
 
 
 def test_rollover_enabled_replaces_session_id_and_preserves_old_transcript(home, tmp_path):

@@ -86,7 +86,6 @@ FAILURE_REASON_MAX = 4000
 LONG_REPLY_LINES = 40
 NO_REPLY_PLACEHOLDER = "(turn produced no reply text)"
 LONG_REPLY_HEAD = 15
-TIMER_EVERY_S = 900
 LOOP_SLEEP_S = 5
 DEADMAN_S = 1800
 NOTE_EVERY_S = 3600
@@ -102,15 +101,32 @@ CODEX_ROLLOUT_RE = re.compile(r"(/[^\s'\"]*rollout-[^\s'\"]*\.jsonl)")
 DEFAULT_DEV_CHANNEL = "C_DEV"
 THREAD_PRUNE_DAYS = 14
 COMPACTION_DEFAULTS = {"threshold_tokens": 300000, "max_bytes": 50 * 1000 * 1000, "codex_every_turns": 25,
-                       "quiet_hours": [2, 5], "quiet_hours_tz": "local", "over_ratio": 1.25, "retry_after_s": 6 * 3600}
+                       "quiet_hours": [2, 5], "quiet_hours_tz": "local", "retry_after_s": 6 * 3600,
+                       "rollover_enabled": True}
 COMPACTION_MESSAGE = ("[compaction] Compact: write everything from this session that must survive into MEMORY.md "
                       "(facts, decisions, open questions, with dates), update MANAGER-HANDOFF.md, then reply only "
                       "`compacted`.")
 FLUSH_LINE = ("[flush] every {n} Codex turns: before handling the events below, write everything durable since your "
               "last flush to MEMORY.md and codex/NOTES.md (dated, tagged codex).")
 USAGE_LINE_RE = re.compile(r"^\[usage\][ \t]+(.*)\n?", re.MULTILINE)
-TIMER_TEXT = ("timer: read state.json, check open PRs and loop labels with `gh`, act only if something changed; "
-              "reply `nothing changed` otherwise.")
+TIMER_DEFAULTS = {  # requirement 11, loops/b11.md: the `timer` section of config.json, read fresh on every tick
+    "every_s": 900,
+    "digest_at": "07:00",
+    "digest_tz": "America/Los_Angeles",
+    "max_silence_s": 14400,
+    "gh_bin": "gh",
+    "github_repos": ["faden-systems/faden", "faden-systems/hydra-agent"],
+    "coder_logs_glob": "/srv/hydra/coder/*-logs",
+}
+TIMER_MIN_EVERY_S = 30
+TIMER_GH_TIMEOUT_S = 30
+TIMER_HEALTH_TIMEOUT_S = 5
+TIMER_FAILURE_WAKE_AT = 3  # the third consecutive failure of a source wakes once (requirement 10)
+TIMER_ISSUES_KEPT = 200
+TIMER_SNAPSHOT = os.path.join("logs", "timer-snapshot.json")
+TIMER_CHECKS = os.path.join("logs", "timer-checks.jsonl")
+TIMER_BARE_REASON = ("read state.json, check open PRs and loop labels with `gh`, act only if something changed; "
+                     "reply `nothing changed` otherwise")
 REACTION_WORKING = "eyes"
 REACTION_FAILED = "x"
 SLACK_TS_RE = re.compile(r"^\d+\.\d+$")
@@ -826,6 +842,192 @@ def tracks_summary(state):
     return lines
 
 
+# ----------------------------------------------------------------------------------------------- state digest
+# (requirement 5, loops/b11.md): a bounded per-turn digest of factory/state.json, replacing the whole-file
+# `state_block` prefix. Every cut below is in bytes of UTF-8 on a character boundary, never characters.
+
+DIGEST_MANDATORY_BUDGET = 30000
+DIGEST_BUDGET = 36000
+DIGEST_DECISION_COUNT = 10
+DIGEST_DECISION_DEGRADED_COUNT = 3
+DIGEST_FIELD_CUT = 240
+DIGEST_DECISION_CUT = 600
+_ASSIGNEE_LINE_RE = re.compile(r"^assignee:\s*(\S+)\s*\|\s*track:\s*([A-Za-z0-9_.-]+)\s*$")
+_MENTION_PREFIX_RE = re.compile(r"^(?:<@[^>]+>\s*)+")
+_CONTINUE_LINE_RE = re.compile(r"^continue\s+([A-Za-z0-9_.-]+):")
+
+
+def _utf8_cut(s, limit):
+    """`s` cut to at most `limit` bytes of UTF-8, on a character boundary."""
+    s = s if isinstance(s, str) else str(s)
+    b = s.encode("utf-8")
+    if len(b) <= limit:
+        return s
+    b = b[:limit]
+    while b:
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            b = b[:-1]
+    return ""
+
+
+def _utf8_len(s):
+    return len(s.encode("utf-8"))
+
+
+def _digest_track_field(tr, key):
+    """The collapsed-whitespace string for `key` on track `tr`, or None when absent. `now` falls back to
+    `stage` then `status` as `hydra status` does (loops/b7.md requirement 5)."""
+    if key == "now":
+        now = tr.get("now")
+        if isinstance(now, str) and now.strip():
+            val = now
+        else:
+            legacy = tr.get("stage") or tr.get("status") or tr.get("state") or ""
+            val = legacy if isinstance(legacy, str) else str(legacy)
+    else:
+        val = tr.get(key)
+        val = "" if val is None else (val if isinstance(val, str) else str(val))
+    val = " ".join(val.split())
+    return val or None
+
+
+def _ts_variants(value):
+    if value is None:
+        return set()
+    s = str(value)
+    return {s, s.replace(".", "")}
+
+
+def _contains_ts_value(obj, targets):
+    """A recursive scan of dicts/lists for a string leaf equal to one of `targets`, exact or `.`-stripped
+    (loops/b11.md requirement 5a)."""
+    if not targets:
+        return False
+    if isinstance(obj, dict):
+        return any(_contains_ts_value(v, targets) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_contains_ts_value(v, targets) for v in obj)
+    if isinstance(obj, str):
+        return obj in targets or obj.replace(".", "") in targets
+    return False
+
+
+def _select_touched_tracks(state, events, home):
+    """The ids of the tracks this batch touches, in selection order (loops/b11.md requirement 5): per event,
+    in batch order, rules (a) thread/ts match, (b) `assignee: <name> | track: <id>`, (c) `continue <id>:`, in
+    that order; then (d) `work-status.json`'s track, last; a track already selected is not selected again."""
+    tracks = _track_items(state)
+    track_by_id = {tid: tr for tid, tr in tracks}
+    selected, seen = [], set()
+
+    def consider(tid):
+        if tid in track_by_id and tid not in seen:
+            seen.add(tid)
+            selected.append(tid)
+
+    for ev in events or []:
+        p = _payload(ev)
+        text = p.get("text") or ""
+        targets = _ts_variants(p.get("thread_ts")) | _ts_variants(ev.get("id"))
+        for tid, tr in tracks:
+            if tid not in seen and _contains_ts_value(tr, targets):
+                consider(tid)
+        first_line = text.splitlines()[0] if text else ""
+        stripped = _MENTION_PREFIX_RE.sub("", first_line).strip()
+        m = _ASSIGNEE_LINE_RE.match(stripped)
+        if m:
+            consider(m.group(2))
+        cm = _CONTINUE_LINE_RE.match(text)
+        if cm:
+            consider(cm.group(1))
+    ws = read_work_status(home)
+    if isinstance(ws, dict) and isinstance(ws.get("track"), str):
+        consider(ws["track"])
+    return selected
+
+
+def _digest_mandatory_lines(path, state, tracks, decisions, level):
+    """One `(level in 0..4)` rendering of the digest's mandatory part (header through `waits_on`): level 0 is
+    full; levels 1-4 progressively degrade per requirement 5's order (decisions to 3, then track lines to a
+    120-byte `now`, then 60, then the bare `- <id>` line)."""
+    header = f"# factory/state.json (digest of {path}; read the file before acting on a track)"
+    lines = [header, f"updated: {state.get('updated') if state.get('updated') is not None else '-'}", "## tracks"]
+    for tid, tr in tracks:
+        if level >= 4:
+            lines.append(f"- {tid}")
+            continue
+        if not isinstance(tr, dict):  # no fields to digest: the record itself, its key included
+            lines.append(f"- {tid}: " + _utf8_cut(json.dumps({tid: tr}, ensure_ascii=False), DIGEST_FIELD_CUT))
+            continue
+        now_cut = DIGEST_FIELD_CUT if level < 2 else (120 if level == 2 else 60)
+        now_val = _digest_track_field(tr, "now") or "-"
+        now_val = _utf8_cut(now_val, now_cut) if now_val != "-" else "-"
+        if level < 2:
+            waits_val = _utf8_cut(_digest_track_field(tr, "waits_on") or "-", DIGEST_FIELD_CUT)
+            next_val = _utf8_cut(_digest_track_field(tr, "next_action") or "-", DIGEST_FIELD_CUT)
+            lines.append(f"- {tid}: now: {now_val} | waits_on: {waits_val} | next_action: {next_val}")
+        else:
+            lines.append(f"- {tid}: now: {now_val}")
+    count = DIGEST_DECISION_COUNT if level == 0 else DIGEST_DECISION_DEGRADED_COUNT
+    kept = decisions[-count:] if count else []
+    lines.append(f"## founder decisions ({len(decisions)}; newest {len(kept)} below, the rest in the file)")
+    for dec in kept:
+        lines.append("- " + _utf8_cut(dec, DIGEST_DECISION_CUT))
+    next_gate = state.get("next_gate")
+    if next_gate is not None:
+        lines.append("## next_gate")
+        lines.append(_utf8_cut(str(next_gate), DIGEST_DECISION_CUT))
+    waits_on = state.get("waits_on")
+    if waits_on is not None:
+        lines.append("## waits_on")
+        lines.append(_utf8_cut(str(waits_on), DIGEST_DECISION_CUT))
+    return lines
+
+
+def build_state_digest(home, repo, events):
+    """`Supervisor.state_digest`'s pure module-level core (loops/b11.md requirement 5): a bounded digest of
+    `factory/state.json` for every engine's prompt, replacing the whole-file `state_block` prefix."""
+    path = state_path(home, repo)
+    state = read_state(home, repo)
+    tracks = _track_items(state)
+    decisions = state.get("founder_decisions_in_force")
+    decisions = [d if isinstance(d, str) else str(d) for d in decisions] if isinstance(decisions, list) else []
+    selected = _select_touched_tracks(state, events, home)
+
+    level = 0
+    mandatory = _digest_mandatory_lines(path, state, tracks, decisions, 0)
+    size = _utf8_len("\n".join(mandatory))
+    if size > DIGEST_MANDATORY_BUDGET:
+        for level in (1, 2, 3, 4):
+            mandatory = _digest_mandatory_lines(path, state, tracks, decisions, level)
+            size = _utf8_len("\n".join(mandatory))
+            if size <= DIGEST_MANDATORY_BUDGET:
+                break
+        if size > DIGEST_MANDATORY_BUDGET:
+            mandatory[0] += " (mandatory part over budget)"
+            log(f"state_digest: mandatory part over budget at {size} bytes even fully degraded")
+        else:
+            mandatory[0] += " (mandatory part shortened)"
+
+    track_by_id = {tid: tr for tid, tr in tracks}
+    remaining = list(selected)
+    digest = None
+    while True:
+        dropped = len(selected) - len(remaining)
+        header = mandatory[0] + (f" (truncated: {dropped} touched track(s) left out)" if dropped else "")
+        mandatory_text = "\n".join([header] + mandatory[1:])
+        sections = [f"### {tid}\n" + json.dumps(track_by_id[tid], indent=1, ensure_ascii=False)
+                    for tid in remaining if tid in track_by_id]
+        touched = "## tracks touched by this batch\n" + ("\n".join(sections) if sections else "none")
+        digest = mandatory_text + "\n" + touched + "\n## end of state digest"
+        if _utf8_len(digest) <= DIGEST_BUDGET or not remaining:
+            break
+        remaining = remaining[:-1]
+    return digest
+
+
 def migrate_track_history(home, repo):
     """Mechanical migration, not a new verdict (requirement 5, loops/b7.md): every track gets a short `now`;
     complete legacy stage text is archived (appended, never overwritten or duplicated) to
@@ -1312,6 +1514,7 @@ def status_text(home, repo=None):
         direct += f", {st['failed']} set aside"
     lines.append(direct)
     lines.append(compaction_status_line(home))
+    lines.append(timer_status_line(home))  # requirement 10, loops/b11.md
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
         lines.append(f"heartbeat: {now_iso(os.path.getmtime(hb))}")
@@ -1465,23 +1668,252 @@ def read_compaction_state(home):
     return data if isinstance(data, dict) else {}
 
 
-def compaction_status_line(home):
-    """`last compaction: <at> (<before> -> <after>)` plus `; compaction: pending (...)` when one is scheduled."""
+def _compaction_config(cfg):
+    """`COMPACTION_DEFAULTS` overridden by a `compaction` config dict (or {}). `over_ratio` is retired
+    (requirement 1, loops/b11.md, amendment 2026-10-14): a configured value is ignored here and announced once per
+    supervisor start by `Supervisor.__init__`; the due limit is `threshold_tokens` itself."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    out = dict(COMPACTION_DEFAULTS)
+    for k in ("threshold_tokens", "max_bytes", "codex_every_turns", "retry_after_s"):
+        if cfg.get(k) is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                out[k] = int(cfg[k])
+    if "rollover_enabled" in cfg:
+        out["rollover_enabled"] = bool(cfg["rollover_enabled"])
+    qh = cfg.get("quiet_hours")
+    if isinstance(qh, (list, tuple)) and len(qh) == 2:
+        with contextlib.suppress(TypeError, ValueError):
+            out["quiet_hours"] = [int(qh[0]) % 24, int(qh[1]) % 24]
+    if cfg.get("quiet_hours_tz"):
+        out["quiet_hours_tz"] = str(cfg["quiet_hours_tz"])
+    return out
+
+
+def compaction_config_for(home):
+    return _compaction_config(load_config(home).get("compaction"))
+
+
+# ----------------------------------------------------------------------------------------------- the gated timer
+
+def timer_config(home):
+    """Requirement 11, loops/b11.md: `TIMER_DEFAULTS` merged with the `timer` section of config.json, read fresh on
+    every call (a changed `every_s` takes effect without a restart): `every_s` clamped to at least 30 and
+    `max_silence_s` to at least `every_s`; an unreadable config.json or a malformed section falls back to the
+    defaults. `dogfood` (`{"unit", "health_url", "checkout", "systemctl_bin"?}`) is passed through when it is a
+    dict, else absent."""
+    out = {k: (list(v) if isinstance(v, list) else v) for k, v in TIMER_DEFAULTS.items()}
+    section = load_config(home).get("timer")
+    section = section if isinstance(section, dict) else {}
+    for k in ("every_s", "max_silence_s"):
+        v = section.get(k)
+        if v is not None and not isinstance(v, bool):
+            with contextlib.suppress(TypeError, ValueError):
+                out[k] = int(v)
+    for k in ("digest_at", "digest_tz", "gh_bin", "coder_logs_glob"):
+        v = section.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    repos = section.get("github_repos")
+    if isinstance(repos, list):
+        out["github_repos"] = [r for r in repos if isinstance(r, str) and "/" in r]
+    if isinstance(section.get("dogfood"), dict):
+        out["dogfood"] = dict(section["dogfood"])
+    out["every_s"] = max(TIMER_MIN_EVERY_S, out["every_s"])
+    out["max_silence_s"] = max(out["every_s"], out["max_silence_s"])
+    return out
+
+
+def _timer_strict_json(path):
+    """The timer's own reader (requirement 10): an absent file is an empty record (`{}`), invalid JSON or a
+    non-object raises (a failure of that source, unlike the forgiving readers the turn uses)."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: not a JSON object")
+    return data
+
+
+def _short_sha(value):
+    return str(value)[:7] if value else "none"
+
+
+def _pr_fields(pr):
+    """The compared fields of one open PR from the observation `gh` built (requirement 10a)."""
+    return {"head": pr.get("head"), "updated_at": pr.get("updated_at"), "labels": pr.get("labels"),
+            "comments": pr.get("comments"), "reviews": pr.get("reviews"), "checks": pr.get("checks")}
+
+
+def _github_reasons(repo, old, new):
+    """The exact reason clauses between two observations of one repository (requirement 10a)."""
+    name = repo.rsplit("/", 1)[-1]
+    reasons = []
+    if old.get("head") != new.get("head"):
+        reasons.append(f"{name} main {_short_sha(old.get('head'))} -> {_short_sha(new.get('head'))}")
+    old_prs, new_prs = old.get("prs") or {}, new.get("prs") or {}
+    for num in sorted(set(old_prs) | set(new_prs), key=lambda x: int(x) if str(x).isdigit() else 0):
+        if num not in old_prs:
+            reasons.append(f"{name} PR #{num} opened")
+            continue
+        if num not in new_prs:
+            reasons.append(f"{name} PR #{num} closed")
+            continue
+        a, b = _pr_fields(old_prs[num]), _pr_fields(new_prs[num])
+        if a["head"] != b["head"]:
+            reasons.append(f"{name} PR #{num} head {_short_sha(a['head'])} -> {_short_sha(b['head'])}")
+        if a["updated_at"] != b["updated_at"]:
+            reasons.append(f"{name} PR #{num} updated_at {a['updated_at']} -> {b['updated_at']}")
+        if a["labels"] != b["labels"]:
+            reasons.append(f"{name} PR #{num} labels {a['labels'] or 'none'} -> {b['labels'] or 'none'}")
+        if a["comments"] != b["comments"]:
+            reasons.append(f"{name} PR #{num} comments {a['comments']} -> {b['comments']}")
+        if a["reviews"] != b["reviews"]:
+            reasons.append(f"{name} PR #{num} reviews {a['reviews']} -> {b['reviews']}")
+        if a["checks"] != b["checks"]:
+            reasons.append(f"{name} PR #{num} checks {a['checks'] or 'none'} -> {b['checks'] or 'none'}")
+    old_issues, new_issues = old.get("issues") or {}, new.get("issues") or {}
+    for num in sorted(new_issues, key=lambda x: int(x) if str(x).isdigit() else 0):
+        if old_issues.get(num) != new_issues[num]:
+            reasons.append(f"{name} issue #{num} updated")
+    return reasons
+
+
+def _timer_val(v):
+    """A value in a reason clause: strings bare, null/true/false as JSON, numbers as they are."""
+    return v if isinstance(v, str) else json.dumps(v)
+
+
+def _coder_reasons(old, new):
+    """The reason clauses between two observations of the coder log directories (requirement 10b)."""
+    reasons = []
+    for name in sorted(set(old) | set(new)):
+        if name not in old:
+            reasons.append(f"coder {name} appeared")
+            continue
+        if name not in new:
+            reasons.append(f"coder {name} disappeared")
+            continue
+        a, b = old[name], new[name]
+        for fname in ("status.json", "result.json", "completion.json", "coder-result.json"):
+            fa, fb = a.get("files", {}).get(fname), b.get("files", {}).get(fname)
+            if fa == fb:
+                continue
+            if fa is None or fb is None:
+                reasons.append(f"coder {name} {fname} {'appeared' if fa is None else 'gone'}")
+                continue
+            for key in sorted(set(fa) | set(fb)):
+                if fa.get(key) != fb.get(key):
+                    reasons.append(f"coder {name} {fname} {key} {_timer_val(fa.get(key))} -> {_timer_val(fb.get(key))}")
+        if a.get("pid_alive") and not b.get("pid_alive"):
+            reasons.append(f"coder {name} launcher pid {b.get('pid')} dead")
+        for fname in sorted(set(b.get("exit_files") or []) - set(a.get("exit_files") or [])):
+            reasons.append(f"coder {name} new file {fname}")
+    return reasons
+
+
+def timer_status_line(home):
+    """The `timer:` line of `hydra status` (requirement 10): the interval, the last check and the last wake."""
+    cfg = timer_config(home)
+    try:
+        snap = _timer_strict_json(os.path.join(home, TIMER_SNAPSHOT))
+    except (OSError, ValueError):
+        snap = {}
+    last = snap.get("last_check") or {}
+    if not last:
+        return f"timer: every {cfg['every_s']}s | last check: none"
+    wake = snap.get("last_wake") or {}
+    wake_text = f"{wake.get('at')}: {'; '.join(wake.get('reasons') or []) or 'none'}" if wake else "none"
+    return f"timer: every {cfg['every_s']}s | last check {last.get('at')} ({last.get('cost_ms', 0)} ms) | last wake {wake_text}"
+
+
+def _last_measured_claude_turn(home, engines=None):
+    """(context_tokens, turn) of the last Claude turn that measured a context (never a `compaction` record,
+    requirement 4, loops/b11.md); (None, None) when no Claude turn ever measured one."""
+    for t in reversed(read_jsonl(os.path.join(home, "logs", "turns.jsonl"))):
+        if t.get("context_tokens") is not None and t.get("kind") != "compaction" \
+                and family_of(str(t.get("engine") or ""), engines) == "claude":
+            return t["context_tokens"], t.get("n")
+    return None, None
+
+
+def _held_outcome(rec):
+    return isinstance(rec, dict) and str(rec.get("error") or "").startswith("held:")
+
+
+def cli_compactions_since(data, offset):
+    """Requirement 3, loops/b11.md: the module-level pure parser. `data` is bytes, `offset` the byte position to
+    start from; returns ([{"at": <timestamp or None>}], new_offset) where new_offset is the end of the last
+    complete line consumed (a partial trailing line is left for the next scan, never consumed). Every complete
+    JSON line whose `type` is `system` and whose `subtype` is `compact_boundary` is one record; an invalid line
+    is skipped."""
+    records = []
+    pos = offset
+    while True:
+        nl = data.find(b"\n", pos)
+        if nl == -1:
+            break
+        line = data[pos:nl]
+        pos = nl + 1
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+            records.append({"at": obj.get("timestamp")})
+    return records, pos
+
+
+def compaction_status_line(home, now=None):
+    """Requirement 4, loops/b11.md: one line, one number (the last measured Claude context, never a stale
+    `pending` value), the due limit, the newest of the supervisor's own last compaction and the CLI's own
+    detected compactions, and at most one suffix (`forced` > `held` > `due (<reason>)` > `awaiting
+    verification`). `now` is the clock to compare the failure back-off against (the wall clock by default)."""
     state = read_compaction_state(home)
+    cfg = compaction_config_for(home)
+    limit = int(cfg["threshold_tokens"])
+    ctx, turn_n = _last_measured_claude_turn(home)
+    head = f"context: {ctx} tokens (turn {turn_n})" if ctx is not None else "context: unknown"
     last = state.get("last") or {}
-    if last:
+    cli_list = state.get("cli_compactions") or []
+    cli_last = cli_list[-1] if cli_list else None
+    last_at = parse_iso(last.get("at")) if last else None
+    cli_at = parse_iso(cli_last.get("at")) if cli_last else None
+    use_cli = cli_last is not None and (last_at is None or (cli_at is not None and cli_at > last_at))
+    if use_cli:
+        last_text = f"{cli_last.get('at')} (cli)"
+    elif last:
         after = last.get("after_tokens")
-        shown = after if after is not None else ("failed" if last.get("ok") is False else "unverified")
-        line = f"last compaction: {last.get('at')} ({last.get('before_tokens')} -> {shown})"
+        if _held_outcome(last):
+            shown = "held"
+        elif after is not None:
+            shown = after
+        elif last.get("ok") is False:
+            shown = "failed"
+        else:
+            shown = "unverified"
+        last_text = f"{last.get('at')} ({last.get('before_tokens')} -> {shown})"
     else:
-        line = "last compaction: none"
+        last_text = "none"
+    line = f"{head} | due over {limit} | last compaction: {last_text}"
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    failed = parse_iso(state.get("failed_at"))
+    backoff = bool(failed and (now - failed).total_seconds() < cfg["retry_after_s"])
     pending = state.get("pending") or {}
+    claude_selected = family_of(current_engine(home)) == "claude"  # requirement 1's engine-family guard
     if os.path.exists(os.path.join(home, "COMPACT")):
-        line += "; compaction: pending (forced)"
-    elif pending:
-        line += f"; compaction: pending ({pending.get('reason')} {pending.get('value')} over {pending.get('limit')})"
+        line += "; compaction: forced"
+    elif _held_outcome(last) and pending:
+        line += "; compaction: held"
+    elif claude_selected and not state.get("verify") and not backoff and (
+            (ctx is not None and ctx > limit) or pending.get("reason") == "bytes"):
+        reason = "tokens" if (ctx is not None and ctx > limit) else "bytes"
+        line += f"; compaction: due ({reason})"
     elif state.get("verify"):
-        line += "; compaction: awaiting the next turn's verification"
+        line += "; compaction: awaiting verification"
     return line
 
 
@@ -1668,7 +2100,7 @@ def build_message(events):
         p = _payload(ev)
         text = p.get("text") or ""
         if ev.get("source") == "timer" and not text:
-            text = TIMER_TEXT
+            text = "timer: " + TIMER_BARE_REASON
         parts.append(f"### event {i} ({ev.get('id')})\n{event_header(ev)}\n---\n{text}")
     return "\n\n".join(parts) + "\n"
 
@@ -1763,6 +2195,10 @@ class Supervisor:
         self.engine_timeout = engine_timeout
         self.models = load_models(self.home)
         self.memory_dir = memory_dir_for(self.home, self.repo)
+        if isinstance(self.config.get("compaction"), dict) and self.config["compaction"].get("over_ratio") is not None:
+            log("compaction.over_ratio is retired; the due limit is threshold_tokens")  # once per start (req. 1)
+        self._last_message_bytes = None  # requirement 5, loops/b11.md: the exact UTF-8 length of the message
+        # handed to the engine for the most recent invoke()/invoke_codex() call, recorded on every turn.
         self._persistent = None  # loops/b8.md: this instance's own live persistent child, never shared across
         # a real process boundary; a pid recorded on disk that this instance never spawned owns no pipe here
         # and is retired as an orphan the next time something needs to invoke (requirement 9, loops/b8.md).
@@ -1961,7 +2397,7 @@ class Supervisor:
         self.migrate_tracks()  # before prompt creation (requirement 5, loops/b7.md)
         before = dir_hashes(self.memory_dir)
         message = build_message(events)
-        state_text = self.state_block()
+        state_text = self.state_digest(events)
         if state_text:
             message = state_text + "\n" + message
         notes = []
@@ -2003,14 +2439,19 @@ class Supervisor:
         usage = usage or {}
         is_claude = family_of(engine, self.engines) == "claude"
         compaction = None
+        cli_found = False
         if is_claude:
             self.snapshot_claude_memory()
             compaction = self.verify_compaction(usage.get("context_tokens"))
+            cli_found = self._scan_cli_compactions(n)
         self.append_ledger(n, engine, model, before, transition, compaction=compaction)
         if notes:
             reply = (reply + "\n\n" if reply else "") + "\n".join(f"_{x}_" for x in notes)
         record = {"n": n, "at": started, "engine": engine, "model": model, "events": [ev["id"] for ev in events],
-                  "reacted": reacted, "duration_s": round(time.time() - started, 3)}
+                  "reacted": reacted, "duration_s": round(time.time() - started, 3),
+                  "message_bytes": self._last_message_bytes}
+        if is_claude:
+            record["cli_compacted"] = cli_found
         for k in ("tokens", "input_tokens", "context_tokens"):
             if usage.get(k) is not None:
                 record[k] = usage[k]
@@ -2363,6 +2804,7 @@ class Supervisor:
             if handoff_text:
                 preamble = preamble + "\n\n# MANAGER-HANDOFF.md\n" + handoff_text.rstrip()
             message = preamble + "\n\n" + message
+        self._last_message_bytes = len(message.encode("utf-8"))
         if read_engine(self.home, self.engines)["mode"] == "persistent":
             result = self._invoke_persistent(name, spec, message, model)
             if result is not None:
@@ -2638,9 +3080,9 @@ class Supervisor:
         body = message
         if not preamble and message.startswith("[memory]"):
             preamble, _, body = message.partition("\n\n")
-        prefix = ["# MANAGER-HANDOFF.md", (self.read_handoff() or "(none)").rstrip(),
-                  "", "# factory/state.json", read_text(state_path(self.home, self.repo), "{}").rstrip(), ""]
+        prefix = ["# MANAGER-HANDOFF.md", (self.read_handoff() or "(none)").rstrip(), ""]
         full = (preamble + "\n\n" if preamble else "") + "\n".join(prefix) + "\n" + body
+        self._last_message_bytes = len(full.encode("utf-8"))
         last = self.path("logs", "codex-last-message.txt")
         with contextlib.suppress(FileNotFoundError):
             os.remove(last)
@@ -2691,23 +3133,7 @@ class Supervisor:
 
     # ---- compaction (loops/b4.md)
     def compaction_config(self):
-        cfg = self.config.get("compaction")
-        cfg = cfg if isinstance(cfg, dict) else {}
-        out = dict(COMPACTION_DEFAULTS)
-        for k in ("threshold_tokens", "max_bytes", "codex_every_turns", "retry_after_s"):
-            if cfg.get(k) is not None:
-                with contextlib.suppress(TypeError, ValueError):
-                    out[k] = int(cfg[k])
-        if cfg.get("over_ratio") is not None:
-            with contextlib.suppress(TypeError, ValueError):
-                out["over_ratio"] = float(cfg["over_ratio"])
-        qh = cfg.get("quiet_hours")
-        if isinstance(qh, (list, tuple)) and len(qh) == 2:
-            with contextlib.suppress(TypeError, ValueError):
-                out["quiet_hours"] = [int(qh[0]) % 24, int(qh[1]) % 24]
-        if cfg.get("quiet_hours_tz"):
-            out["quiet_hours_tz"] = str(cfg["quiet_hours_tz"])
-        return out
+        return _compaction_config(self.config.get("compaction"))
 
     def compaction_state(self):
         return read_compaction_state(self.home)
@@ -2782,38 +3208,104 @@ class Supervisor:
     def last_claude_context_tokens(self):
         """The last measured Claude turn's context_tokens (requirement 4, loops/b7.md); unknown (None) when no
         Claude turn ever measured it. Replaces the old aggregate `input_tokens` lookup."""
-        for t in reversed(self.turns()):
-            if t.get("context_tokens") is not None and t.get("kind") != "compaction" \
-                    and family_of(str(t.get("engine") or ""), self.engines) == "claude":
-                return t["context_tokens"]
-        return None
+        ctx, _ = _last_measured_claude_turn(self.home, self.engines)
+        return ctx
+
+    def _scan_cli_compactions(self, turn_n):
+        """Requirement 3, loops/b11.md: scan the current session's transcript from the recorded byte offset for
+        new `compact_boundary` records, record them in `logs/compaction.json` (newest 50) and `transcript_scan`
+        (reset to the file's start when the path differs from the recorded one or the file is shorter than the
+        offset). Returns True when a boundary was found (never raises: a missing/unreadable transcript or a
+        scan error is logged once and the caller's turn completes)."""
+        sid = self.session_id() or None
+        path = None
+        try:
+            path = find_claude_transcript(self.path(".claude"), self.home, sid)
+            if not path:
+                # a path that exists but is not a readable file (a directory left at the transcript's name) is an
+                # unreadable episode: one diagnostic naming it, not one per turn
+                stray = next((c for c in (os.path.join(d, f"{sid}.jsonl") for d in claude_project_dirs(self.path(".claude"), self.home))
+                              if sid and os.path.lexists(c)), None) if sid else None
+                if stray:
+                    self._note_unreadable_transcript(stray, "not a readable file")
+                return False
+            state = self.compaction_state()
+            scan = state.get("transcript_scan") or {}
+            size = os.path.getsize(path)
+            offset = scan.get("offset") or 0
+            if scan.get("path") != path or size < offset:
+                offset = 0
+            with open(path, "rb") as f:
+                f.seek(offset)
+                data = f.read()
+            if state.get("transcript_unreadable"):
+                state.pop("transcript_unreadable", None)  # the episode ended: the next failure logs again
+            recs, consumed = cli_compactions_since(data, 0)
+            cli_list = list(state.get("cli_compactions") or [])
+            known_at = {r.get("at") for r in cli_list}
+            new_recs = [r for r in recs if (r.get("at") or self.now()) not in known_at]
+            found = bool(new_recs)
+            if found:
+                for r in new_recs:
+                    cli_list.append({"at": r.get("at") or self.now(), "turn": turn_n})
+                state["cli_compactions"] = cli_list[-50:]
+            state["transcript_scan"] = {"path": path, "offset": offset + consumed}
+            self.save_compaction_state(state)
+            return found
+        except OSError as e:
+            self._note_unreadable_transcript(path or "(unknown)", str(e))
+            return False
+
+    def _note_unreadable_transcript(self, path, why):
+        """Requirement 3, loops/b11.md: an unreadable transcript is logged once per unreadable episode (the
+        flag in `logs/compaction.json` clears when a scan of that path succeeds), never on every turn."""
+        state = self.compaction_state()
+        if state.get("transcript_unreadable") == path:
+            return
+        state["transcript_unreadable"] = path
+        self.save_compaction_state(state)
+        log(f"cli compaction scan: transcript unreadable at {path}: {why}")
 
     def compaction_pending(self):
         """A compaction is scheduled (by tokens, by bytes, or forced) and has not run yet."""
         return bool(self.compaction_state().get("pending")) or os.path.exists(self.path("COMPACT"))
 
     def compaction_due(self):
-        """(due, reason): forced (`hydra compact`/`COMPACT`) always; otherwise due only for a qualified
-        emergency rollover (requirement 6, loops/b8.md: automatic rollover is emergency-only -- an ordinary
-        token/byte threshold, however far over, no longer schedules one by itself); never twice without
-        consuming the trigger, nor inside the back-off after a failed attempt."""
+        """(due, reason): forced (`hydra compact`/`COMPACT`) always, never guarded; else a qualified emergency
+        rollover (requirement 6, loops/b8.md, unchanged); else an ordinary tokens/bytes overage (requirement 1,
+        loops/b11.md, amendment 2026-10-14): the last measured Claude context strictly over `threshold_tokens`
+        (`over_ratio` is retired), or a `bytes` pending. Three guards apply to tokens/bytes (never to forced): the failure back-off, an
+        outstanding rollover verification, and the Claude engine family -- a stale Claude measurement never
+        compacts while another engine family is selected."""
         if os.path.exists(self.path("COMPACT")):
             return True, "forced"
         state = self.compaction_state()
-        emergency = state.get("emergency_pending")
-        if not emergency or state.get("verify"):
-            return False, None
         cfg = self.compaction_config()
+        verify_pending = bool(state.get("verify"))
         failed = parse_iso(state.get("failed_at"))
-        if failed and (self.clock_dt() - failed).total_seconds() < cfg["retry_after_s"]:
+        backoff = bool(failed and (self.clock_dt() - failed).total_seconds() < cfg["retry_after_s"])
+        if state.get("emergency_pending"):
+            if verify_pending or backoff:
+                return False, None
+            return True, "emergency"
+        if verify_pending or backoff:
             return False, None
-        return True, "emergency"
+        if family_of(current_engine(self.home), self.engines) != "claude":
+            return False, None
+        ctx = self.last_claude_context_tokens()
+        if ctx is not None and ctx > cfg["threshold_tokens"]:
+            return True, "tokens"
+        if (state.get("pending") or {}).get("reason") == "bytes":
+            return True, "bytes"
+        return False, None
 
     def schedule_compaction(self, context_tokens):
         """After a Claude turn: context tokens over `threshold_tokens`, or the session file grown by more than
         `max_bytes` since the last compaction (the file never shrinks, so growth is what counts), schedules a
         compaction before the next turn. A turn under both limits clears the schedule; a turn without usage keeps
-        it (requirement 4, loops/b7.md: context_tokens drives scheduling, never aggregate input_tokens)."""
+        it (requirement 4, loops/b7.md: context_tokens drives scheduling, never aggregate input_tokens). Clearing
+        the schedule also resets the held-episode buildlog guard (requirement 2, loops/b11.md): the next overage
+        is a new episode and posts its one held line again."""
         cfg = self.compaction_config()
         state = self.compaction_state()
         at = self.now()
@@ -2831,6 +3323,8 @@ class Supervisor:
         if pending and previous.get("reason") == pending["reason"] and previous.get("since"):
             pending["since"] = previous["since"]
         state["pending"] = pending
+        if pending is None:
+            state["held_posted"] = False
         self.save_compaction_state(state)
         return pending
 
@@ -2891,8 +3385,7 @@ class Supervisor:
     # id replacement, instead of `/compact`. `rollover-intent.json` survives a crash at any point.
 
     def rollover_enabled(self):
-        cfg = self.config.get("compaction")
-        return bool((cfg if isinstance(cfg, dict) else {}).get("rollover_enabled"))
+        return bool(self.compaction_config()["rollover_enabled"])
 
     def rollover_intent_path(self):
         return self.path("rollover-intent.json")
@@ -2950,7 +3443,7 @@ class Supervisor:
         self.persistence_checkpoint("rollover_recovered")
         self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": bool(intent.get("started"))})
 
-    def _finish_rollover_bookkeeping(self, intent, before_dir=None):
+    def _finish_rollover_bookkeeping(self, intent, before_dir=None, message_bytes=None):
         """The durable last/verify state, the one successful-compaction ledger entry and the original
         COMPACT/pending trigger consumption for a single rollover (requirement 22, loops/b7.md: B3). Idempotent:
         safe to call again on an already-finished rollover (restart, or a repeated checkpoint crash) without a
@@ -2976,7 +3469,7 @@ class Supervisor:
                                kind="compaction", compaction=None)
             append_jsonl(self.path("logs", "turns.jsonl"),
                         {"n": turn, "at": time.time(), "engine": name, "model": model, "events": [],
-                         "duration_s": 0.0, "kind": "compaction"})
+                         "duration_s": 0.0, "kind": "compaction", "message_bytes": message_bytes})
 
     def replace_session_id(self, new_id):
         """Atomically replace `$HYDRA_HOME/session-id` with `new_id` (os.replace); raises on write failure without
@@ -3140,9 +3633,13 @@ class Supervisor:
             rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": None, "reason": reason,
                    "error": "held: automatic rollover is disabled (compaction.rollover_enabled is false)"}
             state["last"] = rec
-            state["pending"] = None
             with contextlib.suppress(FileNotFoundError):
                 os.remove(self.path("COMPACT"))
+            if not state.get("held_posted"):
+                limit = int(self.compaction_config()["threshold_tokens"])
+                self.buildlog(f"hydra-manager: compaction held (rollover disabled): context {before_tokens} over "
+                              f"{limit}; enable compaction.rollover_enabled")
+                state["held_posted"] = True
             self.save_compaction_state(state)
             log(f"compaction held: rollover disabled; session {old_id or '-'} kept")
             return rec
@@ -3160,6 +3657,7 @@ class Supervisor:
             before_dir = dir_hashes(self.memory_dir)
             log(f"compaction ({reason}) on {name}: [compaction] turn")
             rc, out, err, usage = self.invoke(name, spec, COMPACTION_MESSAGE, model)
+            mb = self._last_message_bytes
             if rc != 0:
                 error = f"[compaction] turn failed on {name} (rc={rc}): {(err or out or '').strip()[-200:]}"
             else:
@@ -3175,6 +3673,8 @@ class Supervisor:
                     old_id = self.session_id()  # the compaction turn itself may have just bootstrapped this
                     # id (there was no prior session at all): the actual "old" side of this rollover is whatever
                     # session that turn ran on, not the empty value read before invoke().
+                    self._scan_cli_compactions(n)  # requirement 3, loops/b11.md: the OLD session's transcript,
+                    # before the id below is replaced
                     new_id = str(uuid.uuid4())
                     intent = {"old_id": old_id, "new_id": new_id, "started": False, "turn": n, "reason": reason,
                               "before_tokens": before_tokens, "at": at, "engine": name, "model": model}
@@ -3187,7 +3687,8 @@ class Supervisor:
                         error = f"session replacement failed: {e}"
                     else:
                         self.persistence_checkpoint("rollover_id_replaced")
-                        self._finish_rollover_bookkeeping(intent, before_dir)
+                        self._scan_cli_compactions(n)  # requirement 3: the NEW session's transcript
+                        self._finish_rollover_bookkeeping(intent, before_dir, message_bytes=mb)
                         self.persistence_checkpoint("rollover_state_saved")
                         self._write_rollover_intent({"old_id": old_id, "new_id": new_id, "started": False})
                         log(f"rollover done: session {old_id} -> {new_id}; the next Claude turn verifies it")
@@ -3197,7 +3698,6 @@ class Supervisor:
                "error": error}
         state["last"] = rec
         state["pending"] = pending or None
-        state["baseline_bytes"] = self.session_file_size()
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("COMPACT"))
         self._compaction_outcome(state, rec)
@@ -3601,10 +4101,10 @@ class Supervisor:
         except ValueError as e:
             log(f"track migration skipped: {e}")
 
-    def state_block(self):
-        """`# factory/state.json` plus its (migrated) content, for every engine's prompt, not only Codex's."""
-        text = read_text(state_path(self.home, self.repo), "{}").rstrip()
-        return f"# factory/state.json\n{text}\n" if text and text != "{}" else ""
+    def state_digest(self, events):
+        """A bounded digest of `factory/state.json` (requirement 5, loops/b11.md), for every engine's prompt
+        (Claude per-turn, Claude persistent, Codex), replacing the whole-file `state_block` prefix."""
+        return build_state_digest(self.home, self.repo, events)
 
     # ---- work-status.json: the manager-owned scheduling input (requirement 16, loops/b7.md)
 
@@ -4118,13 +4618,296 @@ class Supervisor:
         return self._persistence_recovered(local_sha)
 
     # ---- the service loop
-    def add_timer_event(self, now=None):
+    # ---- the gated timer (requirement 10, loops/b11.md): a Python change check, a wake only on a difference
+    def add_timer_event(self, now=None, text=None, digest=False):
+        """One timer event per `every_s` slot: `timer-<slot>` for the default 900 s interval (the baseline
+        contract), `timer-<every_s>-<slot>` for any other interval (requirement 11), None when the slot's event
+        exists already. `text` is the gated check's reason line; without one the bare instruction is used."""
         now = now if now is not None else time.time()
-        slot = int(now // TIMER_EVERY_S)
-        eid = f"timer-{slot}"
+        every_s = timer_config(self.home)["every_s"]
+        slot = int(now // every_s)
+        eid = f"timer-{slot}" if every_s == TIMER_DEFAULTS["every_s"] else f"timer-{every_s}-{slot}"
         if eid in handled_ids(self.home) or any(ev.get("id") == eid for ev in pending_events(self.home)):
             return None
-        return append_event(self.home, new_event("timer", {"text": TIMER_TEXT, "instructs": False}, event_id=eid))
+        payload = {"text": text or ("timer: " + TIMER_BARE_REASON), "instructs": False}
+        if digest:
+            payload["digest"] = True
+            payload["channel"] = load_config(self.home).get("dev_channel") or self.dev_channel
+        return append_event(self.home, new_event("timer", payload, event_id=eid))
+
+    def timer_snapshot_path(self):
+        return self.path(TIMER_SNAPSHOT)
+
+    def _timer_gh(self, cfg, path):
+        """`<gh_bin> api <path>`: JSON from stdout, a 30 s timeout, no --jq, no --paginate (requirement 10a)."""
+        p = subprocess.run([cfg["gh_bin"], "api", path], capture_output=True, text=True, timeout=TIMER_GH_TIMEOUT_S)
+        if p.returncode != 0:
+            raise RuntimeError(f"gh api {path}: rc={p.returncode}: {(p.stderr or '').strip()[:200]}")
+        return json.loads(p.stdout or "null")
+
+    def _timer_github_repo(self, cfg, repo, previous, at_dt):
+        """One repository's observation (requirement 10a). The issues cursor is this repo's previous successful
+        check (`last_ok`), a day before this check for a fresh snapshot; the cumulative issues map keeps the
+        newest 200 numbers."""
+        gh = lambda path: self._timer_gh(cfg, path)  # noqa: E731
+        since = previous.get("last_ok") or _iso(at_dt - _dt.timedelta(days=1))
+        issues = dict(previous.get("issues") or {})
+        for issue in gh(f"repos/{repo}/issues?state=open&since={since}&per_page=100") or []:
+            if not isinstance(issue, dict) or issue.get("pull_request"):
+                continue
+            issues[str(issue.get("number"))] = issue.get("updated_at")
+        if len(issues) > TIMER_ISSUES_KEPT:
+            keep = sorted(issues, key=lambda x: int(x) if x.isdigit() else 0)[-TIMER_ISSUES_KEPT:]
+            issues = {k: issues[k] for k in keep}
+        head = (gh(f"repos/{repo}/commits/HEAD") or {}).get("sha")
+        prs = {}
+        for pr in gh(f"repos/{repo}/pulls?state=open&per_page=100") or []:
+            num = str(pr.get("number"))
+            head_sha = (pr.get("head") or {}).get("sha")
+            detail = gh(f"repos/{repo}/pulls/{num}") or {}
+            reviews = gh(f"repos/{repo}/pulls/{num}/reviews?per_page=100") or []
+            runs = (gh(f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100") or {}).get("check_runs") or []
+            labels = sorted(str(l.get("name")) for l in (pr.get("labels") or []) if isinstance(l, dict))
+            conclusions = sorted("pending" if r.get("conclusion") is None else str(r.get("conclusion")) for r in runs)
+            newest = reviews[-1].get("state") if reviews else "none"
+            prs[num] = {"head": head_sha, "updated_at": pr.get("updated_at"), "labels": ",".join(labels),
+                        "comments": int(detail.get("comments") or 0) + int(detail.get("review_comments") or 0),
+                        "reviews": f"{len(reviews)} {newest}", "checks": ",".join(conclusions),
+                        "login": (pr.get("user") or {}).get("login")}
+        return {"head": head, "prs": prs, "issues": issues, "last_ok": _iso(at_dt)}
+
+    def _timer_coder(self, cfg):
+        """The coder log directories (requirement 10b): an unreadable directory or glob raises (a failure of the
+        source); an unparsable or absent file inside a directory is that file's null."""
+        import glob as _glob
+        out = {}
+        for d in sorted(_glob.glob(cfg["coder_logs_glob"])):
+            if not os.path.isdir(d):
+                continue
+            names = os.listdir(d)  # PermissionError here fails the source
+            entry = {"files": {}}
+            for fname, keys in (("status.json", ("state", "exit_code")), ("result.json", ("pass", "exit_code", "disposition")),
+                                ("completion.json", ("pass", "exit_code", "disposition")),
+                                ("coder-result.json", ("pass", "exit_code", "disposition"))):
+                data = None
+                if fname in names:
+                    try:
+                        loaded = json.loads(read_text(os.path.join(d, fname), "") or "null")
+                        data = {k: loaded.get(k) for k in keys} if isinstance(loaded, dict) else None
+                    except (OSError, json.JSONDecodeError):
+                        data = None
+                entry["files"][fname] = data
+            pid = None
+            try:
+                launcher = json.loads(read_text(os.path.join(d, "launcher.json"), "") or "null")
+                pid = launcher.get("pid") if isinstance(launcher, dict) else None
+            except (OSError, json.JSONDecodeError):
+                pid = None
+            entry["pid"] = pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+            entry["pid_alive"] = bool(entry["pid"] and pid_alive(entry["pid"]))
+            entry["exit_files"] = sorted(n for n in names if "exit" in n)
+            out[os.path.basename(d)] = entry
+        return out
+
+    def _timer_dogfood(self, cfg, previous):
+        """The dogfood unit, health and checkout (requirement 10e); only when `timer.dogfood` is configured."""
+        dog = cfg["dogfood"]
+        systemctl = dog.get("systemctl_bin") or "systemctl"
+        p = subprocess.run([systemctl, "is-active", str(dog.get("unit"))], capture_output=True, text=True, timeout=TIMER_GH_TIMEOUT_S)
+        unit = (p.stdout or "").splitlines()[0].strip() if (p.stdout or "").strip() else ""
+        if not unit:
+            raise RuntimeError(f"{systemctl} is-active: empty output (rc={p.returncode})")
+        health = "error"
+        if dog.get("health_url"):
+            try:
+                with urllib.request.urlopen(dog["health_url"], timeout=TIMER_HEALTH_TIMEOUT_S) as r:
+                    health = int(r.status)
+            except urllib.error.HTTPError as e:
+                health = int(e.code)
+            except (OSError, ValueError) as e:
+                health = f"error: {str(e)[:80]}"
+        streak = (previous.get("health_streak") or 0) + 1 if health != 200 else 0
+        sha = None
+        if dog.get("checkout"):
+            g = subprocess.run(["git", "-C", str(dog["checkout"]), "rev-parse", "HEAD"], capture_output=True, text=True,
+                               timeout=TIMER_GH_TIMEOUT_S)
+            if g.returncode != 0:
+                raise RuntimeError(f"git rev-parse in {dog['checkout']}: {(g.stderr or '').strip()[:120]}")
+            sha = g.stdout.strip()
+        return {"unit": unit, "health": health, "health_streak": streak, "sha": sha}
+
+    def _timer_in_flight(self, snap, work_status):
+        """What is in flight for the max-silence wake (requirement 10): a live coder launcher, an open PR by the
+        manager's GitHub login, a `waiting` record on someone other than L with a deadline; never L alone."""
+        items = []
+        for name, entry in sorted((snap.get("coder") or {}).items()):
+            if entry.get("pid_alive"):
+                items.append(f"coder {name}")
+        login = snap.get("manager_login")
+        for repo, entry in sorted((snap.get("github") or {}).items()):
+            for num, pr in sorted((entry.get("prs") or {}).items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+                if login and pr.get("login") == login:
+                    items.append(f"{repo.rsplit('/', 1)[-1]} PR #{num}")
+        if isinstance(work_status, dict) and work_status.get("mode") == "waiting":
+            who = work_status.get("who")
+            if isinstance(who, str) and who and not who.startswith("L") and _ws_num(work_status.get("deadline")) is not None:
+                items.append(f"waiting on {who}")
+        return items
+
+    def timer_tick(self, now=None):
+        """Requirement 10, loops/b11.md: the change check behind every timer slot. Reads the sources in order
+        (GitHub, coder runs, work-status, persistence, dogfood, engine-runtime), each independently guarded,
+        compares them with `logs/timer-snapshot.json`, adds the forced wakes (the daily digest, max silence while
+        something is in flight), queues one timer event only when there is a reason, appends one record to
+        `logs/timer-checks.jsonl` and returns it. No engine call, ever."""
+        started = time.monotonic()
+        at_dt = self.clock_dt() if now is None else _dt.datetime.fromtimestamp(float(now), _dt.timezone.utc)
+        now_epoch = at_dt.timestamp()
+        at = _iso(at_dt)
+        cfg = timer_config(self.home)
+        try:
+            snap = _timer_strict_json(self.timer_snapshot_path())
+        except (OSError, ValueError):
+            snap = {}
+        fresh = not snap
+        snap.setdefault("failures", {})
+        reasons = []
+
+        def failed(source, exc):
+            n = int(snap["failures"].get(source) or 0) + 1
+            snap["failures"][source] = n
+            log(f"timer check: {source} failed ({n}): {exc}")
+            if n == TIMER_FAILURE_WAKE_AT:
+                reasons.append(f"check failing: {source}")
+
+        def ok(source):
+            snap["failures"].pop(source, None)
+
+        # (a) GitHub
+        github = dict(snap.get("github") or {})
+        if cfg["github_repos"] and not snap.get("manager_login"):
+            try:
+                snap["manager_login"] = (self._timer_gh(cfg, "user") or {}).get("login")
+            except Exception as e:  # noqa: BLE001 - one source never stops the others
+                log(f"timer check: gh api user failed: {e}")
+        for repo in cfg["github_repos"]:
+            source = f"github:{repo}"
+            try:
+                obs = self._timer_github_repo(cfg, repo, github.get(repo) or {}, at_dt)
+            except Exception as e:  # noqa: BLE001
+                failed(source, e)
+                continue
+            ok(source)
+            if repo in github:
+                reasons.extend(_github_reasons(repo, github[repo], obs))
+            github[repo] = obs
+        snap["github"] = github
+        # (b) coder runs
+        try:
+            coder = self._timer_coder(cfg)
+        except Exception as e:  # noqa: BLE001
+            failed("coder", e)
+        else:
+            ok("coder")
+            if "coder" in snap:
+                reasons.extend(_coder_reasons(snap["coder"], coder))
+            snap["coder"] = coder
+        # (c) work-status deadlines
+        work_status = None
+        try:
+            work_status = _timer_strict_json(self.path("work-status.json"))
+        except Exception as e:  # noqa: BLE001
+            failed("work-status", e)
+            work_status = None
+        else:
+            ok("work-status")
+            ws_snap = dict(snap.get("work_status") or {})
+            deadline = _ws_num(work_status.get("deadline")) if work_status.get("mode") in ("idle", "waiting") else None
+            if deadline is not None and deadline <= now_epoch \
+                    and ws_snap.get("fired_deadline") != deadline:
+                reasons.append(f"work-status deadline {now_iso(deadline)} passed")
+                ws_snap["fired_deadline"] = deadline
+            snap["work_status"] = ws_snap
+        # (d) persistence
+        try:
+            pers = _timer_strict_json(self.path("logs", "persistence.json"))
+        except Exception as e:  # noqa: BLE001
+            failed("persistence", e)
+        else:
+            ok("persistence")
+            triple = {k: pers.get(k) for k in ("status", "error", "pending_local_sha")}
+            if "persistence" in snap and triple != snap["persistence"] and triple.get("status") != "synced":
+                reasons.append(f"persistence status {triple.get('status')}")
+            snap["persistence"] = triple
+        # (e) the dogfood
+        if isinstance(cfg.get("dogfood"), dict):
+            try:
+                dog = self._timer_dogfood(cfg, snap.get("dogfood") or {})
+            except Exception as e:  # noqa: BLE001
+                failed("dogfood", e)
+            else:
+                ok("dogfood")
+                prev = snap.get("dogfood")
+                if prev is not None:
+                    if dog["unit"] != prev.get("unit"):
+                        reasons.append(f"dogfood unit {dog['unit']}")
+                    if dog["health_streak"] == 2:
+                        reasons.append(f"dogfood /health {dog['health']} twice")
+                    if dog.get("sha") != prev.get("sha"):
+                        reasons.append(f"dogfood sha {_short_sha(prev.get('sha'))} -> {_short_sha(dog.get('sha'))}")
+                snap["dogfood"] = dog
+        # (f) engine-runtime
+        try:
+            runtime = _timer_strict_json(self.path("engine-runtime.json"))
+        except Exception as e:  # noqa: BLE001
+            failed("engine-runtime", e)
+        else:
+            ok("engine-runtime")
+            pair = {"episode_id": runtime.get("episode_id"), "active": bool(runtime.get("active"))}
+            prev = snap.get("engine_runtime")
+            if prev is not None and pair != prev:
+                if pair["active"]:
+                    reasons.append(f"fallback episode {pair['episode_id']} started")
+                elif prev.get("active"):
+                    reasons.append(f"fallback episode {prev.get('episode_id')} ended")
+            snap["engine_runtime"] = pair
+        # the forced wakes
+        digest = False
+        try:
+            local = at_dt.astimezone(zoneinfo.ZoneInfo(cfg["digest_tz"]))
+            hh, mm = (int(x) for x in str(cfg["digest_at"]).split(":")[:2])
+            due = (local.hour, local.minute) >= (hh, mm)
+            today = local.date().isoformat()
+            if due and snap.get("digest_date") != today:
+                if not fresh:
+                    reasons.append("daily digest")
+                    digest = True
+                snap["digest_date"] = today  # a snapshot initialised after digest_at never catches up
+        except Exception as e:  # noqa: BLE001
+            log(f"timer check: daily digest clock failed: {e}")
+        turns_rows = self.turns()
+        newest_n = turns_rows[-1].get("n") if turns_rows else None
+        if newest_n != snap.get("last_turn_n"):
+            snap["last_turn_n"] = newest_n
+            snap["last_turn_seen_at"] = now_epoch
+        in_flight = self._timer_in_flight(snap, work_status)
+        if fresh:
+            reasons.insert(0, "snapshot initialised")
+        else:
+            ref = max(float(snap.get("last_wake_at") or 0), float(snap.get("last_turn_seen_at") or 0))
+            silence = now_epoch - ref
+            if in_flight and ref and silence >= cfg["max_silence_s"]:
+                reasons.append(f"max silence {int(silence)}s; in flight: {', '.join(in_flight)}")
+        woke = bool(reasons)
+        if woke:
+            self.add_timer_event(now_epoch, text="timer: " + "; ".join(reasons), digest=digest)
+            snap["last_wake_at"] = now_epoch
+            snap["last_wake"] = {"at": at, "reasons": reasons}
+        rec = {"at": at, "woke": woke, "reasons": reasons, "cost_ms": int((time.monotonic() - started) * 1000)}
+        snap["last_check"] = rec
+        append_jsonl(self.path(TIMER_CHECKS), rec)
+        write_text(self.timer_snapshot_path(), json.dumps(snap, indent=1) + "\n")  # only after a completed check
+        return rec
 
     def deadman_due(self, now=None):
         """True when events are queued and neither a turn nor a heartbeat happened in the last DEADMAN_S."""
@@ -4148,7 +4931,7 @@ class Supervisor:
     def loop(self, sleep_s=LOOP_SLEEP_S):
         log(f"service loop, home={self.home}, repo={self.repo or '-'}")
         write_text(self.path("logs", "supervisor.pid"), f"{os.getpid()}\n")
-        last_timer = 0.0
+        last_timer = None  # when the last every_s slot was handled (checked, or consumed while paused)
 
         def watchdog():
             while True:
@@ -4162,17 +4945,32 @@ class Supervisor:
 
         threading.Thread(target=watchdog, daemon=True).start()
         while True:
-            now = time.time()
-            if now - last_timer >= TIMER_EVERY_S:
-                last_timer = now
+            # requirement 10, loops/b11.md: one gated change check per elapsed `timer.every_s` slot on the
+            # supervisor's clock (the interval re-read every iteration), never while paused
+            now = self.clock_epoch()
+            every_s = timer_config(self.home)["every_s"]
+            if last_timer is None or int(now // every_s) != int(last_timer // every_s):
+                last_timer = now  # a paused slot is consumed without a check; a changed interval renumbers
+                # the slots without an extra check
                 if not self.paused():
-                    self.add_timer_event(now)
+                    try:
+                        self.timer_tick(now)
+                    except Exception as e:  # noqa: BLE001 - the check never takes the loop down
+                        log(f"timer_tick raised: {e}")
             try:
                 ran = self.run_once()
             except Exception as e:
                 log(f"run_once raised: {e}")
                 ran = False
-            time.sleep(0 if ran else sleep_s)
+            self._loop_sleep(0 if ran else sleep_s)
+
+    def _loop_sleep(self, seconds):
+        """The service loop's wait: the injected `sleep` when the Supervisor was given one (so the acceptance can
+        drive the loop on a controlled clock, as `_heartbeat_wait` does), else the wall clock."""
+        if self.sleep is None:
+            time.sleep(seconds)
+        else:
+            self.sleep(seconds)
 
 
 def _digest(path):

@@ -34,7 +34,9 @@ inbox/outbox-failed.jsonl   outbox lines set aside after 5 failed posts (with at
 inbox/files/<ts>-<name>     attachments downloaded by the bridge
 mirror/<channel>.jsonl      every message in a channel the bot is in (copied to factory/log/ and committed)
 logs/turns.jsonl            {n, at, engine, model, events, reacted, duration_s, tokens?, input_tokens?, kind?, error?} per turn (kind: compaction for the compaction turn; reacted: the Slack message ts the working indicator went on)
-logs/compaction.json        the compaction policy's state: pending, verify, last, failed_at, fail_posted, baseline_bytes
+logs/compaction.json        the compaction policy's state: pending, verify, last, failed_at, fail_posted, baseline_bytes, held_posted, cli_compactions, transcript_scan
+logs/timer-snapshot.json    the gated timer's last observation of every source (loops/b11.md requirement 10); one JSON object
+logs/timer-checks.jsonl     one {at, woke, reasons, cost_ms} row per timer check, newest last; a log, never truncated
 logs/reactions.json         {event id: {channel, ts, thread_ts, name, at}}: the reactions the working indicator has standing on messages (name: eyes, hourglass_flowing_sand or x)
 logs/outbox.json            {posted, failed, last_at}: what the bridge has posted from the outbox (`hydra status` shows it)
 logs/bridge.pid             the bridge service's pid: `hydra post` waits for the post when a bridge is alive
@@ -54,7 +56,10 @@ budgets.json                {"turns_per_hour": n, "claude_turns_per_day": {"clau
 allowlist.json              {slack user or bot id: {"instructs": true|false}}
 config.json                 optional: {"repo": <faden clone>, "dev_channel": "C…", "engines": {...}, "buildlog_webhook": url,
                             "codex_home": <Codex's $CODEX_HOME, default ~/.codex>, "transition": {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": true},
-                            "compaction": {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "quiet_hours": [2, 5], "quiet_hours_tz": "local"},
+                            "compaction": {"threshold_tokens": 300000, "max_bytes": 50000000, "codex_every_turns": 25, "rollover_enabled": true, "quiet_hours": [2, 5], "quiet_hours_tz": "local"},
+                            "timer": {"every_s": 900, "digest_at": "07:00", "digest_tz": "America/Los_Angeles", "max_silence_s": 14400, "gh_bin": "gh",
+                                      "github_repos": ["faden-systems/faden", "faden-systems/hydra-agent"], "coder_logs_glob": "/srv/hydra/coder/*-logs",
+                                      "dogfood": {"unit": "fitflow-dogfood", "health_url": "http://127.0.0.1:8082/health", "checkout": "/srv/hydra/repos/faden-verify-sf1"}},
                             "reactions": {"heartbeat_seconds": 20}}
 credentials/                claude-r2d2.env, claude-l.env (CLAUDE_CODE_OAUTH_TOKEN=…), slack.env (SLACK_BOT_TOKEN, SLACK_APP_TOKEN), buildlog.env (BUILDLOG_WEBHOOK)
 PAUSE                       present: no turn runs; content is who paused
@@ -302,11 +307,22 @@ The supervisor keeps it within `compaction.threshold_tokens` (default 300000):
   usage; a plain-text `[usage] input_tokens=N` line is read the same way). A turn over the threshold, or a session
   file (`$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<session-id>.jsonl`) that grew by more than `compaction.max_bytes`
   (default 50 MB) since the last compaction (the file never shrinks, so growth is what counts), schedules a compaction
-  before the next turn (`logs/compaction.json: pending`; `hydra status` says `compaction: pending (...)`).
-- When the limit is crossed by less than 25% the compaction waits for `compaction.quiet_hours` (default `[2, 5]`,
-  02:00 to 05:00) evaluated in `compaction.quiet_hours_tz` (`local`, the VM's zone, by default; `UTC` or any IANA
-  name); 25% or more over, it runs immediately before the next turn. The timer events keep turns coming, so a
-  deferred compaction runs in the first quiet-hours turn.
+  before the next turn (`logs/compaction.json: pending`; `hydra status` shows the measured context and `; compaction: due (<reason>)`).
+- A measured Claude context strictly over `compaction.threshold_tokens` is due before the very next turn, with or
+  without queued events (`loops/b11.md` requirement 1, amendment 2026-10-14; the former `over_ratio` band is retired
+  and a configured value is ignored with one log line per start). Only three guards apply: the back-off after a
+  failed rollover, an outstanding verification of the previous rollover, and the engine family (a stale Claude
+  measurement never compacts while Codex is selected). `compaction.quiet_hours`/`quiet_hours_tz` gate the daily
+  restart of the persistent mode only.
+- `compaction.rollover_enabled` is on by default. With an explicit `false` the compaction is held: no engine call,
+  `last.error` starts `held:`, `pending` stays, a forced `COMPACT` is consumed, and one buildlog line per held
+  episode `hydra-manager: compaction held (rollover disabled): context <N> over <limit>; enable
+  compaction.rollover_enabled` (an episode ends when a measured turn clears `pending`).
+- `hydra status` shows one line, one number: `context: <N> tokens (turn <n>) | due over <limit> | last compaction:
+  <at> (<before> -> <after>|failed|unverified|held)` or `<at> (cli)` for a compaction the Claude CLI did on its
+  own (detected from the session transcript's `compact_boundary` records, recorded in `logs/compaction.json`
+  `cli_compactions`), plus at most one suffix: `; compaction: forced` > `held` > `due (<reason>)` > `awaiting
+  verification`.
 - The compaction itself, under the WRITER lock and before the batched turn: a dedicated turn on the same session,
   `[compaction] Compact: write everything from this session that must survive into MEMORY.md (facts, decisions,
   open questions, with dates), update MANAGER-HANDOFF.md, then reply only \`compacted\`.` (its handoff and memory
@@ -327,6 +343,42 @@ The supervisor keeps it within `compaction.threshold_tokens` (default 300000):
   it to write everything durable since its last flush to `MEMORY.md` and `codex/NOTES.md` before the events.
 - The engine's side (`[compaction]`: memory, handoff, reply `compacted`, nothing else; `[flush]`) is in `CLAUDE.md`
   under "Compaction and flushes".
+
+## The gated timer (`loops/b11.md` requirements 10 and 11)
+
+A timer tick no longer wakes the model unconditionally. Once per elapsed `timer.every_s` slot the service loop runs
+`Supervisor.timer_tick()`: a pure-Python change check (no engine call) against `logs/timer-snapshot.json`, which
+queues one timer event (`timer-<slot>` for the default 900 s interval, `timer-<every_s>-<slot>` for any other; source
+`timer`, `instructs: false`) only when something differs. The event's text is `timer: <reason>; <reason>; ...`, one
+clause per difference naming the source and what changed, so the model knows without re-querying:
+`<repo> main <old> -> <new>`, `<repo> PR #<n> opened|closed`, `<repo> PR #<n> head|updated_at|labels|comments|
+reviews|checks <old> -> <new>`, `<repo> issue #<n> updated`, `coder <dir> appeared`, `coder <dir> status.json state
+<old> -> <new>`, `coder <dir> launcher pid <pid> dead`, `coder <dir> new file <name>`, `work-status deadline <ISO>
+passed`, `persistence status <new>`, `dogfood unit <state>`, `dogfood /health <code> twice`, `dogfood sha <old> ->
+<new>`, `fallback episode <id> started|ended`, `check failing: <source>`, `snapshot initialised`, `daily digest`,
+`max silence <s>s; in flight: <what>`.
+
+The `timer` section of `config.json` (read fresh on every tick; a change of `every_s` needs no restart):
+
+| key | default | meaning |
+| --- | --- | --- |
+| `every_s` | 900 | the check interval in seconds (clamped to at least 30) |
+| `digest_at` | `07:00` | the daily digest's local time; the digest event carries `digest: true` and fires once per local date, never as a catch-up after a deployment |
+| `digest_tz` | `America/Los_Angeles` | the zone `digest_at` is read in |
+| `max_silence_s` | 14400 | a forced wake after this long without a timer wake or a new turn, only while something is in flight: a coder logs directory whose launcher pid is alive, an open PR by the manager's own GitHub login, or a `waiting` work-status record on someone other than L with a deadline; never when only L is pending (clamped to at least `every_s`) |
+| `gh_bin` | `gh` | the GitHub CLI used as `<gh_bin> api <path>` (30 s timeout, JSON on stdout, no `--jq`, no `--paginate`, every list one page of `per_page=100`) |
+| `github_repos` | the two repositories | `repos/<o>/<r>/commits/HEAD`, the open PRs (head, updated_at, labels, comments + review_comments, reviews, check runs) and the open issues updated since this repo's previous successful check |
+| `coder_logs_glob` | `/srv/hydra/coder/*-logs` | the VM coder runs: `status.json` state/exit_code, `result.json`/`completion.json`/`coder-result.json` pass/exit_code/disposition, the `launcher.json` pid's liveness, files whose name contains `exit` |
+| `dogfood` | absent | `{"unit", "health_url", "checkout", "systemctl_bin"?}`: `systemctl is-active <unit>`, an HTTP GET of `health_url` (5 s; a reason only after two consecutive non-200 answers, once per streak) and `git -C <checkout> rev-parse HEAD` |
+
+Never compared: Slack (events already wake the model), branches that are not an open PR, the manager's own
+`state.json`, `MANAGER-HANDOFF.md` and memory files, `work-status.json` beyond its deadline rule (`continue` stays
+with the self-event scheduler, `done` never wakes, a `waiting` record with no deadline never polls L), and any
+mtime-only change. A source that cannot be read keeps its previous snapshot entry, counts one failure
+(`failures.<source>` in the snapshot), and wakes once on the third consecutive failure with `check failing:
+<source>` (`github:<o>/<r>`, `coder`, `work-status`, `persistence`, `dogfood`, `engine-runtime`); a success resets
+the streak. Every check appends `{"at", "woke", "reasons", "cost_ms"}` to `logs/timer-checks.jsonl`, and `hydra
+status` shows `timer: every <every_s>s | last check <at> (<cost_ms> ms) | last wake <at>: <reasons>`.
 
 ## Shared memory across engines (`factory/manager-memory/`)
 

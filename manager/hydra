@@ -263,13 +263,19 @@ def cmd_attach(home, args):
 
 
 def cmd_compact(home, args):
-    """Write the COMPACT flag; with a live loop, wait for the compaction and print its outcome (0 ok, 1 failed)."""
+    """Write the COMPACT flag; with a live loop, wait for the compaction and print its outcome (requirement 2,
+    loops/b11.md: 0 for a verified rollover, 1 for failed/held/unverified; without a live loop and rollover
+    disabled, held is reported immediately and COMPACT is never written)."""
     def marks():
         st = S.read_compaction_state(home)
         return ((st.get("last") or {}).get("at"), (st.get("verify") or {}).get("at"))
+    alive = supervisor_alive(home)
+    if not alive and not S.compaction_config_for(home)["rollover_enabled"]:
+        print("compaction held: automatic rollover is disabled (compaction.rollover_enabled is false)")
+        return 1
     before = marks()
     S.write_text(os.path.join(home, "COMPACT"), who() + "\n")
-    if not supervisor_alive(home):
+    if not alive:
         print("compaction scheduled (COMPACT): it runs before the manager's next turn; no live supervisor loop right now")
         return 0
     timeout = float(os.environ.get("HYDRA_COMPACT_TIMEOUT", "900"))
@@ -284,12 +290,19 @@ def cmd_compact(home, args):
                 print(f"compacted at {verify.get('at')} ({verify.get('before_tokens')} input tokens before); "
                       "the next turn verifies the reduction and `hydra status` shows it")
                 return 0
+            error = str(last.get("error") or "")
+            if error.startswith("held:"):
+                print(f"compaction held: {error}")
+                return 1
             if last.get("ok") is False:
                 print(f"compaction failed at {last.get('at')}: {last.get('error')}; the session is unchanged")
                 return 1
+            if last.get("ok") is None:
+                print(f"compaction unverified at {last.get('at')} ({last.get('before_tokens')} -> ?)")
+                return 1
             print(f"compaction at {last.get('at')}: {last.get('before_tokens')} -> {last.get('after_tokens')}")
             return 0
-        time.sleep(1)
+        time.sleep(0.2)
     print(f"no compaction within {timeout:.0f}s; the COMPACT flag stays, it runs before the next turn", file=sys.stderr)
     return 1
 
