@@ -471,7 +471,7 @@ def cli_compactions_detected():
     real_since = S.cli_compactions_since
 
     def spy(data, offset):
-        seen.append((len(data), offset))
+        seen.append((bytes(data), offset))
         return real_since(data, offset)
     S.cli_compactions_since = spy
     event(h, 'A'); sup.run_once()
@@ -479,9 +479,9 @@ def cli_compactions_detected():
     first_len = tpath.stat().st_size
     with tpath.open('a') as f:
         f.write(json.dumps(good) + '\n')
-    added = tpath.stat().st_size - first_len
+    appended = tpath.read_bytes()[first_len:]
     event(h, 'B'); sup.run_once()
-    check(seen and seen[-1] == (added, 0), f'the scan must hand the parser only the bytes after the recorded offset: {seen[-1:]} vs ({added}, 0)')
+    check(seen and seen[-1] == (appended, 0), f'the scan must hand the parser exactly the bytes after the recorded offset with offset 0: {[(len(b), o) for b, o in seen[-1:]]} vs ({len(appended)}, 0)')
     S.cli_compactions_since = real_since
     rec = turns(h)[-1]
     check(rec.get('cli_compacted') is True, f'the turn after a boundary must carry cli_compacted: {rec}')
@@ -967,8 +967,11 @@ class FakeGitHub:
 
     def repo(self, repo, head, prs=(), issues=()):
         self.set(f'repos/{repo}/commits/HEAD', {'sha': head})
-        self.set(f'repos/{repo}/pulls?state=open&per_page=100', [{k: v for k, v in p.items() if k not in ('reviews', 'checks')} for p in prs])
+        # the list response is the "pull request simple" shape: no comments / review_comments on it
+        self.set(f'repos/{repo}/pulls?state=open&per_page=100',
+                 [{k: v for k, v in p.items() if k not in ('reviews', 'checks', 'comments', 'review_comments')} for p in prs])
         for p in prs:
+            self.set(f"repos/{repo}/pulls/{p['number']}", {k: v for k, v in p.items() if k not in ('reviews', 'checks')})
             self.set(f"repos/{repo}/pulls/{p['number']}/reviews", p['reviews'])
             self.set(f"repos/{repo}/commits/{p['head']['sha']}/check-runs",
                      {'total_count': len(p['checks']), 'check_runs': [{'conclusion': c} for c in p['checks']]})
@@ -980,6 +983,16 @@ class FakeGitHub:
     def calls(self):
         p = self.d / 'gh-calls.log'
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def issue_sinces(self, repo):
+        """The `since` value of every issues call for `repo`, in call order."""
+        out = []
+        for argv in self.calls():
+            path = argv[1] if len(argv) > 1 else ''
+            if path.startswith(f'repos/{repo}/issues?'):
+                m = re.search(r'since=([^&]+)', path)
+                out.append(m.group(1) if m else None)
+        return out
 
 
 class Dogfood:
@@ -1242,8 +1255,20 @@ def timer_check_failures():
         gh.fail([])
         tick(None, 'recovery with unchanged data: no wake')
         check(not (snapshot(h).get('failures') or {}).get(f'github:{FADEN_REPO}'), 'a success resets the streak')
+        # the issues cursor: `since` is the `at` of this repo's previous SUCCESSFUL check; the first check of a fresh
+        # snapshot queries from a day before its own `at`; a failed check never advances it; the other repo
+        # advances its own cursor every check
+        rows = checks_log(h)   # rows[0] = the initialising check, rows[1:6] = the failing checks, rows[6] = the recovery
+        sinces = gh.issue_sinces(FADEN_REPO)
+        check(len(sinces) >= 2 and all(sinces), f'every issues call carries since: {sinces}')
+        check(sinces[0] < rows[0]['at'] and sinces[0] >= '2026-10-07', f'the first check queries since a day before its own at: {sinces[0]} vs {rows[0]["at"]}')
+        check(all(x == rows[0]['at'] for x in sinces[1:]), f'every call after the first success, failed checks and the recovery included, queries since the last SUCCESSFUL check: {sinces[1:]} vs {rows[0]["at"]}')
+        hydra_sinces = gh.issue_sinces(HYDRA_REPO)
+        check(hydra_sinces[-1] == rows[-2]['at'], f'the unaffected repo advances its own cursor every check: {hydra_sinces[-1]} vs {rows[-2]["at"]}')
         gh.fail([f'repos/{FADEN_REPO}/'])
-        tick(None, 'new streak 1'); tick(None, 'new streak 2')
+        tick(None, 'new streak 1')
+        check(gh.issue_sinces(FADEN_REPO)[-1] == rows[6]['at'], f'after the recovery the cursor is the recovery check: {gh.issue_sinces(FADEN_REPO)[-1]} vs {rows[6]["at"]}')
+        tick(None, 'new streak 2')
         tick(f'check failing: github:{FADEN_REPO}', 'new streak 3 wakes again')
         gh.fail([])
         tick(None, 'recovered')
@@ -1254,6 +1279,62 @@ def timer_check_failures():
         tick(None, 'persistence readable again (synced is no reason)')
         Path(coder, 'not-a-dir-logs').write_text('a file where a directory is expected')
         tick(None, 'a stray file matching the coder glob is skipped, not a failure')
+    finally:
+        dog.close()
+
+
+def timer_source_isolation():
+    """Requirement 10: every source is independently guarded: an unreadable coder directory, an invalid
+    work-status.json, an invalid engine-runtime.json and a missing systemctl each keep their snapshot entry, never
+    stop the other sources, wake once on the third consecutive failure and reset on recovery."""
+    h, d, gh, dog, coder, clock, sup, tick = timer_setup()
+    cfg_path = Path(h, 'config.json')
+    try:
+        tick('snapshot initialised', 'first check')
+        child = subprocess.Popen(['sleep', '600'])
+        try:
+            cdir = coder_dir(coder, 'b97-logs', child.pid)
+            tick('coder b97-logs', 'a coder dir appears')
+            cdir.chmod(0)
+            try:
+                tick(None, 'unreadable coder dir 1')
+                Path(h, 'engine-runtime.json').write_text(json.dumps({'episode_id': 'ep-9', 'active': True}))
+                tick(('fallback episode ep-9', 'started'), 'another source still observed while coder fails', forbid=('check failing',))
+                tick('check failing: coder', 'unreadable coder dir 3')
+                tick(None, 'unreadable coder dir 4: no second wake')
+                snap = snapshot(h)
+                check((snap.get('failures') or {}).get('coder') == 4, f'coder failure streak counted: {snap.get("failures")}')
+                check('b97-logs' in json.dumps(snap.get('coder', {})), f'the coder snapshot keeps its last good entry: {snap.get("coder")}')
+            finally:
+                cdir.chmod(0o755)
+            tick(None, 'coder readable again, unchanged: no wake')
+            check(not (snapshot(h).get('failures') or {}).get('coder'), 'the coder streak resets on success')
+        finally:
+            with contextlib.suppress(Exception):
+                child.kill(); child.wait()
+        ws = Path(h, 'work-status.json'); ws.write_text('{not json')
+        tick(None, 'invalid work-status 1'); tick(None, 'invalid work-status 2')
+        tick('check failing: work-status', 'invalid work-status 3')
+        tick(None, 'invalid work-status 4: no second wake')
+        ws.write_text(json.dumps({'turn': 1, 'mode': 'done'}))
+        tick(None, 'work-status readable again')
+        check(not (snapshot(h).get('failures') or {}).get('work-status'), 'the work-status streak resets on success')
+        er = Path(h, 'engine-runtime.json'); er.write_text('{not json')
+        tick(None, 'invalid engine-runtime 1'); tick(None, 'invalid engine-runtime 2')
+        tick('check failing: engine-runtime', 'invalid engine-runtime 3')
+        er.write_text(json.dumps({'episode_id': 'ep-9', 'active': True}))
+        tick(None, 'engine-runtime readable again, unchanged: no wake')
+        cfg = json.loads(cfg_path.read_text()); good_bin = cfg['timer']['dogfood']['systemctl_bin']
+        cfg['timer']['dogfood']['systemctl_bin'] = str(Path(dog.d, 'no-such-systemctl')); cfg_path.write_text(json.dumps(cfg))
+        tick(None, 'missing systemctl 1')
+        gh.repo(HYDRA_REPO, head=sha('h3'))
+        tick(('hydra-agent main', sha('h3')[:7]), 'GitHub still observed while the dogfood fails', forbid=('check failing',))
+        tick('check failing: dogfood', 'missing systemctl 3')
+        tick(None, 'missing systemctl 4: no second wake')
+        check(snapshot(h).get('dogfood', {}).get('unit') == 'active', f'the dogfood snapshot keeps its last good entry: {snapshot(h).get("dogfood")}')
+        cfg['timer']['dogfood']['systemctl_bin'] = good_bin; cfg_path.write_text(json.dumps(cfg))
+        tick(None, 'dogfood readable again, unchanged: no wake')
+        check(not (snapshot(h).get('failures') or {}).get('dogfood'), 'the dogfood streak resets on success')
     finally:
         dog.close()
 
@@ -1440,8 +1521,8 @@ SCENARIOS = [threshold_compacts_before_next_turn, threshold_boundaries, quiet_ho
              bytes_overage_compacts, codex_selected_ignores_stale_claude_measurement,
              held_is_loud_and_keeps_the_schedule, failed_rollover_backs_off, cli_compactions_detected,
              status_line_contract, stale_pending_regression, state_digest_bounds_the_message, persistent_mode_covered,
-             timer_gating_sources, timer_check_failures, timer_daily_digest, timer_max_silence, timer_service_loop,
-             timer_interval_config]
+             timer_gating_sources, timer_check_failures, timer_source_isolation, timer_daily_digest, timer_max_silence,
+             timer_service_loop, timer_interval_config]
 
 
 def main(argv):

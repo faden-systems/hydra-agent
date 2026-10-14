@@ -80,7 +80,8 @@ assert tdefaults and re.search(r'"every_s":\s*900\b',tdefaults.group(1)),'TIMER_
 assert 'timer-snapshot.json' in src and 'timer-checks.jsonl' in src,'the timer snapshot and check log paths are missing (requirement 10)'
 assert 'check failing: ' in src,'the failing-source wake reason is missing (requirement 10)'
 readme=Path('manager/README.md').read_text()
-assert 'every_s' in readme and 'timer' in readme,'manager/README.md must document the timer section (requirement 11)'
+for key in ('"timer"','every_s','digest_at','digest_tz','max_silence_s','gh_bin','github_repos','coder_logs_glob','dogfood','health_url','timer-checks.jsonl'):
+    assert key in readme,f'manager/README.md must document the timer section incl. {key} (requirement 11)'
 assert 'compact_boundary' in src,'compact_boundary detection missing (requirement 3)'
 assert 'message_bytes' in src,'turn records must carry message_bytes (requirement 5)'
 assert 'end of state digest' in src,'the digest terminator line is missing (requirement 5)'
