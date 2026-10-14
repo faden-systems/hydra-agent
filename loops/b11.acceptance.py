@@ -4,12 +4,15 @@ supervisor's stream-json, a controlled clock and fake posters only: no real engi
 raises (no `assert` in the contracts, so `python -O` cannot skip one). `--only <name>` runs one scenario."""
 import hashlib
 import contextlib
+import http.server
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import datetime as dt
 from pathlib import Path
@@ -20,7 +23,7 @@ import supervisor as S  # noqa: E402
 
 HYDRA = str(ROOT / 'manager' / 'hydra')
 THRESHOLD = 300000
-LIMIT = int(1.25 * THRESHOLD)
+FADEN_REPO, HYDRA_REPO = 'faden-systems/faden', 'faden-systems/hydra-agent'
 
 
 class Fail(Exception):
@@ -169,9 +172,9 @@ class Clock:
         self.now = self.now + dt.timedelta(seconds=seconds)
 
 
-def make(h, d, clock=None, blog=None, poster=None):
+def make(h, d, clock=None, blog=None, poster=None, sleep=None):
     return S.Supervisor(home=h, engines=engines(d), poster=poster or Poster(), buildlog_poster=blog or Poster(),
-                        clock=clock or Clock(dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc)))
+                        clock=clock or Clock(dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc)), sleep=sleep)
 
 
 def config(h, **cfg):
@@ -210,8 +213,6 @@ def kinds(d):
 def run_ticks(sup, n):
     for _ in range(n):
         sup.run_once()
-
-import threading
 
 
 class LiveLoop:
@@ -282,8 +283,9 @@ def threshold_compacts_before_next_turn():
     check('held' not in json.dumps(last), f'rollover must not be held by default: {last}')
 
 
-def over_ratio_boundaries():
-    """Requirement 1: due at or above over_ratio x threshold, not below; over_ratio configurable, clamped to >= 1."""
+def threshold_boundaries():
+    """Requirement 1 (amendment 2026-10-14): due strictly over threshold_tokens, not at it; a configured over_ratio
+    raises nothing and is retired from the config."""
     def compacts(context, **cfg):
         h, d = home(), fakes(context=context, context_after=90000)
         if cfg:
@@ -292,13 +294,24 @@ def over_ratio_boundaries():
         event(h, 'A'); sup.run_once()
         event(h, 'B'); sup.run_once()
         return 'compaction' in kinds(d)
-    check(not compacts(350000), '1.17x must stay pending, not compact')
-    check(compacts(LIMIT), f'exactly 1.25x ({LIMIT}) must compact')
-    check(not compacts(450000, over_ratio=2.0), '1.5x with over_ratio 2.0 must not compact')
-    check(compacts(600000, over_ratio=2.0), '2.0x with over_ratio 2.0 must compact')
-    h = home(); config(h, over_ratio=0.5)
-    sup = make(h, fakes())
-    check(sup.compaction_config()['over_ratio'] == 1.0, 'over_ratio below 1.0 must be clamped to 1.0')
+    check(not compacts(THRESHOLD), f'exactly the threshold ({THRESHOLD}) must not compact')
+    check(compacts(THRESHOLD + 1), f'one token over the threshold ({THRESHOLD + 1}) must compact')
+    check(compacts(450000, over_ratio=2.0), '1.5x with over_ratio 2.0 configured must still compact (over_ratio is retired)')
+    check(compacts(350000, threshold_tokens=340000), 'a configured threshold_tokens is the due limit')
+    check(not compacts(350000, threshold_tokens=350000), 'a context at a configured threshold_tokens does not compact')
+    h, d = home(), fakes(context=100000)
+    config(h, over_ratio=2.0)
+    logged, orig = [], S.log
+    S.log = lambda m: logged.append(str(m))
+    try:
+        sup = make(h, d)
+        check('over_ratio' not in sup.compaction_config(), f'compaction_config must not return over_ratio: {sup.compaction_config()}')
+        event(h, 'A'); sup.run_once(); run_ticks(sup, 3); sup.compaction_config(); S.compaction_config_for(h)
+    finally:
+        S.log = orig
+    retired = [m for m in logged if 'over_ratio' in m and 'retired' in m]
+    check(len(retired) == 1, f'exactly one over_ratio retirement log line per supervisor start, got {retired}')
+    check('over_ratio' not in S.COMPACTION_DEFAULTS, 'COMPACTION_DEFAULTS must not carry over_ratio')
 
 
 def quiet_hours_do_not_gate():
@@ -336,8 +349,14 @@ def held_is_loud_and_keeps_the_schedule():
     run_ticks(sup, 2)
     held_lines = [t for _, _, t in blog.posted if 'compaction held' in t]
     check(len(held_lines) == 1, f'exactly one held buildlog line per episode, got {held_lines}')
-    check('context 940000 over 375000' in held_lines[0] and 'compaction.rollover_enabled' in held_lines[0],
-          f'held line must name the measured context, the limit and the setting: {held_lines[0]}')
+    check(f'context 940000 over {THRESHOLD}' in held_lines[0] and 'compaction.rollover_enabled' in held_lines[0],
+          f'held line must name the measured context, the limit (threshold_tokens) and the setting: {held_lines[0]}')
+    hc, dc = home(), fakes(context=940000, context_after=90000)
+    config(hc, rollover_enabled=False, threshold_tokens=500000)
+    blogc = Poster(); supc = make(hc, dc, blog=blogc)
+    event(hc, 'A'); supc.run_once(); event(hc, 'B'); supc.run_once()
+    heldc = [t for _, _, t in blogc.posted if 'compaction held' in t]
+    check(len(heldc) == 1 and 'context 940000 over 500000' in heldc[0], f'the held line names the configured threshold: {heldc}')
     Path(h, 'COMPACT').write_text('')
     sup.run_once()
     check(not Path(h, 'COMPACT').exists(), 'a forced request must be consumed, not retried every tick')
@@ -379,6 +398,25 @@ def held_is_loud_and_keeps_the_schedule():
     finally:
         loop.close()
     check(rc == 1 and 'compacted at' not in out, f'live loop + failed rollover: exit 1 expected, got rc={rc} {out[-200:]!r}')
+    # an outcome without a new session id (ok null, an error not starting `held:`): seeded by a stub loop that
+    # consumes COMPACT and writes that form, since the engine seam cannot produce it
+    h4, d4 = home(), fakes(context=940000, context_after=90000)
+    sup4 = make(h4, d4)
+    S.write_text(S.compaction_state_path(h4), json.dumps({'last': {'before_tokens': 940000, 'after_tokens': None, 'at': '2026-10-08T09:00:00Z', 'ok': True, 'reason': 'tokens'}}))
+
+    def seeded_run_once():
+        if Path(h4, 'COMPACT').exists():
+            Path(h4, 'COMPACT').unlink()
+            S.write_text(S.compaction_state_path(h4), json.dumps({'last': {'before_tokens': 940000, 'after_tokens': None, 'at': '2026-10-08T12:00:00Z', 'ok': None, 'reason': 'forced', 'error': 'rollover left no session id'}}))
+            return True
+        return False
+    sup4.run_once = seeded_run_once
+    loop = LiveLoop(sup4, h4)
+    try:
+        rc, out = hydra_compact(h4, timeout=60)
+    finally:
+        loop.close()
+    check(rc == 1 and 'compaction unverified' in out and 'compacted at' not in out, f'live loop + unverified outcome: exit 1 and `compaction unverified` expected, got rc={rc} {out[-200:]!r}')
 
 
 def failed_rollover_backs_off():
@@ -433,7 +471,7 @@ def cli_compactions_detected():
     real_since = S.cli_compactions_since
 
     def spy(data, offset):
-        seen.append((len(data), offset))
+        seen.append((bytes(data), offset))
         return real_since(data, offset)
     S.cli_compactions_since = spy
     event(h, 'A'); sup.run_once()
@@ -441,9 +479,9 @@ def cli_compactions_detected():
     first_len = tpath.stat().st_size
     with tpath.open('a') as f:
         f.write(json.dumps(good) + '\n')
-    added = tpath.stat().st_size - first_len
+    appended = tpath.read_bytes()[first_len:]
     event(h, 'B'); sup.run_once()
-    check(seen and seen[-1] == (added, 0), f'the scan must hand the parser only the bytes after the recorded offset: {seen[-1:]} vs ({added}, 0)')
+    check(seen and seen[-1] == (appended, 0), f'the scan must hand the parser exactly the bytes after the recorded offset with offset 0: {[(len(b), o) for b, o in seen[-1:]]} vs ({len(appended)}, 0)')
     S.cli_compactions_since = real_since
     rec = turns(h)[-1]
     check(rec.get('cli_compacted') is True, f'the turn after a boundary must carry cli_compacted: {rec}')
@@ -506,9 +544,17 @@ def cli_compactions_detected():
     event(h, 'G'); sup.run_once()
     cli = cstate(h).get('cli_compactions') or []
     check(len(cli) == 50 and cli[-1].get('at') == '2026-10-09T00:00:50.000Z', f'the newest 50 must be kept: {len(cli)} {cli[-1:]}')
-    # an unreadable transcript never fails a turn
+    # an unreadable transcript never fails a turn and is logged exactly once per unreadable episode
     newpath.unlink(); newpath.mkdir()
-    event(h, 'H'); check(sup.run_once() is True, 'an unreadable transcript must not fail the turn')
+    logged, orig_log = [], S.log
+    S.log = lambda m: logged.append(str(m))
+    try:
+        for name in ('H', 'H2', 'H3'):
+            event(h, name); check(sup.run_once() is True, 'an unreadable transcript must not fail the turn')
+    finally:
+        S.log = orig_log
+    diag = [m for m in logged if 'transcript' in m.lower()]
+    check(len(diag) == 1, f'exactly one diagnostic for one unreadable-transcript episode across three turns, got {diag}')
     check(turns(h)[-1].get('events') == [turns(h)[-1]['events'][0]] if turns(h)[-1].get('events') else True, 'turn recorded')
     # a missing transcript never fails a turn
     h2, d2 = home(), fakes(context=100000)
@@ -529,14 +575,18 @@ def status_line_contract():
     now = dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc)
     h = home()
     line = S.compaction_status_line(h, now=now)
-    check(line.startswith('context: unknown') and f'due at {LIMIT}' in line and 'last compaction: none' in line, f'no measurement: {line}')
+    check(line.startswith('context: unknown') and f'due over {THRESHOLD}' in line and 'last compaction: none' in line, f'no measurement: {line}')
+    check('due at' not in line, f'the old due wording must go: {line}')
     write(h, turn={'n': 1, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 100000})
     line = S.compaction_status_line(h, now=now)
     check(line.startswith('context: 100000 tokens (turn 1)') and '; compaction' not in line, f'below threshold: {line}')
-    write(h, state={'pending': {'reason': 'tokens', 'value': 320000, 'limit': THRESHOLD, 'since': 'x'}},
-          turn={'n': 2, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 320000})
+    write(h, turn={'n': 2, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': THRESHOLD})
     line = S.compaction_status_line(h, now=now)
-    check(line.startswith('context: 320000 tokens (turn 2)') and '; compaction' not in line, f'pending between threshold and limit: {line}')
+    check(line.startswith(f'context: {THRESHOLD} tokens (turn 2)') and '; compaction' not in line, f'at exactly the threshold: no suffix: {line}')
+    write(h, state={'pending': {'reason': 'tokens', 'value': THRESHOLD + 1, 'limit': THRESHOLD, 'since': 'x'}},
+          turn={'n': 2, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': THRESHOLD + 1})
+    line = S.compaction_status_line(h, now=now)
+    check(line.startswith(f'context: {THRESHOLD + 1} tokens (turn 2)') and line.endswith('; compaction: due (tokens)'), f'one over the threshold is due: {line}')
     write(h, state={'pending': {'reason': 'tokens', 'value': 940000, 'limit': THRESHOLD, 'since': 'x'}},
           turn={'n': 3, 'at': time.time(), 'engine': 'claude-r2d2', 'events': ['x'], 'context_tokens': 940000})
     line = S.compaction_status_line(h, now=now)
@@ -651,11 +701,14 @@ def codex_selected_ignores_stale_claude_measurement():
     Path(h, 'engine').write_text('codex\n')
     due, _ = sup.compaction_due()
     check(not due, 'nothing is due while Codex is selected')
+    line = status_line(h)
+    check('; compaction: due' not in line and 'context: 940000 tokens' in line, f'status applies the same guard: no due suffix while Codex is selected: {line}')
     event(h, 'B'); sup.run_once()
     check(kinds(d) == ['turn', 'codex'], f'the Codex turn must run without a compaction: {kinds(d)}')
     Path(h, 'engine').write_text('claude-r2d2\n')
     due, reason = sup.compaction_due()
     check(due and reason == 'tokens', 'back on Claude the overage is due again')
+    check(status_line(h).endswith('; compaction: due (tokens)'), f'back on Claude status shows due again: {status_line(h)}')
 
 
 def big_state(n_tracks=24, entry_kb=5):
@@ -724,6 +777,29 @@ def state_digest_bounds_the_message():
     stdin = calls(d)[-1]['stdin']
     check('MARKER-t03-DEEP' in stdin, 'the plain assignee line must select its track')
     check('MARKER-t04-DEEP' not in stdin, 'an assignee line with extra words must not select')
+    # rule (a) in full: a ts nested anywhere in the entry, the event id when there is no payload.thread_ts, and a
+    # `.`-stripped ts; the sections appear in event (selection) order
+    for t in state['tracks']:
+        if t['id'] == 't07':
+            t['meta'] = {'refs': [{'slack': '9191919191.000001'}]}
+        if t['id'] == 't08':
+            t['links'] = ['x', {'origin': '9292929292.000002'}]
+        if t['id'] == 't09':
+            t['notes'] = {'ts_compact': '9393939393000003'}
+    Path(h, 'state.json').write_text(json.dumps(state, indent=1))
+    event(h, 'nested', thread='9191919191.000001')
+    S.append_event(h, {'id': '9292929292.000002', 'source': 'slack', 'at': time.time(),
+                       'payload': {'channel': 'C_DEV', 'user': 'U_FOUNDER', 'text': 'by id', 'instructs': True}})
+    event(h, 'stripped', thread='9393939393.000003')
+    sup.run_once()
+    stdin = calls(d)[-1]['stdin']
+    for tid in ('t07', 't08', 't09'):
+        check(f'MARKER-{tid}-DEEP' in stdin, f'rule (a) must select {tid} (nested value / event id / dot-stripped ts)')
+    pos = [stdin.index(f'### {tid}') for tid in ('t07', 't08', 't09')]
+    check(pos == sorted(pos), f'the full entries must appear in event order t07, t08, t09: {pos}')
+    for t in state['tracks']:
+        if t['id'] not in ('t07', 't08', 't09', 't21'):
+            check(f"MARKER-{t['id']}-DEEP" not in stdin, f"untouched track {t['id']} must not be in full")
     # the cap: four touched tracks of ~16 KB each cannot fit (one does); selection order is EVENT order (t17, t05,
     # t11, then the work-status track t21), not file order, so t17 survives and t05 (first in file order) is dropped
     state2 = big_state(entry_kb=16)
@@ -741,7 +817,9 @@ def state_digest_bounds_the_message():
     check('MARKER-t21-DEEP' not in stdin, 'the last-selected touched track (work-status) must be dropped first')
     for t in state2['tracks']:
         check(f"- {t['id']}: now:" in stdin, f"track lines are never dropped: {t['id']}")
-    # the mandatory part alone over the budget: 80 tracks with long fields and 30 long decisions still fit
+    # the mandatory part alone over the budget: 80 tracks with long fields and 30 long decisions still fit; no
+    # work-status track is selected here (a full entry would legitimately carry the long fields)
+    Path(h, 'work-status.json').write_text(json.dumps({'turn': 0, 'mode': 'done'}))
     state3 = big_state(n_tracks=80, entry_kb=1)
     for t in state3['tracks']:
         t['now'] = f"now of {t['id']}: " + ('n' * 230); t['waits_on'] = 'w' * 230; t['next_action'] = 'a' * 230
@@ -852,10 +930,662 @@ def persistent_mode_covered():
             sup._retire_persistent('planned', 'acceptance done')
 
 
-SCENARIOS = [threshold_compacts_before_next_turn, over_ratio_boundaries, quiet_hours_do_not_gate,
+# ---------------------------------------------------------------------------------------------- timer gating fixtures
+FAKE_GH = r"""#!/usr/bin/env python3
+import sys, json
+from pathlib import Path
+D = Path(%(dir)r)
+argv = sys.argv[1:]
+
+
+def norm(p):
+    base, _, q = p.partition('?')
+    params = sorted(kv for kv in q.split('&') if kv and not kv.startswith(('since=', 'per_page=')))
+    return base + ('?' + '&'.join(params) if params else '')
+
+
+with open(D / 'gh-calls.log', 'a') as f:
+    f.write(json.dumps(argv) + '\n')
+if argv[:1] != ['api'] or len(argv) < 2 or any(a in ('--jq', '--paginate', '-q') for a in argv):
+    print('fake gh: unsupported invocation', argv, file=sys.stderr); sys.exit(2)
+path = norm(argv[1])
+routes = json.loads((D / 'routes.json').read_text())
+fails = json.loads((D / 'fails.json').read_text()) if (D / 'fails.json').exists() else []
+if any(path.startswith(norm(f)) for f in fails):
+    print('fake gh: HTTP 503', file=sys.stderr); sys.exit(1)
+if path not in routes:
+    print('fake gh: no route for ' + path, file=sys.stderr); sys.exit(1)
+print(json.dumps(routes[path]))
+"""
+
+FAKE_SYSTEMCTL = r"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+state = Path(%(state)r).read_text().strip()
+print(state)
+sys.exit(0 if state == 'active' else 3)
+"""
+
+
+def sha(seed):
+    return hashlib.sha1(seed.encode()).hexdigest()
+
+
+def pr(number, head, updated='2026-10-08T00:00:00Z', labels=(), comments=0, review_comments=0, login='someone',
+       reviews=(), checks=()):
+    return {'number': number, 'head': {'sha': head}, 'updated_at': updated, 'labels': [{'name': l} for l in labels],
+            'comments': comments, 'review_comments': review_comments, 'user': {'login': login},
+            'reviews': [{'state': r} for r in reviews], 'checks': list(checks)}
+
+
+class FakeGitHub:
+    """`gh api <path>` answered from a route table; a failing prefix exits 1."""
+    def __init__(self):
+        self.d = Path(tempfile.mkdtemp(prefix='b11-gh-'))
+        self.routes = {}
+        self.bin = self.d / 'gh'
+        self.bin.write_text(FAKE_GH % {'dir': str(self.d)})
+        self.bin.chmod(0o755)
+        self.set('user', {'login': 'hydra-manager'})
+        self.fail([])
+
+    @staticmethod
+    def norm(p):
+        base, _, q = p.partition('?')
+        params = sorted(kv for kv in q.split('&') if kv and not kv.startswith(('since=', 'per_page=')))
+        return base + ('?' + '&'.join(params) if params else '')
+
+    def set(self, path, data):
+        self.routes[self.norm(path)] = data
+        (self.d / 'routes.json').write_text(json.dumps(self.routes))
+
+    def repo(self, repo, head, prs=(), issues=()):
+        self.set(f'repos/{repo}/commits/HEAD', {'sha': head})
+        # the list response is the "pull request simple" shape: no comments / review_comments on it
+        self.set(f'repos/{repo}/pulls?state=open&per_page=100',
+                 [{k: v for k, v in p.items() if k not in ('reviews', 'checks', 'comments', 'review_comments')} for p in prs])
+        for p in prs:
+            self.set(f"repos/{repo}/pulls/{p['number']}", {k: v for k, v in p.items() if k not in ('reviews', 'checks')})
+            self.set(f"repos/{repo}/pulls/{p['number']}/reviews", p['reviews'])
+            self.set(f"repos/{repo}/commits/{p['head']['sha']}/check-runs",
+                     {'total_count': len(p['checks']), 'check_runs': [{'conclusion': c} for c in p['checks']]})
+        self.set(f'repos/{repo}/issues?state=open&since=2000-01-01T00:00:00Z&per_page=100', list(issues))
+
+    def fail(self, prefixes):
+        (self.d / 'fails.json').write_text(json.dumps(list(prefixes)))
+
+    def calls(self):
+        p = self.d / 'gh-calls.log'
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def issue_sinces(self, repo):
+        """The `since` value of every issues call for `repo`, in call order."""
+        out = []
+        for argv in self.calls():
+            path = argv[1] if len(argv) > 1 else ''
+            if path.startswith(f'repos/{repo}/issues?'):
+                m = re.search(r'since=([^&]+)', path)
+                out.append(m.group(1) if m else None)
+        return out
+
+
+class Dogfood:
+    """A fake systemctl, a local /health server whose status is a file, and a scratch git checkout."""
+    def __init__(self):
+        self.d = Path(tempfile.mkdtemp(prefix='b11-dog-'))
+        self.state = self.d / 'unit-state'
+        self.state.write_text('active\n')
+        self.systemctl = self.d / 'systemctl'
+        self.systemctl.write_text(FAKE_SYSTEMCTL % {'state': str(self.state)})
+        self.systemctl.chmod(0o755)
+        self.status = self.d / 'health-status'
+        self.status.write_text('200')
+        status_file = self.status
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                code = int(status_file.read_text().strip() or '200')
+                body = b'{"ok": true}' if code == 200 else b'{"ok": false}'
+                self.send_response(code); self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        self.url = f'http://127.0.0.1:{self.server.server_address[1]}/health'
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.checkout = self.d / 'checkout'
+        self.checkout.mkdir()
+        self.git('init', '-q')
+        self.commit('one')
+
+    def git(self, *args):
+        return subprocess.run(['git', '-C', str(self.checkout), '-c', 'user.name=b11', '-c', 'user.email=b11@example.test', *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, msg):
+        self.git('commit', '-q', '--allow-empty', '-m', msg)
+        return self.git('rev-parse', 'HEAD')
+
+    def close(self):
+        self.server.shutdown()
+
+
+def dead_pid():
+    """A pid that was alive a moment ago and is now reaped."""
+    p = subprocess.Popen(['sleep', '300'])
+    pid = p.pid
+    p.send_signal(signal.SIGKILL); p.wait()
+    return pid
+
+
+def coder_dir(root, name, pid, state='running'):
+    d = Path(root, name)
+    d.mkdir()
+    Path(d, 'launcher.json').write_text(json.dumps({'pid': pid, 'HEAD': sha(name)}))
+    Path(d, 'status.json').write_text(json.dumps({'state': state, 'exit_code': None}))
+    return d
+
+
+def checks_log(h):
+    return S.read_jsonl(os.path.join(h, 'logs', 'timer-checks.jsonl'))
+
+
+def snapshot(h):
+    return json.loads(Path(h, 'logs', 'timer-snapshot.json').read_text())
+
+
+class Ticker:
+    """One timer tick per call, each in a fresh every_s slot; asserts exactly one timer event or none."""
+    def __init__(self, sup, h, clock, every_s=60):
+        self.sup, self.h, self.clock, self.every_s, self.n = sup, h, clock, every_s, 0
+
+    def __call__(self, expect, label, forbid=(), exact=()):
+        self.clock.advance(self.every_s)
+        before = len(S.pending_events(self.h)); checks_before = len(checks_log(self.h))
+        rec = self.sup.timer_tick()
+        self.n += 1
+        new = S.pending_events(self.h)[before:]
+        check(isinstance(rec, dict) and {'at', 'woke', 'reasons', 'cost_ms'} <= set(rec), f'{label}: timer_tick must return the check record, got {rec!r}')
+        rows = checks_log(self.h)
+        check(len(rows) == checks_before + 1 and rows[-1] == rec, f'{label}: every tick appends its record to timer-checks.jsonl: {rows[-1:]} vs {rec}')
+        check(isinstance(rec['cost_ms'], int) and rec['cost_ms'] >= 0 and isinstance(rec['reasons'], list), f'{label}: record shape: {rec}')
+        if expect is None:
+            check(rec['woke'] is False and rec['reasons'] == [] and not new, f'{label}: must not wake, got {rec} and {len(new)} new event(s): {[e.get("payload", {}).get("text") for e in new]}')
+            return None
+        check(rec['woke'] is True and len(new) == 1, f'{label}: exactly one timer event expected, got {len(new)}; record {rec}')
+        ev = new[0]; text = ev.get('payload', {}).get('text') or ''
+        check(ev.get('source') == 'timer' and ev.get('id', '').startswith('timer-') and ev['payload'].get('instructs') is False,
+              f'{label}: the timer event must be source timer, id timer-<slot>, instructs false: {ev}')
+        check(text.startswith('timer: '), f'{label}: event text must start with "timer: ": {text!r}')
+        expects = (expect,) if isinstance(expect, str) else tuple(expect)
+        for e in expects:
+            check(e in text, f'{label}: reason {e!r} missing from the event text {text!r}')
+        for f in forbid:
+            check(f not in text, f'{label}: reason {f!r} must not appear in the event text {text!r}')
+        check(rec['reasons'] and all(r in text for r in rec['reasons']), f'{label}: the record reasons must be the event text reasons: {rec} vs {text!r}')
+        check(text == 'timer: ' + '; '.join(rec['reasons']), f'{label}: the event text is exactly "timer: " + the reasons joined by "; ": {text!r} vs {rec["reasons"]}')
+        for clause in exact:
+            check(clause in rec['reasons'], f'{label}: the exact reason clause {clause!r} must be one of {rec["reasons"]}')
+        return ev
+
+
+def timer_setup(every_s=60, start=None):
+    h, d = home(), fakes(context=100000)
+    gh, dog = FakeGitHub(), Dogfood()
+    coder = Path(tempfile.mkdtemp(prefix='b11-coder-'))
+    Path(h, 'config.json').write_text(json.dumps({'timer': {
+        'every_s': every_s, 'gh_bin': str(gh.bin), 'coder_logs_glob': str(coder / '*-logs'),
+        'dogfood': {'unit': 'fitflow-dogfood', 'health_url': dog.url, 'checkout': str(dog.checkout), 'systemctl_bin': str(dog.systemctl)}}}))
+    gh.repo(FADEN_REPO, head=sha('f1'), prs=[pr(261, sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))])
+    gh.repo(HYDRA_REPO, head=sha('h1'))
+    clock = Clock(start or dt.datetime(2026, 10, 8, 15, 0, 0, tzinfo=dt.timezone.utc))   # 08:00 PDT, past the digest time
+    sup = make(h, d, clock=clock)
+    return h, d, gh, dog, coder, clock, sup, Ticker(sup, h, clock, every_s)
+
+
+def timer_gating_sources():
+    """Requirement 10: a tick wakes the model only on a difference, one timer event naming the reason; every
+    source independently; the never-compared inputs; the check log and the status line."""
+    h, d, gh, dog, coder, clock, sup, tick = timer_setup()
+    try:
+        tick('snapshot initialised', 'first check')
+        check(Path(h, 'logs', 'timer-snapshot.json').exists(), 'the snapshot must be written after the first check')
+        tick(None, 'unchanged')
+        check(not any(c['kind'] != 'turn' for c in calls(d)) and calls(d) == [], f'the change check must not call an engine: {calls(d)}')
+        # GitHub: main HEAD, the open set, the per-PR fields, issues updated since the last check
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[pr(261, sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))])
+        tick('faden main', 'main head change', forbid=('hydra-agent', 'PR #261'), exact=[f"faden main {sha('f1')[:7]} -> {sha('f2')[:7]}"])
+        tick(None, 'unchanged after head')
+        gh.repo(HYDRA_REPO, head=sha('h1'), prs=[pr(70, sha('q1'))])
+        tick('hydra-agent PR #70', 'new open PR', forbid=('faden',), exact=['hydra-agent PR #70 opened'])
+        tick(None, 'unchanged after new PR')
+        cur = dict(head=sha('p1'), labels=('loop',), reviews=('APPROVED',), checks=('success',))
+        transitions = (
+            ('head', dict(head=sha('p2')), f"faden PR #261 head {sha('p1')[:7]} -> {sha('p2')[:7]}"),
+            ('updated_at', dict(updated='2026-10-08T01:00:00Z'), 'faden PR #261 updated_at 2026-10-08T00:00:00Z -> 2026-10-08T01:00:00Z'),
+            ('labels', dict(labels=('loop', 'approved')), 'faden PR #261 labels loop -> approved,loop'),
+            ('comments', dict(comments=3), 'faden PR #261 comments 0 -> 3'),
+            ('comments', dict(review_comments=2), 'faden PR #261 comments 3 -> 5'),
+            ('reviews', dict(reviews=('APPROVED', 'CHANGES_REQUESTED')), 'faden PR #261 reviews 1 APPROVED -> 2 CHANGES_REQUESTED'),
+            ('checks', dict(checks=('success', 'failure')), 'faden PR #261 checks success -> failure,success'),
+            ('checks', dict(checks=('success', None)), 'faden PR #261 checks failure,success -> pending,success'))
+        for field, kw, clause in transitions:
+            cur.update(kw)
+            p = pr(261, **cur)
+            gh.repo(FADEN_REPO, head=sha('f2'), prs=[p])
+            tick(('faden PR #261', field), f'PR {field} change', exact=[clause])
+            tick(None, f'unchanged after PR {field}')
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:30:00Z', 'title': 'x'},
+                                                      {'number': 59, 'updated_at': '2026-10-08T12:30:00Z', 'pull_request': {'url': 'u'}}])
+        tick('faden issue #58', 'issue updated since the last check', forbid=('#59',), exact=['faden issue #58 updated'])
+        tick(None, 'the same issue list again does not wake (cumulative map)')
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[p], issues=[{'number': 58, 'updated_at': '2026-10-08T12:45:00Z', 'title': 'x'}])
+        tick('faden issue #58', 'issue updated again')
+        gh.repo(FADEN_REPO, head=sha('f2'), prs=[], issues=[])
+        tick('faden PR #261', 'PR closed (left the open set)', exact=['faden PR #261 closed'])
+        check(all(a[1].startswith(('repos/', 'user')) for a in gh.calls()), f'gh is called with REST paths only: {gh.calls()[:3]}')
+        # the bounded observation contract: every list call is one page of 100, never --paginate
+        lists = [a[1] for a in gh.calls() if any(k in a[1] for k in ('/pulls?', '/issues?', '/reviews', '/check-runs'))]
+        check(lists and all('per_page=100' in path for path in lists), f'every list call carries per_page=100: {[p for p in lists if "per_page=100" not in p][:3]}')
+        # coder runs
+        child = subprocess.Popen(['sleep', '300'])
+        try:
+            coder_dir(coder, 'b99-logs', child.pid)
+            tick('coder b99-logs', 'new coder logs dir')
+            tick(None, 'unchanged coder dir')
+            os.utime(Path(coder, 'b99-logs', 'status.json'))
+            tick(None, 'mtime-only change of status.json')
+            Path(coder, 'b99-logs', 'status.json').write_text(json.dumps({'state': 'done', 'exit_code': 0}))
+            tick(('coder b99-logs', 'state', 'running', 'done'), 'status.json state change')
+            tick(None, 'unchanged after state change')
+            child.kill(); child.wait()
+            tick(('coder b99-logs', 'pid', 'dead'), 'launcher pid died')
+            tick(None, 'a dead pid stays dead without waking again')
+            Path(coder, 'b99-logs', 'coder-exit.log').write_text('[b11] FAIL\n')
+            tick(('coder b99-logs', 'coder-exit.log'), 'new exit file')
+            Path(coder, 'b99-logs', 'coder-exit.log').write_text('[b11] FAIL again\n')
+            tick(None, 'exit file content is not compared')
+            Path(coder, 'b99-logs', 'result.json').write_text(json.dumps({'pass': False, 'coder_exit': 1}))
+            tick(('coder b99-logs', 'result.json'), 'result.json appeared')
+        finally:
+            with contextlib.suppress(Exception):
+                child.kill(); child.wait()
+        # work-status deadlines
+        now_epoch = sup.clock_epoch()
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 1, 'mode': 'idle', 'track': 'ops', 'deadline': int(now_epoch) - 10, 'since': int(now_epoch) - 100}))
+        tick('work-status deadline', 'idle deadline passed')
+        tick(None, 'the same deadline wakes once')
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 2, 'mode': 'waiting', 'track': 'ops', 'who': 'L', 'since': int(now_epoch)}))
+        tick(None, 'waiting on L with no deadline never wakes')
+        clock.advance(3600)
+        tick(None, 'waiting on L with no deadline never wakes, an hour later')
+        now_epoch = sup.clock_epoch()
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 3, 'mode': 'waiting', 'track': 'b12', 'who': 'Hermes', 'deadline': int(now_epoch) + 30, 'since': int(now_epoch)}))
+        tick(None, 'an operator deadline in the future does not wake')
+        tick('work-status deadline', 'operator deadline passed')
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 4, 'mode': 'continue', 'track': 'b12', 'next_action': 'x', 'deadline': int(now_epoch) - 10}))
+        tick(None, 'continue stays with the self-event scheduler')
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 5, 'mode': 'done', 'deadline': int(now_epoch) - 10}))
+        tick(None, 'done never wakes')
+        # persistence
+        Path(h, 'logs', 'persistence.json').write_text(json.dumps({'last_turn': 5, 'status': 'blocked', 'error': 'push failed', 'pending_local_sha': sha('x')}))
+        tick(('persistence', 'blocked'), 'persistence blocked')
+        tick(None, 'staying blocked does not wake again')
+        Path(h, 'logs', 'persistence.json').write_text(json.dumps({'last_turn': 6, 'status': 'synced', 'error': None, 'pending_local_sha': None}))
+        tick(None, 'a change back to synced is not a reason')
+        # dogfood
+        dog.state.write_text('inactive\n')
+        tick(('dogfood unit', 'inactive'), 'unit inactive')
+        tick(None, 'staying inactive does not wake again')
+        dog.state.write_text('active\n')
+        tick(('dogfood unit', 'active'), 'unit back')
+        dog.status.write_text('503')
+        tick(None, 'one non-200 health answer does not wake')
+        tick(('dogfood /health', '503', 'twice'), 'two consecutive non-200 answers')
+        tick(None, 'a continuing health streak wakes once')
+        dog.status.write_text('200')
+        tick(None, 'health recovered: no wake')
+        dog.status.write_text('503')
+        tick(None, 'a new streak, first answer')
+        tick(('dogfood /health', 'twice'), 'a new streak, second answer')
+        dog.status.write_text('200')
+        new_head = dog.commit('two')
+        tick(('dogfood sha', new_head[:7]), 'deployed sha changed')
+        dog.git('branch', 'scratch-not-a-pr')
+        tick(None, 'a non-PR branch is not compared')
+        # engine-runtime
+        Path(h, 'engine-runtime.json').write_text(json.dumps({'episode_id': 'ep-1', 'active': True, 'reason': 'usage'}))
+        tick(('fallback episode ep-1', 'started'), 'fallback started')
+        tick(None, 'an active episode stays active without waking again')
+        Path(h, 'engine-runtime.json').write_text(json.dumps({'episode_id': 'ep-1', 'active': False, 'reason': 'usage'}))
+        tick(('fallback episode ep-1', 'ended'), 'fallback ended')
+        # never compared: Slack, the manager's own files, mtime-only changes
+        Path(h, 'state.json').write_text(json.dumps({'tracks': [{'id': 'ops', 'now': 'changed'}]}))
+        Path(h, 'MANAGER-HANDOFF.md').write_text('tracks: changed\n')
+        Path(h, 'mirror', 'MEMORY.md').write_text('changed\n')
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 6, 'mode': 'waiting', 'who': 'L', 'since': 1}))
+        event(h, 'a slack message', thread='3.3')
+        queued = len(S.pending_events(h))
+        tick(None, 'Slack, state.json, the handoff and memory files are never reasons')
+        check(len(S.pending_events(h)) == queued, 'the tick must neither drop nor add events')
+        # the log and the status line
+        rows = checks_log(h)
+        check(len(rows) == tick.n, f'one timer-checks row per tick: {len(rows)} vs {tick.n}')
+        for r in rows:
+            check({'at', 'woke', 'reasons', 'cost_ms'} <= set(r) and dt.datetime.fromisoformat(r['at'].replace('Z', '+00:00')), f'malformed check row: {r}')
+        status = S.status_text(h)
+        line = next((l for l in status.splitlines() if l.startswith('timer: ')), '')
+        check(re.match(r'^timer: every 60s \| last check \S+ \(\d+ ms\) \| last wake \S+: .*fallback episode ep-1 ended', line),
+              f'status must show the interval, the last check and the last wake reason: {line!r} in {status!r}')
+    finally:
+        dog.close()
+
+
+def timer_check_failures():
+    """Requirement 10: an unreadable source keeps its snapshot entry, never stops the other sources, wakes once
+    after three consecutive failures, and a success resets the streak."""
+    h, d, gh, dog, coder, clock, sup, tick = timer_setup()
+    try:
+        tick('snapshot initialised', 'first check')
+        gh.fail([f'repos/{FADEN_REPO}/'])
+        gh.repo(HYDRA_REPO, head=sha('h2'))
+        tick(('hydra-agent main', sha('h2')[:7]), 'the other repo is still read while faden fails', forbid=('check failing',))
+        tick(None, 'second consecutive failure: no wake')
+        tick(f'check failing: github:{FADEN_REPO}', 'third consecutive failure wakes once')
+        tick(None, 'fourth failure: no wake')
+        tick(None, 'fifth failure: no wake')
+        snap = snapshot(h)
+        check((snap.get('failures') or {}).get(f'github:{FADEN_REPO}') == 5, f'the snapshot counts the failure streak: {snap.get("failures")}')
+        check(snap.get('github', {}).get(FADEN_REPO, {}).get('head') == sha('f1'), f'the failing source keeps its previous snapshot entry: {snap.get("github", {}).get(FADEN_REPO)}')
+        gh.fail([])
+        tick(None, 'recovery with unchanged data: no wake')
+        check(not (snapshot(h).get('failures') or {}).get(f'github:{FADEN_REPO}'), 'a success resets the streak')
+        # the issues cursor: `since` is the `at` of this repo's previous SUCCESSFUL check; the first check of a fresh
+        # snapshot queries from a day before its own `at`; a failed check never advances it; the other repo
+        # advances its own cursor every check
+        rows = checks_log(h)   # rows[0] = the initialising check, rows[1:6] = the failing checks, rows[6] = the recovery
+        sinces = gh.issue_sinces(FADEN_REPO)
+        check(len(sinces) >= 2 and all(sinces), f'every issues call carries since: {sinces}')
+        check(sinces[0] < rows[0]['at'] and sinces[0] >= '2026-10-07', f'the first check queries since a day before its own at: {sinces[0]} vs {rows[0]["at"]}')
+        check(all(x == rows[0]['at'] for x in sinces[1:]), f'every call after the first success, failed checks and the recovery included, queries since the last SUCCESSFUL check: {sinces[1:]} vs {rows[0]["at"]}')
+        hydra_sinces = gh.issue_sinces(HYDRA_REPO)
+        check(hydra_sinces[-1] == rows[-2]['at'], f'the unaffected repo advances its own cursor every check: {hydra_sinces[-1]} vs {rows[-2]["at"]}')
+        gh.fail([f'repos/{FADEN_REPO}/'])
+        tick(None, 'new streak 1')
+        check(gh.issue_sinces(FADEN_REPO)[-1] == rows[6]['at'], f'after the recovery the cursor is the recovery check: {gh.issue_sinces(FADEN_REPO)[-1]} vs {rows[6]["at"]}')
+        tick(None, 'new streak 2')
+        tick(f'check failing: github:{FADEN_REPO}', 'new streak 3 wakes again')
+        gh.fail([])
+        tick(None, 'recovered')
+        pers = Path(h, 'logs', 'persistence.json'); pers.write_text('{not json')
+        tick(None, 'invalid persistence json 1'); tick(None, 'invalid persistence json 2')
+        tick('check failing: persistence', 'invalid persistence json 3')
+        pers.write_text(json.dumps({'status': 'synced', 'error': None, 'pending_local_sha': None}))
+        tick(None, 'persistence readable again (synced is no reason)')
+        Path(coder, 'not-a-dir-logs').write_text('a file where a directory is expected')
+        tick(None, 'a stray file matching the coder glob is skipped, not a failure')
+    finally:
+        dog.close()
+
+
+def timer_source_isolation():
+    """Requirement 10: every source is independently guarded: an unreadable coder directory, an invalid
+    work-status.json, an invalid engine-runtime.json and a missing systemctl each keep their snapshot entry, never
+    stop the other sources, wake once on the third consecutive failure and reset on recovery."""
+    check(os.geteuid() != 0, 'the acceptance must run unprivileged: the unreadable-directory case relies on chmod 0 being enforced')
+    h, d, gh, dog, coder, clock, sup, tick = timer_setup()
+    cfg_path = Path(h, 'config.json')
+    try:
+        tick('snapshot initialised', 'first check')
+        child = subprocess.Popen(['sleep', '600'])
+        try:
+            cdir = coder_dir(coder, 'b97-logs', child.pid)
+            tick('coder b97-logs', 'a coder dir appears')
+            cdir.chmod(0)
+            try:
+                tick(None, 'unreadable coder dir 1')
+                Path(h, 'engine-runtime.json').write_text(json.dumps({'episode_id': 'ep-9', 'active': True}))
+                tick(('fallback episode ep-9', 'started'), 'another source still observed while coder fails', forbid=('check failing',))
+                tick('check failing: coder', 'unreadable coder dir 3')
+                tick(None, 'unreadable coder dir 4: no second wake')
+                snap = snapshot(h)
+                check((snap.get('failures') or {}).get('coder') == 4, f'coder failure streak counted: {snap.get("failures")}')
+                check('b97-logs' in json.dumps(snap.get('coder', {})), f'the coder snapshot keeps its last good entry: {snap.get("coder")}')
+            finally:
+                cdir.chmod(0o755)
+            tick(None, 'coder readable again, unchanged: no wake')
+            check(not (snapshot(h).get('failures') or {}).get('coder'), 'the coder streak resets on success')
+            child.kill(); child.wait()
+            tick(('coder b97-logs', 'dead'), 'the launcher died after the recovery')
+        finally:
+            with contextlib.suppress(Exception):
+                child.kill(); child.wait()
+        ws = Path(h, 'work-status.json'); ws.write_text('{not json')
+        tick(None, 'invalid work-status 1'); tick(None, 'invalid work-status 2')
+        tick('check failing: work-status', 'invalid work-status 3')
+        tick(None, 'invalid work-status 4: no second wake')
+        ws.write_text(json.dumps({'turn': 1, 'mode': 'done'}))
+        tick(None, 'work-status readable again')
+        check(not (snapshot(h).get('failures') or {}).get('work-status'), 'the work-status streak resets on success')
+        er = Path(h, 'engine-runtime.json'); er.write_text('{not json')
+        tick(None, 'invalid engine-runtime 1'); tick(None, 'invalid engine-runtime 2')
+        tick('check failing: engine-runtime', 'invalid engine-runtime 3')
+        er.write_text(json.dumps({'episode_id': 'ep-9', 'active': True}))
+        tick(None, 'engine-runtime readable again, unchanged: no wake')
+        cfg = json.loads(cfg_path.read_text()); good_bin = cfg['timer']['dogfood']['systemctl_bin']
+        cfg['timer']['dogfood']['systemctl_bin'] = str(Path(dog.d, 'no-such-systemctl')); cfg_path.write_text(json.dumps(cfg))
+        tick(None, 'missing systemctl 1')
+        gh.repo(HYDRA_REPO, head=sha('h3'))
+        tick(('hydra-agent main', sha('h3')[:7]), 'GitHub still observed while the dogfood fails', forbid=('check failing',))
+        tick('check failing: dogfood', 'missing systemctl 3')
+        tick(None, 'missing systemctl 4: no second wake')
+        check(snapshot(h).get('dogfood', {}).get('unit') == 'active', f'the dogfood snapshot keeps its last good entry: {snapshot(h).get("dogfood")}')
+        cfg['timer']['dogfood']['systemctl_bin'] = good_bin; cfg_path.write_text(json.dumps(cfg))
+        tick(None, 'dogfood readable again, unchanged: no wake')
+        check(not (snapshot(h).get('failures') or {}).get('dogfood'), 'the dogfood streak resets on success')
+    finally:
+        dog.close()
+
+
+def timer_daily_digest():
+    """Requirement 10: the daily digest fires once per local date at timer.digest_at (America/Los_Angeles by
+    default), with digest: true in the payload; a snapshot initialised after that time does not catch up."""
+    h, d, gh, dog, coder, clock, sup, tick = timer_setup(start=dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.timezone.utc))  # 05:00 PDT
+    try:
+        tick('snapshot initialised', 'first check', forbid=('daily digest',))
+        target = dt.datetime(2026, 10, 8, 13, 58, 0, tzinfo=dt.timezone.utc)
+        clock.advance(max(0, (target - clock.now).total_seconds()))
+        tick(None, 'two minutes before the digest time')
+        clock.advance(120)
+        ev = tick('timer: daily digest', 'digest at 07:00 local')
+        check(ev['payload'].get('digest') is True, f'the digest event carries digest: true: {ev["payload"]}')
+        tick(None, 'no second digest the same date')
+        clock.advance(6 * 3600)
+        tick(None, 'nor six hours later')
+        clock.advance(18 * 3600)
+        ev = tick('timer: daily digest', 'the next day digests again')
+        check(ev['payload'].get('digest') is True, 'digest: true on the next day too')
+    finally:
+        dog.close()
+    h, d, gh, dog, coder, clock, sup, tick = timer_setup(start=dt.datetime(2026, 10, 8, 20, 0, 0, tzinfo=dt.timezone.utc))  # 13:00 PDT
+    try:
+        tick('snapshot initialised', 'first check after the digest time', forbid=('daily digest',))
+        tick(None, 'no catch-up digest after deployment')
+        clock.advance(3600)
+        tick(None, 'nor an hour later')
+    finally:
+        dog.close()
+
+
+def timer_max_silence():
+    """Requirement 10: max silence wakes only while something is in flight (a live coder run, an open PR by the
+    manager, an operator deadline), never when only L is pending; the silence clock restarts at every wake."""
+    h, d, gh, dog, coder, clock, sup, tick = timer_setup(start=dt.datetime(2026, 10, 8, 20, 0, 0, tzinfo=dt.timezone.utc))  # 13:00 PDT
+    cfg = json.loads(Path(h, 'config.json').read_text()); cfg['timer']['max_silence_s'] = 1800
+    Path(h, 'config.json').write_text(json.dumps(cfg))
+    try:
+        tick('snapshot initialised', 'first check')
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 1, 'mode': 'waiting', 'track': 'ops', 'who': 'L', 'since': int(sup.clock_epoch())}))
+        clock.advance(1800 + 120)
+        tick(None, 'max silence with only L pending never wakes')
+        clock.advance(1800 + 120)
+        tick(None, 'still never, later')
+        child = subprocess.Popen(['sleep', '600'])
+        try:
+            coder_dir(coder, 'b98-logs', child.pid)
+            tick('coder b98-logs', 'a live coder run appears')
+            clock.advance(900)
+            tick(None, 'fifteen minutes of silence is under the limit')
+            clock.advance(1200)
+            tick(('timer: max silence', 'in flight', 'b98-logs'), 'max silence with a live coder run')
+            tick(None, 'right after the forced wake nothing is due')
+            clock.advance(900)
+            tick(None, 'the silence clock restarted at the forced wake')
+            # an ordinary turn restarts the silence clock too: the check that observes a new turn record is the reference
+            event(h, 'a founder message', thread='4.4'); check(sup.run_once() is True, 'the ordinary turn must run')
+            tick(None, 'the check after an ordinary turn: nothing to wake for')
+            clock.advance(1200)
+            tick(None, 'twenty minutes after the turn was observed, thirty-five since the forced wake: under the limit')
+            clock.advance(700)
+            tick(('timer: max silence', 'in flight', 'b98-logs'), 'max silence counted from the observed turn')
+            child.kill(); child.wait()
+            tick(('coder b98-logs', 'dead'), 'the run ended')
+            clock.advance(1800 + 120)
+            tick(None, 'a dead run is not in flight; only L pending: no max-silence wake')
+        finally:
+            with contextlib.suppress(Exception):
+                child.kill(); child.wait()
+        gh.repo(HYDRA_REPO, head=sha('h1'), prs=[pr(71, sha('m1'), login='hydra-manager')])
+        tick('hydra-agent PR #71', 'the manager opened a PR')
+        clock.advance(1800 + 120)
+        tick(('timer: max silence', 'in flight', 'PR #71'), 'max silence with an open PR by the manager')
+        gh.repo(HYDRA_REPO, head=sha('h1'), prs=[pr(72, sha('m2'), login='someone-else')])
+        tick(('PR #71', 'PR #72'), 'the manager PR closed, another opened')
+        clock.advance(1800 + 120)
+        tick(None, 'a PR by someone else is not the manager in flight')
+        now_epoch = int(sup.clock_epoch())
+        Path(h, 'work-status.json').write_text(json.dumps({'turn': 2, 'mode': 'waiting', 'track': 'b12', 'who': 'Hermes', 'deadline': now_epoch + 10 * 24 * 3600, 'since': now_epoch}))
+        tick(None, 'a new waiting record is not itself a reason')
+        clock.advance(1800 + 120)
+        tick(('timer: max silence', 'in flight', 'Hermes'), 'max silence with an operator deadline')
+        line = next((l for l in S.status_text(h).splitlines() if l.startswith('timer: ')), '')
+        check('last wake' in line and 'max silence' in line, f'status shows the last wake reason: {line!r}')
+        rows = checks_log(h)
+        check(len(rows) == tick.n and sum(1 for r in rows if r['woke']) == 9, f'nine wakes in {len(rows)} checks expected: {[r["reasons"] for r in rows if r["woke"]]}')
+    finally:
+        dog.close()
+
+
+def timer_service_loop():
+    """Requirement 10/11: the service loop itself calls timer_tick once per elapsed every_s slot on the supervisor's
+    clock, never while paused, and adopts a changed interval without a restart (driven through the injected sleep)."""
+    h, d = home(), fakes(context=100000)
+    coder = Path(tempfile.mkdtemp(prefix='b11-coder-'))
+
+    def configure(every_s):
+        Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': every_s, 'github_repos': [], 'coder_logs_glob': str(coder / '*-logs')}}))
+    configure(60)
+    start = dt.datetime(2026, 10, 8, 15, 0, 0, tzinfo=dt.timezone.utc)
+    clock = Clock(start)
+    stop = threading.Event()
+
+    class Stop(BaseException):
+        pass
+
+    def fake_sleep(seconds):
+        if stop.is_set():
+            raise Stop()
+        clock.advance(max(float(seconds), 1.0))
+    sup = make(h, d, clock=clock, sleep=fake_sleep)
+    ticks = []
+    real = sup.timer_tick
+
+    def spy(now=None):
+        ticks.append(sup.clock_epoch())
+        return real(now)
+    sup.timer_tick = spy
+    errors = []
+
+    def run():
+        try:
+            sup.loop(sleep_s=5)
+        except Stop:
+            pass
+        except BaseException as e:  # noqa: BLE001 - surfaced by the contract
+            errors.append(repr(e))
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    def wait_clock(seconds, label):
+        target = clock.now + dt.timedelta(seconds=seconds)
+        deadline = time.time() + 120
+        while clock.now < target and time.time() < deadline and t.is_alive():
+            time.sleep(0.02)
+        check(t.is_alive() and not errors, f'{label}: the loop must keep running: {errors}')
+        check(clock.now >= target, f'{label}: the loop must sleep through the injected sleep (clock did not advance)')
+    try:
+        wait_clock(600, 'ten minutes at 60 s')
+        n = len(ticks)
+        check(9 <= n <= 12, f'about ten timer_tick calls in ten minutes at every_s 60, got {n}')
+        slots = [int(ts // 60) for ts in ticks]
+        check(len(slots) == len(set(slots)), f'at most one timer_tick per slot: {slots}')
+        Path(h, 'PAUSE').write_text('acceptance\n')
+        wait_clock(300, 'paused')
+        check(len(ticks) == n, f'no timer_tick while paused: {len(ticks) - n} call(s)')
+        Path(h, 'PAUSE').unlink()
+        configure(120)
+        wait_clock(600, 'ten minutes at 120 s')
+        m = len(ticks) - n
+        check(4 <= m <= 6, f'about five timer_tick calls in ten minutes at every_s 120 (re-read without a restart), got {m}')
+        rows = checks_log(h)
+        check(len(rows) == len(ticks), f'every loop-driven tick appends its check record: {len(rows)} rows vs {len(ticks)} calls')
+        check(sum(1 for r in rows if r['woke']) == 1 and rows[0]['reasons'] == ['snapshot initialised'], f'only the initialising check wakes with nothing changing: {[r["reasons"] for r in rows if r["woke"]]}')
+        check(len([r for r in turns(h) if r.get('events')]) == 1, 'exactly one turn (the initialising wake) ran')
+    finally:
+        stop.set()
+        t.join(10)
+
+
+def timer_interval_config():
+    """Requirement 11: timer.every_s (and the other timer keys) come from config.json, re-read each time, clamped;
+    the module has no TIMER_EVERY_S / TIMER_TEXT constants."""
+    check(not hasattr(S, 'TIMER_EVERY_S'), 'TIMER_EVERY_S must be gone from the module')
+    check(not hasattr(S, 'TIMER_TEXT'), 'TIMER_TEXT must be gone from the module')
+    h = home()
+    cfg = S.timer_config(h)
+    for k, v in (('every_s', 900), ('digest_at', '07:00'), ('digest_tz', 'America/Los_Angeles'), ('max_silence_s', 14400),
+                 ('gh_bin', 'gh'), ('github_repos', [FADEN_REPO, HYDRA_REPO]), ('coder_logs_glob', '/srv/hydra/coder/*-logs')):
+        check(cfg.get(k) == v, f'timer default {k} must be {v!r}, got {cfg.get(k)!r}')
+    check(S.TIMER_DEFAULTS['every_s'] == 900, 'TIMER_DEFAULTS.every_s must be 900')
+    sup = make(h, fakes())
+    check(sup.add_timer_event(now=1000.0)['id'] == 'timer-1', 'the default slot is 900 s (baseline contract)')
+    check(sup.add_timer_event(now=1500.0) is None, 'the same 900 s slot is not queued twice (baseline contract)')
+    Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 120, 'max_silence_s': 10}}))
+    cfg = S.timer_config(h)
+    check(cfg['every_s'] == 120 and cfg['max_silence_s'] == 120, f'every_s 120 and max_silence_s clamped up to it: {cfg}')
+    ev = sup.add_timer_event(now=1000000.0)
+    check(ev and ev['id'] == f'timer-120-{int(1000000.0 // 120)}', f'a non-default interval carries its identity in the id: {ev}')
+    Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 5}}))
+    check(S.timer_config(h)['every_s'] == 30, 'every_s below 30 is clamped to 30')
+    ev = sup.add_timer_event(now=1000120.0)
+    check(ev and ev['id'] == f'timer-30-{int(1000120.0 // 30)}', f'a changed interval is re-read: {ev}')
+    # the collision regression: slot 1 was handled under 900 s; under 30 s the same slot number is a different event
+    Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 30}}))
+    ev = sup.add_timer_event(now=30.0)
+    check(ev and ev['id'] == 'timer-30-1', f'the same slot number under another interval is a distinct event: {ev}')
+    Path(h, 'config.json').write_text(json.dumps({'timer': {'every_s': 900}}))
+    check(sup.add_timer_event(now=1000.0) is None, 'back on 900 s the already-queued timer-1 is still not queued twice')
+    Path(h, 'config.json').write_text('{not json')
+    check(S.timer_config(h)['every_s'] == 900, 'an unreadable config falls back to the defaults')
+
+
+SCENARIOS = [threshold_compacts_before_next_turn, threshold_boundaries, quiet_hours_do_not_gate,
              bytes_overage_compacts, codex_selected_ignores_stale_claude_measurement,
              held_is_loud_and_keeps_the_schedule, failed_rollover_backs_off, cli_compactions_detected,
-             status_line_contract, stale_pending_regression, state_digest_bounds_the_message, persistent_mode_covered]
+             status_line_contract, stale_pending_regression, state_digest_bounds_the_message, persistent_mode_covered,
+             timer_gating_sources, timer_check_failures, timer_source_isolation, timer_daily_digest, timer_max_silence,
+             timer_service_loop, timer_interval_config]
 
 
 def main(argv):

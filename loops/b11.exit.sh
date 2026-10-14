@@ -28,8 +28,14 @@ test -f docs/notes/b11.md || fail 'docs/notes/b11.md missing'
 PYTHON="${PYTHON:-python3}"
 PYTHON=$("$PYTHON" -c 'import sys; print(sys.executable)') || fail 'cannot resolve the Python interpreter'
 [[ "$PYTHON" = /* ]] || fail "interpreter path is not absolute: $PYTHON"
+# The gates below use assert; an optimising interpreter would skip them. Refuse PYTHONOPTIMIZE and a forced -O.
+unset PYTHONOPTIMIZE
+"$PYTHON" -c 'import sys; raise SystemExit(1 if sys.flags.optimize else 0)' || fail 'the interpreter runs with optimization on; the exit gates need assert'
+[[ "$(id -u)" != 0 ]] || fail 'run the exit unprivileged, never as root (the acceptance relies on file permissions)'
 # Notes gate (requirement 8): real headings with bodies, evidence content, no Slack ids / tokens / hostnames.
 "$PYTHON" - <<'PY' || fail 'notes gate'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import re,sys
 from pathlib import Path
 text=Path('docs/notes/b11.md').read_text()
@@ -56,8 +62,10 @@ for label,pat in (('Slack id',r'\b[CUW]0[A-Z0-9]{8,}\b'),('token',r'xox[a-z]-|gh
 print('[b11] notes ok')
 PY
 "$PYTHON" -c 'import pytest, slack_bolt, slack_sdk' || fail 'install pytest, slack_bolt and slack_sdk in the selected Python environment'
-# Seams of requirements 2, 3 and 5 (the acceptance exercises their behaviour; these are the names it relies on).
+# Seams of requirements 2, 3, 5, 10 and 11 (the acceptance exercises their behaviour; these are the names it relies on).
 "$PYTHON" - <<'PY' || fail 'required seams missing'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import ast,re
 from pathlib import Path
 src=Path('manager/supervisor.py').read_text()
@@ -70,6 +78,18 @@ assert 'state_digest' in methods,'Supervisor.state_digest missing (requirement 5
 assert 'state_block' not in methods,'Supervisor.state_block must be replaced by state_digest (requirement 5)'
 defaults=re.search(r'COMPACTION_DEFAULTS\s*=\s*\{(.*?)\}',src,re.S)
 assert defaults and re.search(r'"rollover_enabled":\s*True',defaults.group(1)),'COMPACTION_DEFAULTS lacks "rollover_enabled": True (requirement 2)'
+assert 'over_ratio' not in defaults.group(1),'COMPACTION_DEFAULTS must not carry over_ratio (requirement 1, amendment 2026-10-14)'
+assert 'TIMER_EVERY_S' not in src,'TIMER_EVERY_S must be replaced by timer.every_s (requirement 11)'
+assert 'TIMER_TEXT' not in src,'TIMER_TEXT must be replaced by the reasons of the change check (requirement 10)'
+assert 'timer_config' in names,'module-level timer_config missing (requirement 11)'
+assert 'timer_tick' in methods,'Supervisor.timer_tick missing (requirement 10)'
+tdefaults=re.search(r'TIMER_DEFAULTS\s*=\s*\{(.*?)\n\}',src,re.S) or re.search(r'TIMER_DEFAULTS\s*=\s*\{(.*?)\}',src,re.S)
+assert tdefaults and re.search(r'"every_s":\s*900\b',tdefaults.group(1)),'TIMER_DEFAULTS lacks "every_s": 900 (requirement 11)'
+assert 'timer-snapshot.json' in src and 'timer-checks.jsonl' in src,'the timer snapshot and check log paths are missing (requirement 10)'
+assert 'check failing: ' in src,'the failing-source wake reason is missing (requirement 10)'
+readme=Path('manager/README.md').read_text()
+for key in ('"timer"','every_s','digest_at','digest_tz','max_silence_s','gh_bin','github_repos','coder_logs_glob','dogfood','health_url','timer-checks.jsonl'):
+    assert key in readme,f'manager/README.md must document the timer section incl. {key} (requirement 11)'
 assert 'compact_boundary' in src,'compact_boundary detection missing (requirement 3)'
 assert 'message_bytes' in src,'turn records must carry message_bytes (requirement 5)'
 assert 'end of state digest' in src,'the digest terminator line is missing (requirement 5)'
@@ -81,6 +101,8 @@ PY
 # Baseline regression preservation: every baseline tests/manager statement stays structurally identical, except the
 # two named tests of requirement 7 that contradict this spec; those may be absent. No duplicate definitions.
 "$PYTHON" - "$BASE" $EXEMPT <<'PY'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import ast,subprocess,sys
 from pathlib import Path
 base=sys.argv[1];exempt=set(sys.argv[2:])
@@ -113,6 +135,8 @@ for t in $EXEMPT; do DESELECT+=(--deselect "$t"); done
 (cd "$MIX" && "$PYTHON" -m pytest --rootdir=. -q -rA -p no:cacheprovider "${DESELECT[@]}" tests/manager) >"$MIX/run.txt" 2>&1 || { tail -n 40 "$MIX/run.txt"; fail 'baseline suite fails against candidate code'; }
 "$PYTHON" - "$MIX/nodes.txt" "$MIX/run.txt" <<'PY'
 import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
+import sys
 from pathlib import Path
 nodes={l.strip() for l in Path(sys.argv[1]).read_text().splitlines() if l.startswith('tests/manager/') and '::' in l}
 assert nodes,'empty baseline node set'
@@ -127,9 +151,11 @@ m=re.search(r'(\d+) passed',notes)
 assert m and int(m.group(1))>=len(nodes),f'notes pytest count {m.group(1) if m else None} is below the {len(nodes)} baseline node ids the exit executed'
 PY
 "$PYTHON" - "$PYTHON" <<'PY'
+import sys
+if sys.flags.optimize: raise SystemExit('[b11] FAIL: python optimization disables the gate assertions')
 import re,subprocess,sys
 from pathlib import Path
-try: result=subprocess.run([sys.argv[1],'loops/b11.acceptance.py'],timeout=600,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+try: result=subprocess.run([sys.argv[1],'loops/b11.acceptance.py'],timeout=900,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
 except subprocess.TimeoutExpired: raise SystemExit('[b11] FAIL: loops/b11.acceptance.py timeout')
 sys.stdout.write(result.stdout)
 if result.returncode: raise SystemExit(f'[b11] FAIL: loops/b11.acceptance.py exit {result.returncode}')
