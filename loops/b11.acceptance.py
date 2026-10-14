@@ -1588,12 +1588,125 @@ def timer_interval_config():
     check(S.timer_config(h)['every_s'] == 900, 'an unreadable config falls back to the defaults')
 
 
+def persistence_range(gh, old, commits, repo=FADEN_REPO):
+    """Complete compare + per-commit responses; commit tuples carry (sha, filenames)."""
+    parent = old
+    entries = []
+    for index, (head, paths) in enumerate(commits):
+        entry = {'sha': head, 'parents': [{'sha': parent}]}
+        entries.append(entry)
+        gh.set(f'repos/{repo}/commits/{head}', dict(entry, commit={
+            'message': f'manager: turn {index + 1}',
+            'author': {'name': 'hydra-manager', 'email': 'manager@hydra.local'},
+            'committer': {'name': 'hydra-manager', 'email': 'manager@hydra.local'}},
+            files=[{'filename': path, 'status': 'modified'} for path in paths]))
+        parent = head
+    path = f'repos/{repo}/compare/{old}...{parent}'
+    gh.set(path, {'status': 'ahead', 'merge_base_commit': {'sha': old},
+                 'total_commits': len(entries), 'ahead_by': len(entries), 'behind_by': 0, 'commits': entries})
+    return path
+
+
+def persistence_fixture():
+    fixture = timer_setup()
+    h, d, gh, dog, coder, clock, sup, tick = fixture
+    gh.repo(FADEN_REPO, sha('f1'))
+    tick('snapshot initialised', 'initial')
+    tick(None, 'quiet')
+    return fixture
+
+
+def timer_persistence_only():
+    h, d, gh, dog, coder, clock, sup, tick = persistence_fixture()
+    try:
+        old, mid, new = sha('f1'), sha('persist1'), sha('persist2')
+        persistence_range(gh, old, [(mid, ['factory/log/a.jsonl']),
+                                   (new, ['factory/state.json', 'factory/manager-memory/MEMORY.md'])])
+        gh.repo(FADEN_REPO, new)
+        tick(None, 'complete two-commit persistence range')
+        check(snapshot(h)['github'][FADEN_REPO]['head'] == new, 'suppression advances observed head')
+        tick(None, 'unchanged suppressed range')
+        newer = sha('persist3')
+        persistence_range(gh, new, [(newer, ['factory/log/tracks/ops.md'])])
+        gh.repo(FADEN_REPO, newer, prs=[pr(89, sha('pr89'))], issues=[{'number': 90, 'updated_at': '2026-10-08T15:04:00Z'}])
+        tick('PR #89 opened', 'other changes survive', forbid=('faden main',),
+             exact=['faden PR #89 opened', 'faden issue #90 updated'])
+        tick(None, 'other changes wake only once')
+        gh.repo(FADEN_REPO, sha('unknown'), prs=[pr(89, sha('pr89'))], issues=[{'number': 90, 'updated_at': '2026-10-08T15:04:00Z'}])
+        tick('faden main', 'no stale suppression on next range')
+        check(calls(d) == [], 'verification invokes no model')
+    finally:
+        dog.close()
+
+
+def timer_persistence_mixed():
+    h, d, gh, dog, coder, clock, sup, tick = persistence_fixture()
+    try:
+        old = sha('f1')
+        for label, paths in [('product', ['src/app.py']), ('reverted-product', ['src/app.py']),
+                             ('unknown-owner', ['factory/state.json'])]:
+            mid, new = sha(label + 'mid'), sha(label + 'new')
+            commits = [(mid, paths)]
+            if label == 'reverted-product':
+                commits.append((sha('revert'), paths))
+            commits.append((new, ['factory/manager-memory/MEMORY.md']))
+            persistence_range(gh, old, commits)
+            if label == 'unknown-owner':
+                key = f'repos/{FADEN_REPO}/commits/{mid}'
+                detail = gh.routes[key]; detail['commit']['message'] = 'human updates state'; gh.set(key, detail)
+            gh.repo(FADEN_REPO, new)
+            tick('faden main', label, exact=[f'faden main {old[:7]} -> {new[:7]}'])
+            tick(None, label + ' wakes once')
+            old = new
+    finally:
+        dog.close()
+
+
+def timer_persistence_failed_verification():
+    h, d, gh, dog, coder, clock, sup, tick = persistence_fixture()
+    try:
+        old = sha('f1')
+        cases = ['api', 'detail-api', 'truncated', 'diverged', 'wrong-base', 'wrong-tip', 'merge',
+                 'identity', 'wrong-detail', 'missing-files', 'full-page', 'path', 'rename', 'status']
+        for case in cases:
+            new = sha(case)
+            path = persistence_range(gh, old, [(new, ['factory/log/a.jsonl'])])
+            compare = gh.routes[path]
+            key = f'repos/{FADEN_REPO}/commits/{new}'
+            detail = gh.routes[key]
+            if case == 'api': gh.fail([path])
+            if case == 'detail-api': gh.fail([key])
+            if case == 'truncated': compare['total_commits'] = compare['ahead_by'] = 2
+            if case == 'diverged': compare['status'] = 'diverged'
+            if case == 'wrong-base': compare['merge_base_commit']['sha'] = sha('elsewhere')
+            if case == 'wrong-tip': compare['commits'][-1]['sha'] = sha('wrong-tip-value')
+            if case == 'merge': compare['commits'][0]['parents'].append({'sha': sha('side')})
+            if case == 'identity': detail['commit']['committer']['email'] = 'other@example.test'
+            if case == 'wrong-detail': detail['sha'] = sha('detail-mismatch')
+            if case == 'missing-files': detail.pop('files')
+            if case == 'full-page': detail['files'] *= 100
+            if case == 'path': detail['files'][0]['filename'] = 'factory/log/../../src/app.py'
+            if case == 'rename': detail['files'][0].update(status='renamed', previous_filename='src/app.py')
+            if case == 'status': detail['files'][0]['status'] = 'unknown'
+            gh.set(path, compare); gh.set(key, detail)
+            gh.repo(FADEN_REPO, new, prs=[pr(91, sha(case + 'pr'))])
+            tick('faden main', case + ' fails open to wake', exact=[f'faden main {old[:7]} -> {new[:7]}',
+                 'faden PR #91 opened' if case == 'api' else f'faden PR #91 head {sha(cases[cases.index(case)-1] + 'pr')[:7]} -> {sha(case + 'pr')[:7]}'])
+            check(snapshot(h)['github'][FADEN_REPO]['head'] == new, case + ': observation advances')
+            gh.fail([])
+            tick(None, case + ' wakes once')
+            old = new
+    finally:
+        dog.close()
+
+
 SCENARIOS = [threshold_compacts_before_next_turn, threshold_boundaries, quiet_hours_do_not_gate,
              bytes_overage_compacts, codex_selected_ignores_stale_claude_measurement,
              held_is_loud_and_keeps_the_schedule, failed_rollover_backs_off, cli_compactions_detected,
              status_line_contract, stale_pending_regression, state_digest_bounds_the_message, persistent_mode_covered,
              timer_gating_sources, timer_check_failures, timer_source_isolation, timer_daily_digest, timer_max_silence,
-             timer_service_loop, timer_interval_config]
+             timer_service_loop, timer_interval_config, timer_persistence_only,
+             timer_persistence_mixed, timer_persistence_failed_verification]
 
 
 def main(argv):
