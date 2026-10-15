@@ -98,6 +98,7 @@ LOOP_SLEEP_S = 5
 DEADMAN_S = 1800
 NOTE_EVERY_S = 3600
 RETRY_AFTER_S = 300
+TIER_PROBE_S = 3600  # loops/b12.md (founder rule 3, 2026-10-15): from a lower tier, re-probe the tiers above at most hourly
 ENGINE_TIMEOUT_S = 1800
 DEFAULT_HOME = "/srv/hydra/manager"
 TRANSITION_DEFAULTS = {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": True}
@@ -1664,7 +1665,15 @@ def _status_engine_lines(home, pair):
     configured = (pair['acc'], pair['model'])
     latest = turns[-1] if turns else None
     actual = runner(latest) if latest else ('unknown', 'unknown')
-    engine = f'engine: configured {engine_label(pair)}{mode_suffix(pair)} | last turn ran on {actual[0]} ({actual[1]})'
+    runtime = read_engine_runtime(home)
+    operator = runtime.get('configured') if runtime.get('episode_id') and runtime.get('active') else None
+    if isinstance(operator, dict) and operator.get('acc') and (operator.get('acc'), operator.get('model')) != configured:
+        # founder rule 5 (2026-10-15): the operator's pair and the effective pair are shown separately while a
+        # fallback episode has moved the manager; MISMATCH compares the runner with the effective pair.
+        engine = (f'engine: configured {engine_label(operator)}{mode_suffix(pair)} | effective {engine_label(pair)} '
+                  f'| last turn ran on {actual[0]} ({actual[1]})')
+    else:
+        engine = f'engine: configured {engine_label(pair)}{mode_suffix(pair)} | last turn ran on {actual[0]} ({actual[1]})'
     if latest and actual != configured:
         engine += ' | MISMATCH'
     timed_attempts = [(a, _status_timestamp(a['at'])) for a in attempts]
@@ -2469,6 +2478,14 @@ class AllEnginesFailed(Exception):
         self.uncertain = uncertain
 
 
+class EngineFault(AllEnginesFailed):
+    """A non-usage failure on the step that was running: a crash (rc 17), a timeout (rc 124), a rate limit, a
+    session error or any `other` error (loops/b12.md, founder rule 4 of 2026-10-15). The manager never moves to
+    another tier or account on it: the turn fails, nothing is persisted, the same engine is retried on the normal
+    back-off, and one top-level `engine fault: ...` line is posted per fault episode."""
+    fault = True
+
+
 class Supervisor:
     def __init__(self, home=None, engines=None, poster=None, repo=None, config=None, engine_timeout=ENGINE_TIMEOUT_S,
                  codex_home=None, clock=None, buildlog_poster=None, reactor=None, sleep=None):
@@ -2511,7 +2528,8 @@ class Supervisor:
             os.makedirs(os.path.join(self.home, d), exist_ok=True)
         self._reconcile_rollover_intent()  # requirement 13, loops/b7.md: before any Claude invocation
         self._reconcile_fallback_notice()  # requirement 12, loops/b7.md: before the next run_engines
-        self._reconcile_unavailable_notice()  # loops/b12.md requirement 3: a durable episode's notice is queued
+        self._reconcile_unavailable_notice()
+        self._reconcile_fault_notice()  # loops/b12.md requirement 3: a durable episode's notice is queued
 
     # ---- small helpers
     def path(self, *parts):
@@ -2729,9 +2747,14 @@ class Supervisor:
                           "duration_s": round(time.time() - started, 3), "error": str(e)[:2000]})
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
             self.react_failed(events)
-            text = self._unavailable_text(getattr(e, "reasons", None))
-            self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
-            self._note_unavailable(n, text)  # loops/b12.md requirement 3: one top-level line per episode
+            if getattr(e, "fault", False):
+                text = self._fault_text(getattr(e, "reasons", None))
+                self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
+                self._note_fault(n, text)  # founder rule 4 (2026-10-15): one top-level line per fault episode
+            else:
+                text = self._unavailable_text(getattr(e, "reasons", None))
+                self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
+                self._note_unavailable(n, text)  # loops/b12.md requirement 3: one top-level line per episode
             if getattr(e, "uncertain", False):
                 # requirement 1/8, loops/b8.md: an uncertain submitted request (crash/timeout) gets a durable
                 # disposition that prevents automatic replay -- never reported successful, and not left
@@ -2741,6 +2764,7 @@ class Supervisor:
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("logs", "retry-after"))
         self._close_unavailable_episode()  # a turn served by any ladder step ends the unavailability episode
+        self._close_fault_episode()  # and the fault episode (founder rule 4, 2026-10-15)
         reply, handoff = split_handoff(stdout)
         reply = sanitize_reply(reply)
         if handoff:
@@ -2983,8 +3007,18 @@ class Supervisor:
                 primary = conf
         started_pair = dict(pair)
         order = self._ladder_rotation(primary, ladder_steps(ladder, self.engines))
+        probed_tiers = None  # founder rule 3: tiers above the effective one are tried only when the probe is due
+        if runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict) and configured.get("acc"):
+            conf_tier = ladder_position({"acc": configured.get("acc"), "model": configured.get("model")}, ladder)
+            eff_tier = ladder_position(pair, ladder)
+            if conf_tier is not None and eff_tier is not None and eff_tier > conf_tier:
+                if self._tier_probe_due(runtime):
+                    probed_tiers = {s[0] for s in order if s[0] < eff_tier}
+                else:
+                    order = self._ladder_rotation(pair, [s for s in ladder_steps(ladder, self.engines) if s[0] >= eff_tier])
         current = order[0][1] if order else pair["acc"]
         errors, reasons = [], []
+        failed_steps = []  # (tier, error) of every failed invocation this turn
         persist_switch = False  # a quota, auth or budget move is persisted; a plain or session-level failure is not
         skip_claude = False
         last_reason = None
@@ -2992,6 +3026,11 @@ class Supervisor:
         def failed(uncertain=False):
             exc = AllEnginesFailed(errors, uncertain=uncertain)
             exc.reasons = list(reasons)
+            return exc
+
+        def fault(uncertain=False):
+            exc = EngineFault(errors[-1:], uncertain=uncertain)
+            exc.reasons = reasons[-1:]
             return exc
         for tier, name, model in order:
             spec = self.engines.get(name) or {}
@@ -3042,13 +3081,22 @@ class Supervisor:
                     self.save_transition(transition, block, switch_at)
                 if name != pair["acc"]:
                     notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
-                if persist_switch and (name != pair["acc"] or model != pair["model"]):
+                restored = bool(runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict)
+                                and (name, model) == (configured.get("acc"), configured.get("model")))
+                if (persist_switch or restored) and (name != pair["acc"] or model != pair["model"]):
+                    # a persist-worthy move, or the configured pair serving again during an episode (the return
+                    # must land in the engine file too, or the next turn would stay on the lower tier)
                     set_engine(self.home, name, model, self.engines, explicit=False)
-                self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch)
+                probe_errors = None
+                if probed_tiers is not None or any(t < tier for t, _ in failed_steps):
+                    probe_errors = [e for t, e in failed_steps if t < tier]
+                self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch,
+                                               probe_errors=probe_errors)
                 return name, model, out, usage, transition
             classification = classify_engine_error(err)
             record_attempt(self.home, name, model, rc, classification, err, False)
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
+            failed_steps.append((tier, err or ""))
             log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
             last_reason = err
             if rc in (17, 124):
@@ -3057,11 +3105,15 @@ class Supervisor:
                 # must never be silently replayed on a different engine within the same turn; the event
                 # layer (turn()/post_unavailable) gives it a durable, truthful failure outcome instead.
                 reasons.append(step + ("crash" if rc == 17 else "timeout"))
-                raise failed(uncertain=True)
+                raise fault(uncertain=True)
             if classification == "other":
                 reasons.append(step + "other: " + ((err or "").strip() or f"exit {rc}")[:80])
             else:
                 reasons.append(step + classification)
+            if classification in ("other", "rate_limit"):
+                # founder rule 4 (2026-10-15): a non-usage failure never moves the manager down a tier or to
+                # the other account; the same engine is retried on the back-off and the fault is posted.
+                raise fault()
             if classification == "prompt_too_long":
                 skip_claude = True
                 if family == "claude" and self._is_working(name, model, spec):
@@ -3888,29 +3940,79 @@ class Supervisor:
         runtime["pending_notice"] = None
         save_engine_runtime(self.home, runtime)
 
-    def _note_fallback_transition(self, winning_acc, winning_model, started_pair, reason, persist_worthy):
+    def _note_fallback_transition(self, winning_acc, winning_model, started_pair, reason, persist_worthy,
+                                  probe_errors=None):
         """After a turn resolves successfully: start, update or close the fallback episode. Deliberately
-        selecting a different engine (no failure at all) is never itself a fallback episode."""
+        selecting a different engine (no failure at all) is never itself a fallback episode. `probe_errors` is
+        the list of errors of the higher-tier steps tried this turn (None when none was tried): landing on a tier
+        below the configured one schedules the next re-probe of the tiers above (founder rule 3, 2026-10-15)."""
         runtime = read_engine_runtime(self.home)
         configured = runtime.get("configured") or started_pair
         winning = {"acc": winning_acc, "model": winning_model}
         active = bool(runtime.get("episode_id")) and bool(runtime.get("active"))
+        ladder = self.engine_ladder()
+        conf_tier = ladder_position({"acc": configured.get("acc"), "model": configured.get("model")}, ladder)
+        win_tier = ladder_position(winning, ladder)
+        below = conf_tier is not None and win_tier is not None and win_tier > conf_tier
         # Compare acc/model only: once an operator has ever set mode=... (requirement 7, loops/b8.md),
         # the persisted "configured" pair also carries a "mode" key, which must never prevent recognizing
         # the restored primary and closing the episode (requirement 12/13).
         if winning == {"acc": configured.get("acc"), "model": configured.get("model")}:
             if active:
                 self._close_fallback_episode(runtime)
+            runtime = read_engine_runtime(self.home)
+            if runtime.pop("probe_after", None) is not None:
+                save_engine_runtime(self.home, runtime)
             return
         if not persist_worthy:
-            return  # transient (rate_limit/other) or session-level (prompt_too_long): never announced/persisted
+            return  # session-level (prompt_too_long) or a probe that changed nothing: never announced/persisted
         if not active:
             self._start_fallback_episode(runtime, configured, winning, reason)
         else:
-            runtime["effective"] = winning
-            if reason:
+            previous = runtime.get("effective") or {}
+            if {"acc": previous.get("acc"), "model": previous.get("model")} != winning:
+                # founder rule 5 (2026-10-15): every switch inside an episode gets one top-level notice too
+                runtime.update({"effective": winning, "moves": int(runtime.get("moves") or 0) + 1})
+                if reason:
+                    runtime["reason"] = reason
+                save_engine_runtime(self.home, runtime)
+                self.persistence_checkpoint("fallback_move_saved")
+                text = (f"fallback moved (episode {runtime.get('episode_id')}): {tier_label(previous, ladder)} "
+                        f"unavailable ({(reason or '').strip()[:300]}); now running {tier_label(winning, ladder)}")
+                _queue_notice_once(self.home, self.dev_channel, text,
+                                   f"fallback-{runtime.get('episode_id')}-move-{runtime['moves']}")
+            elif reason:
                 runtime["reason"] = reason
+                save_engine_runtime(self.home, runtime)
+        runtime = read_engine_runtime(self.home)
+        if below and (probe_errors is not None or not runtime.get("probe_after")):
+            runtime["probe_after"] = self._next_tier_probe(probe_errors or [])
             save_engine_runtime(self.home, runtime)
+        elif not below and runtime.get("probe_after"):
+            runtime.pop("probe_after", None)
+            save_engine_runtime(self.home, runtime)
+
+    def _tier_probe_due(self, runtime):
+        """Founder rule 3 (2026-10-15): from a lower tier, the tiers above are re-probed when `probe_after` has passed."""
+        after = parse_iso(runtime.get("probe_after"))
+        return after is None or self.clock_dt() >= after
+
+    def _next_tier_probe(self, errors):
+        """The next re-probe instant: the earliest reset time a failing higher-tier step stated, when it lies in
+        the future, else one TIER_PROBE_S from now."""
+        now = self.clock_dt()
+        resets = []
+        for text in errors:
+            m = re.search(r'\bresets?\s*:?\s+(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d))', str(text or ''), re.I)
+            if m:
+                try:
+                    at = _dt.datetime.fromisoformat(m.group(1).replace(' ', 'T').replace('Z', '+00:00'))
+                except ValueError:
+                    continue
+                if at > now:
+                    resets.append(at)
+        at = min(resets) if resets else now + _dt.timedelta(seconds=TIER_PROBE_S)
+        return at.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def run_emergency_rollover(self, reason="emergency"):
         """Emergency-only automatic rollover (requirement 6, loops/b8.md): the triggering request already
@@ -4458,6 +4560,51 @@ class Supervisor:
             self._queue_unavailable(data)  # the durable line of a crashed episode is still delivered once
         data.update({"episode_id": None, "closed_at": self.now()})
         self._save_unavailable(data)
+
+    # ---- the engine fault episode (loops/b12.md, founder rule 4 of 2026-10-15): the same shape as the
+    # unavailability episode, in logs/fault.json; one top-level `engine fault:` line per episode.
+    def fault_path(self):
+        return self.path("logs", "fault.json")
+
+    def _read_fault(self):
+        try:
+            data = json.loads(read_text(self.fault_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _fault_text(reasons):
+        return "engine fault: " + "; ".join(reasons or [])[:UNAVAILABLE_REASONS_MAX]
+
+    def _queue_fault(self, data):
+        _queue_notice_once(self.home, self.dev_channel, data.get("text") or "", f"fault-{data['episode_id']}")
+        data["queued"] = True
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+
+    def _reconcile_fault_notice(self):
+        data = self._read_fault()
+        if data.get("episode_id") and not data.get("queued"):
+            self._queue_fault(data)
+
+    def _note_fault(self, n, text):
+        data = self._read_fault()
+        if data.get("episode_id"):
+            if not data.get("queued"):
+                self._queue_fault(data)
+            return  # the same fault repeating inside the episode posts nothing more
+        data = {"episode_id": str(uuid.uuid4()), "since": self.now(), "turn": n, "text": text, "queued": False}
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+        self._queue_fault(data)
+
+    def _close_fault_episode(self):
+        data = self._read_fault()
+        if not data.get("episode_id"):
+            return
+        if not data.get("queued"):
+            self._queue_fault(data)
+        data.update({"episode_id": None, "closed_at": self.now()})
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
 
     def post_unavailable(self, events, msg=None):
         """The shared all-engines-failed notice sink (requirement 25, loops/b7.md; audit gap correction): a

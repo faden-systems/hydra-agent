@@ -85,6 +85,7 @@ def setup(home, tmp_path, engine=None, config=None, table=None):
     def tick():
         clock[0] += dt.timedelta(seconds=1)
         return clock[0]
+    tick.clock = clock  # tests advance time with sup.clock.clock[0] += ...
     sup = S.Supervisor(home=home, engines=fk.engines(), poster=Poster(), buildlog_poster=Poster(), clock=tick)
     return fk, sup
 
@@ -142,9 +143,18 @@ def test_fable_out_lands_on_astra_then_opus(home, tmp_path):
     fk.table(dict(ALL_OUT, **{f"claude-r2d2|{OPUS}": "ok"}))
     queue_event(home, "B")
     assert sup.run_once() is True
-    # during the episode the rotation starts at the configured primary (tier 1), then walks toward the floor
-    assert fk.invoked()[3:] == [("claude-r2d2", FABLE), ("claude-l", FABLE), ("codex", ASTRA), ("claude-r2d2", OPUS)]
+    # founder rule 3 (2026-10-15): inside the hour the tiers above the effective one are not re-probed; the turn
+    # starts at the effective step and walks toward the floor
+    assert fk.invoked()[3:] == [("codex", ASTRA), ("claude-r2d2", OPUS)]
     assert "active tier 3/3 claude-r2d2 (claude-opus-5-5)" in policy_line(home)
+    moved = [it["text"] for it in S.read_outbox(home) if "fallback moved" in it["text"]]
+    assert len(moved) == 1 and "tier 2/3 codex (gpt-6-astra) unavailable" in moved[0] \
+        and moved[0].endswith("now running tier 3/3 claude-r2d2 (claude-opus-5-5)")
+    # an hour later the probe is due: the configured tier is tried first again
+    sup.clock.clock[0] += dt.timedelta(seconds=S.TIER_PROBE_S)
+    queue_event(home, "C")
+    assert sup.run_once() is True
+    assert fk.invoked()[5:] == [("claude-r2d2", FABLE), ("claude-l", FABLE), ("codex", ASTRA), ("claude-r2d2", OPUS)]
     no_downgrade(home)
 
 
@@ -211,12 +221,18 @@ def test_only_persist_worthy_failures_persist(home, tmp_path, reason):
     before = open(os.path.join(home, "engine")).read()
     queue_event(home, "A")
     assert sup.run_once() is True
-    assert fk.invoked() == [("claude-r2d2", FABLE), ("claude-l", FABLE)]
     notices = [it for it in S.read_outbox(home) if "fallback started" in it["text"]]
     if reason == "auth":
+        assert fk.invoked() == [("claude-r2d2", FABLE), ("claude-l", FABLE)]
         assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": FABLE} and len(notices) == 1
     else:
+        # founder rule 4 (2026-10-15): a non-usage failure never moves the manager; the fault is posted once
+        assert fk.invoked() == [("claude-r2d2", FABLE)]
         assert open(os.path.join(home, "engine")).read() == before and not notices
+        faults = [it for it in S.read_outbox(home) if it["text"].startswith("engine fault: ")]
+        assert len(faults) == 1 and faults[0]["thread_ts"] is None \
+            and faults[0]["text"].startswith(f"engine fault: tier 1 claude-r2d2 ({FABLE}): {reason}")
+        assert os.path.exists(os.path.join(home, "logs", "retry-after"))
 
 
 def test_custom_ladder_order_and_status(home, tmp_path):
