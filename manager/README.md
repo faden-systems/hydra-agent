@@ -116,28 +116,100 @@ changes require a supervisor restart, while the current `engine` file is read ea
 
 ### Models
 
-`models.json` maps aliases to model ids per family. Claude: `fable5.1 → claude-fable-5-1` (default), `sonnet5 →
-claude-sonnet-5`, `opus5 → claude-opus-5`, `haiku4.5 → claude-haiku-4-5-20251001`. Codex: `gpt6`/`astra → gpt-6-astra`
-(default), `gpt5.6`/`sol → gpt-5.6-sol`. A full id of the family (`claude-…`, `gpt-…`) is accepted as-is. The Claude
-engine gets `--model <id>`, Codex gets `-m <id>`. An automatic switch on quota or budget keeps the alias when the new
-family has it, else takes the family default, and says so in the thread note: `engine: claude-l (claude-fable-5-1)`.
+`models.json` maps aliases to model ids per family. Claude: `fable5.1 → claude-fable-5-1` (default), `opus5 →
+claude-opus-5`, `opus5.5 → claude-opus-5-5`. Codex: `gpt6`/`astra → gpt-6-astra` (default), `gpt5.6`/`sol →
+gpt-5.6-sol`, `gpt6.1`/`sol6.1 → gpt-6.1-sol`. A full id of the family (`claude-…`, `gpt-…`) is accepted as-is. The
+Claude engine gets `--model <id>`, Codex gets `-m <id>`. `sonnet5` and `haiku4.5` are gone (loops/b12.md).
+`gpt6.1`/`sol6.1` (`gpt-6.1-sol`), `opus5` and `gpt5.6`/`sol` are coder-use aliases: they stay resolvable for coder
+tooling, but the manager ladder refuses them. Aliases added in `$HYDRA_HOME/models.json` are subject to the same
+allowlist, which is checked on the resolved full id: an alias can narrow nothing and extend nothing.
+
+### The manager ladder and its floor (loops/b12.md)
+
+The manager runs only on an allowlist with a preference order, the ladder (`MANAGER_LADDER` in `supervisor.py`):
+
+| tier | model | accounts |
+|---|---|---|
+| 1 | `claude-fable-5-1` (Fable 5.1) | `claude-r2d2`, then `claude-l` |
+| 2 | `gpt-6-astra` (GPT-6 Astra) | `codex` |
+| 3 (the floor) | `claude-opus-5-5` (Opus 5.5) | `claude-r2d2`, then `claude-l` |
+
+Nothing below the floor ever runs as the manager, automatically or by command. `config.json` may narrow or reorder
+the ladder with `"engine_policy": {"ladder": [{"model": "<alias|id>", "accounts": ["<account>", …]}, …]}`; every
+account must be a known engine, every model must resolve for that account's family and belong to the founder-approved
+set {`claude-fable-5-1`, `gpt-6-astra`, `claude-opus-5-5`}, and an account/model pair may appear only once. Any
+problem ignores the whole override: the default ladder is in force, one log line per process says
+`engine_policy ignored: <reason>; the default ladder is in force`, and the status line carries the reason.
+`engine_fallback.claude_models` (b7's same-account model retry) is ignored since b12, with one log line.
+
+A turn walks the ladder from the configured primary (the engine file): that step, the other accounts of its tier in
+listed order, every lower tier toward the floor, then the tiers above it from the top, so a deliberately selected
+lower tier still falls back and still recovers upward. Each step runs exactly its model on its account. An engine
+file outside the ladder (from before b12, or a hand edit) is never invoked: the turn starts at the first step on that
+account, else at tier 1, with a log line.
+
+Five founder rules (2026-10-15) govern a fallback episode:
+
+1. **Stickiness inside the tier.** The account that last worked (the engine file) serves first; a usage failure
+   (`credits`, `usage_limit`, `auth`) on it moves to the other account of the same tier before any lower tier.
+   Only when every account of tier 1 is out does a turn reach Astra, and only when Astra is out does it reach the
+   floor. The operator's pair (`configured` in `engine-runtime.json`) is never rewritten by the fallback.
+2. **Recovery is a move up, not a rewrite.** A success on a higher tier moves the manager back up at once; the
+   configured pair closes the episode (`fallback ended`) and is written back to the engine file; another account of
+   the configured tier becomes the effective pair.
+3. **Hourly re-probe.** While the effective tier is lower than the configured one, the tiers above are tried only
+   when `engine-runtime.json` `probe_after` has passed (the earliest future reset time a failing higher-tier error
+   stated as `resets <ISO instant>`, else one hour, `TIER_PROBE_S` = 3600 s); otherwise the turn starts at the
+   effective pair and walks toward the floor. A missing or unparsable `probe_after` makes the tiers above eligible at
+   once. Any success at or above the configured tier removes `probe_after`.
+4. **Faults never move the manager.** `rate_limit`, `other`, a crash (rc 17) or a timeout (rc 124) stops the walk at
+   that step: nothing is persisted, no tier or account changes, no episode starts; the turn keeps the failed-turn
+   bookkeeping (`logs/retry-after`, failed reaction, events pending) and the retry runs the same engine first. One
+   top-level line per fault episode, `engine fault: tier <k> <acc> (<model>): <what>`, is durable in
+   `logs/fault.json` before it is queued (id `fault-<episode_id>`); the episode ends silently at the next served turn.
+   A CLI or self event gets the same text in its reply file or `logs/self-replies.jsonl`.
+5. **Every switch is announced with its tier.** Besides `fallback started` and `fallback ended`, a change of the
+   effective pair inside an episode queues `fallback moved (episode <id>): tier <k> <acc> (<model>) unavailable
+   (<reason>); now running tier <k> <acc> (<model>)` (id `fallback-<episode_id>-move-<n>`, durable in the runtime
+   file as `pending_notice`/`move_from` until queued). While an episode is active, the first `hydra status` line
+   reads `engine: configured <operator pair>[mode] | effective <engine-file pair> | last turn ran on <runner>`.
+
+`hydra status` shows, right after `engine:`, one line (at most 400 characters):
+`engine policy: floor claude-opus-5-5; active tier 1/3 claude-r2d2 (claude-fable-5-1); ladder claude-fable-5-1
+[claude-r2d2, claude-l] > gpt-6-astra [codex] > claude-opus-5-5 [claude-r2d2, claude-l]`. The active pair is the
+effective one during a fallback episode; a pair outside the ladder reads `active tier -/3 (configured <label> is outside
+the ladder; the next turn starts at tier <k>)`; an ignored override adds ` (engine_policy ignored: <reason>)`. The
+fallback notices name the tiers: `fallback started (episode <id>): tier 1/3 claude-r2d2 (claude-fable-5-1) unavailable
+(<reason>); now running tier 2/3 codex (gpt-6-astra)` and `fallback ended (episode <id>): back on tier 1/3 …`.
+
+When every allowed step fails, nothing is downgraded: the manager posts ONE top-level dev-channel line per
+unavailability episode, `manager unavailable: all allowed engines failed (tier 1 claude-r2d2 (claude-fable-5-1):
+credits; tier 1 claude-l (claude-fable-5-1): credits; tier 2 codex (gpt-6-astra): usage_limit; …)`, each step as
+`credits`, `usage_limit`, `auth`, `prompt_too_long` or
+`skipped: <unverified credential|over budget|identity mismatch|skipped Claude family>` (a `rate_limit`, `other`,
+`crash` or `timeout` step ends the walk with the `engine fault:` line instead, rule 4), and retries on the normal
+five-minute back-off. The episode (`logs/unavailable.json`) ends with the next served turn; a failing retry inside it
+posts nothing more.
 
 ### Switching and forcing an engine
 
 `engine acc=<claude-r2d2|claude-l|codex> [model=<alias|id>]` in Slack (`@manager engine …`, founder only) and on the
 console (`hydra engine …`). The old form `engine <account>` still works and means the family default model;
 `model=<alias>` alone keeps the account; `engine` alone prints the current pair. A model of the wrong family or an
-unknown alias is rejected with the list of valid ones and nothing changes. `status` shows `engine: <acc> (<model>)`.
+unknown alias is rejected with the list of valid ones and nothing changes. A pair that is not on the manager ladder is
+refused with one line, `model <id> is not on the manager's allowlist (floor claude-opus-5-5); allowed: …; nothing
+changed (engine: …)` (exit 2 on the console, a reply in Slack); the engine file and `engine-runtime.json` stay
+untouched. `mode=…` alone is allowed only while the current pair is on the ladder, and `hydra attach` refuses (exit 2)
+on an engine file outside it. `status` shows `engine: <acc> (<model>)` and the `engine policy:` line.
 
-Each turn starts at the current engine and tries the remaining engines in cyclic order. A budget limit
-or a nonzero exit whose stderr matches quota, usage limit, rate, 401, or 403 causes fallback and persists
-the next successful engine. Other classifiable nonzero exits (including launch failures) also try the next
-engine, but do not persist a switch by themselves. A crash or a turn timeout is different: its disposition is
-uncertain (the request may already have had a real side effect), so the turn stops there instead of trying
-another account, and the triggering event is marked handled with a truthful failure rather than left pending
-for a retry. A successful fallback adds `engine: <name>` to the reply; `hydra logs 3` records the actual engine
-per turn even when no switch occurred. If every engine fails with a classifiable error, events remain pending
-and the supervisor waits five minutes before retrying.
+Each turn walks the ladder as described above. A budget limit
+or a nonzero exit whose stderr matches quota, usage limit, 401, or 403 causes fallback and persists
+the next successful engine. A rate limit, any other nonzero exit (including launch failures), a crash or a turn
+timeout is a fault (rule 4): the turn stops at that step, nothing is persisted, the retry runs the same engine. A
+crash or a timeout keeps its uncertain disposition (the request may already have had a real side effect), so the
+triggering event is marked handled with a truthful failure rather than left pending. A successful fallback adds
+`engine: <name>` to the reply; `hydra logs 3` records the actual engine per turn even when no switch occurred. If
+every engine fails with a usage error, events remain pending and the supervisor waits five minutes before retrying.
 
 A fallback to a different Claude account is refused unless that account's credential carries a verified
 identity sidecar (`<credential.env>.identity.json`; see "Credential identity" below) — the originally selected
@@ -241,8 +313,9 @@ memory, say it is unknown rather than inventing it.
 6. Bookkeeping: `logs/turns.jsonl`, `handled.jsonl`, the manager's own reply appended to `mirror/<channel>.jsonl`
    (`user: manager`), then `mirror/*.jsonl` to `<repo>/factory/log/`, `state.json` to `<repo>/factory/state.json`
    and `factory/manager-memory/`, commit `manager: turn <n>`, push.
-7. Every engine failing: the turn is logged with `error`, one "manager unavailable, will retry" note per thread per
-   hour, the `eyes` on the batch's messages replaced by `x`, no retry for five minutes.
+7. Every allowed engine failing: the turn is logged with `error`, one top-level `manager unavailable: all allowed
+   engines failed (<reasons>)` line per unavailability episode, the `eyes` on the batch's messages replaced by `x`, no
+   retry for five minutes.
 
 The service loop adds a timer event every 15 minutes (`timer-<slot>`), and a watchdog thread trips the dead-man
 (events queued, no turn and no heartbeat for 30 minutes): a post to the buildlog webhook and exit 3, so systemd

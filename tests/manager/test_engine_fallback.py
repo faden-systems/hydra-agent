@@ -106,6 +106,7 @@ def test_jsonl_stream_with_terminal_error_record(home, tmp_path):
 # ----------------------------------------------------------------------------------------------- model fallback (requirement 12)
 
 def test_same_account_non_fable_retry_before_next_account(home, tmp_path):
+    """b12 supersedes b7 requirement 12: no same-account different-model retry; the ladder decides."""
     S.set_engine(home, "claude-r2d2", "claude-fable-5-1", {"claude-r2d2": {}, "claude-l": {}})
     cfg = {"engine_fallback": {"claude_models": ["claude-sonnet-5"]}}
     eng_map = {"claude-r2d2": {"bin": "fixture"}, "claude-l": {"bin": "fixture"}}
@@ -114,14 +115,15 @@ def test_same_account_non_fable_retry_before_next_account(home, tmp_path):
 
     def invoke(name, spec, message, model=None, preamble=""):
         calls.append((name, model))
-        if model == "claude-sonnet-5":
+        if model in ("claude-sonnet-5", "claude-opus-5-5"):
             return 0, "ok\n" + HANDOFF, "", {"context_tokens": 5}
         return 1, "", "Out of usage credits. Switch model.", None
     with patch.object(sup, "invoke", side_effect=invoke):
         name, model, *_ = sup.run_engines("hi", [])
-    assert calls == [("claude-r2d2", "claude-fable-5-1"), ("claude-r2d2", "claude-sonnet-5")]
-    assert (name, model) == ("claude-r2d2", "claude-sonnet-5")
-    assert S.read_engine(home, eng_map) == {"acc": "claude-r2d2", "model": "claude-sonnet-5"}
+    assert calls == [("claude-r2d2", "claude-fable-5-1"), ("claude-l", "claude-fable-5-1"), ("claude-r2d2", "claude-opus-5-5")]
+    assert (name, model) == ("claude-r2d2", "claude-opus-5-5")
+    assert S.read_engine(home, eng_map) == {"acc": "claude-r2d2", "model": "claude-opus-5-5"}
+    assert all(m != "claude-sonnet-5" for _, m in calls)
 
 
 def test_cross_family_fallback_to_codex_when_claude_exhausted(home):
@@ -198,7 +200,7 @@ def test_fallback_episode_closes_when_mode_was_ever_explicitly_set(home):
     completes a turn, `_note_fallback_transition`'s winning-vs-configured comparison must still recognize it
     and close the episode -- not only announce it starting (requirement 12/13, loops/b8.md)."""
     eng_map = {"claude-r2d2": {"bin": "fixture"}, "codex": {"bin": "fixture", "kind": "codex"}}
-    S.set_engine(home, "claude-r2d2", "claude-sonnet-5", eng_map, mode="per-turn")
+    S.set_engine(home, "claude-r2d2", "claude-fable-5-1", eng_map, mode="per-turn")
     cfg = {"dev_channel": "C_DEV_FIXTURE", "engine_fallback": {"claude_models": []}}
     sup = S.Supervisor(home=home, engines=eng_map, config=cfg, poster=lambda *a: None)
     failing = True
@@ -213,7 +215,7 @@ def test_fallback_episode_closes_when_mode_was_ever_explicitly_set(home):
     assert len(notices) == 1 and "fallback started" in notices[0]["text"].lower()
     # The operator (or the real capture's recovery phase) explicitly restores the primary; this re-selection
     # is exactly what stamps `mode` onto engine-runtime.json's "configured" pair.
-    S.set_engine(home, "claude-r2d2", "claude-sonnet-5", eng_map, mode="per-turn")
+    S.set_engine(home, "claude-r2d2", "claude-fable-5-1", eng_map, mode="per-turn")
     failing = False
     with patch.object(sup, "invoke", side_effect=invoke):
         sup.run_engines("second", [])

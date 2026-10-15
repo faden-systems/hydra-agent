@@ -41,7 +41,7 @@ def test_preserve_populated_runtime(tmp_path,monkeypatch,active):
     file=tmp_path/'baseline.py';file.write_bytes(subprocess.check_output(['git','show','b91679a6db14831b5e3effe257a4c13ee9db6a53:manager/supervisor.py']))
     spec=importlib.util.spec_from_file_location('baseline_b13',file);base=importlib.util.module_from_spec(spec);spec.loader.exec_module(base)
     monkeypatch.setattr(S,'pid_alive',lambda _:False);monkeypatch.setattr(base,'pid_alive',lambda _:False)
-    added=('engine:','last turn attempts:','off configured engine:','accounts:','engine fallback:')
+    added=('engine:','engine policy:','last turn attempts:','off configured engine:','accounts:','engine fallback:')  # b12 adds the policy line
     assert [x for x in S.status_text(home).splitlines() if not x.startswith(added)]==[x for x in base.status_text(home).splitlines() if not x.startswith(('engine:','engine fallback:'))]
     if active:
         assert 'since 2026-10-14 15:00:00 PDT' in S.status_text(home)

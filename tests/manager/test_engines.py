@@ -57,12 +57,16 @@ def test_quota_rotates_persists_and_notes(home, quota_engine, ok_engine, poster)
 
 
 def test_non_quota_failure_tries_next_without_persisting(home, ok_engine, poster, tmp_path):
+    """Rewritten under loops/b12.md requirement 12 (founder rule 4, 2026-10-15): a non-usage failure is a fault.
+    The walk stops at that step, nothing else is tried, nothing is persisted, the event stays pending."""
     d = tmp_path / "crash"; d.mkdir()
     crash = fake_engine(str(d), "crash")
-    queue_event(home, "hello")
+    eid = queue_event(home, "hello")
     assert S.Supervisor(home=home, engines=engines(crash, ok_engine), poster=poster).run_once() is True
-    assert "handled 1 events" in poster.texts and "engine: claude-l" in poster.texts
-    assert engine_acc(home) == "claude-r2d2", "a crash is not a quota switch"
+    assert "handled 1 events" not in poster.texts and "engine: claude-l" not in poster.texts, "the next engine is never tried"
+    assert eid not in S.handled_ids(home), "the event waits for the retry on the same engine"
+    assert engine_acc(home) == "claude-r2d2", "a fault is not a switch"
+    assert any("engine fault: tier 1 claude-r2d2" in it.get("text", "") for it in S.read_outbox(home)), "one top-level fault line"
 
 
 def test_codex_fallback_gets_handoff_and_state_on_stdin(home, quota_engine, poster, tmp_path):
@@ -94,10 +98,14 @@ def test_all_engines_fail_keeps_events_and_notes_once(home, quota_engine, poster
     assert eid not in S.handled_ids(home)
     turn = S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))[-1]
     assert "error" in turn and "claude-r2d2" in turn["error"]
-    assert len(poster.posted) == 1 and "unavailable" in poster.posted[0][2]
+    assert not poster.posted, "b12: no per-thread note any more"
+    lines = [it for it in S.read_outbox(home) if "all allowed engines failed" in it["text"]]
+    assert len(lines) == 1 and lines[0]["thread_ts"] is None
+    assert lines[0]["text"].startswith("manager unavailable: all allowed engines failed (tier 1 claude-r2d2 (claude-fable-5-1): ")
     os.remove(os.path.join(home, "logs", "retry-after"))
     assert sup.run_once() is True
-    assert len(poster.posted) == 1, "the unavailable note is posted at most once per hour per thread"
+    assert len([it for it in S.read_outbox(home) if "all allowed engines failed" in it["text"]]) == 1, \
+        "one top-level line per unavailability episode"
     assert not os.path.exists(os.path.join(home, "MANAGER-HANDOFF.md"))
 
 

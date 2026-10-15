@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """hydra: the console side of the manager. Slack drives; the console observes and repairs.
 
-  hydra status                 engine, last turn, queue depth, tracks
+  hydra status                 engine, engine policy (floor, active tier, ladder), last turn, queue depth, tracks
   hydra say "<text>"           queue a console instruction; print the reply (mirrored to #dev as "from L via console")
   hydra logs [n]               the last n turns
   hydra tail <channel> [n]     the last n mirrored messages of a channel
-  hydra engine [acc=<a>] [model=<m>]  show or set the engine: acc claude-r2d2 | claude-l | codex, model an alias
-                               from models.json (fable5.1, sonnet5, opus5, haiku4.5; gpt6/astra, gpt5.6/sol) or a
-                               full id; `hydra engine <acc>` still works and means the family default model
+  hydra engine [acc=<a>] [model=<m>] [mode=<persistent|per-turn>]
+                               show or set the engine: acc claude-r2d2 | claude-l | codex, model a ladder alias
+                               (fable5.1 on claude-r2d2/claude-l, gpt6/astra on codex, opus5.5 on
+                               claude-r2d2/claude-l: the floor) or its full id; `hydra engine <acc>` still means
+                               the family default model. Only the manager ladder (engine_policy) is allowed:
+                               anything else is refused (exit 2, nothing changed). opus5, gpt5.6/sol and
+                               gpt6.1/sol6.1 (gpt-6.1-sol) are coder-use aliases, refused for the manager.
   hydra pause [reason]         create PAUSE; hydra resume removes it
   hydra attach                 take WRITER and run the manager session interactively; releases on exit
   hydra compact                force a compaction of the manager's Claude session (the COMPACT flag; it runs
@@ -123,7 +127,11 @@ def cmd_engine(home, args):
         print(f"engine: {S.engine_label(current)}{S.mode_suffix(current)}")
         return 0
     try:
-        pair = S.parse_engine_command(" ".join(args), current=current)
+        # loops/b12.md requirement 2: enforce the engine_policy ladder before set_engine; a refusal changes nothing
+        cfg = S.load_config(home)
+        models = S.load_models(home)
+        pair = S.parse_engine_command(" ".join(args), current=current, models=models)
+        S.enforce_engine_policy(pair, S.manager_ladder(cfg, models, S.default_engines(home, cfg)))
     except S.BadEngine as e:
         print(f"{e}; nothing changed (engine: {S.engine_label(current)}{S.mode_suffix(current)})", file=sys.stderr)
         return 2
@@ -222,8 +230,21 @@ def cmd_attach(home, args):
     cfg = S.load_config(home)
     engines = S.default_engines(home, cfg)
     engine = S.current_engine(home)
+    ladder = S.manager_ladder(cfg, S.load_models(home), engines)
+    try:  # loops/b12.md requirement 2: never attach to a pair outside the engine_policy ladder
+        S.enforce_engine_policy(S.read_engine(home, engines), ladder)
+    except S.BadEngine as e:
+        print(f"cannot attach: {e}", file=sys.stderr)
+        return 2
+    attach_model = None
     if engine not in engines or engine == "codex":
-        engine = next((n for n in S.ENGINE_ORDER if n in engines and n != "codex"), engine)
+        # the interactive session is a Claude one: the first Claude step of the ladder in force, never a pair
+        # outside it (a narrowed engine_policy may exclude an account or the family default model)
+        step = next((s for s in S.ladder_steps(ladder, engines) if S.family_of(s[1], engines) == "claude"), None)
+        if step is None:
+            print("cannot attach: the manager ladder in force has no Claude step", file=sys.stderr)
+            return 2
+        engine, attach_model = step[1], step[2]
     spec = engines[engine]
     sup = S.Supervisor(home=home, engines=engines, poster=lambda *a: None, config=cfg)
     me = who()
@@ -240,7 +261,7 @@ def cmd_attach(home, args):
         # joins the conversation the supervisor was really running, never one read before it existed.
         sid = sup.session_id()
         pair = S.read_engine(home, engines)
-        model = pair["model"] if pair["acc"] == engine else S.family_default_model("claude", sup.models)
+        model = pair["model"] if pair["acc"] == engine else (attach_model or S.family_default_model("claude", sup.models))
         argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", model] + list(args)
         _park_persistent(home)
         child = subprocess.Popen(argv, env=sup.engine_env(spec), cwd=home)

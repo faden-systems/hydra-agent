@@ -68,6 +68,14 @@ from transcript import (claude_project_dirs, find_claude_transcript, find_codex_
 import persistent as _persistent  # noqa: E402  (loops/b8.md: the vendor child-process plumbing)
 
 ENGINE_ORDER = ("claude-r2d2", "claude-l", "codex")
+# loops/b12.md requirement 1: the manager's allowlisted engine ladder, tiers in preference order; the last tier is the
+# floor. `engine_policy.ladder` in config.json may narrow or reorder it, never extend the founder-approved set.
+MANAGER_LADDER = ({"model": "claude-fable-5-1", "accounts": ("claude-r2d2", "claude-l")},
+                  {"model": "gpt-6-astra", "accounts": ("codex",)},
+                  {"model": "claude-opus-5-5", "accounts": ("claude-r2d2", "claude-l")})
+APPROVED_MANAGER_MODELS = frozenset({"claude-fable-5-1", "gpt-6-astra", "claude-opus-5-5"})
+UNAVAILABLE_REASONS_MAX = 1000  # code points of the reasons inside `manager unavailable: ... (<reasons>)`
+POLICY_LINE_MAX = 400
 ENGINE_MODES = ("per-turn", "persistent")  # loops/b8.md requirement 7; per-turn is the default, including missing
 MODEL = "claude-fable-5-1"  # the Claude family default; kept for callers that predate models.json
 FAMILIES = ("claude", "codex")
@@ -90,6 +98,7 @@ LOOP_SLEEP_S = 5
 DEADMAN_S = 1800
 NOTE_EVERY_S = 3600
 RETRY_AFTER_S = 300
+TIER_PROBE_S = 3600  # loops/b12.md (founder rule 3, 2026-10-15): from a lower tier, re-probe the tiers above at most hourly
 ENGINE_TIMEOUT_S = 1800
 DEFAULT_HOME = "/srv/hydra/manager"
 TRANSITION_DEFAULTS = {"max_tokens": 100000, "tool_result_max_chars": 4000, "enabled": True}
@@ -1251,6 +1260,131 @@ def carry_model(model, from_family, to_family, models=None):
     return family_default_model(to_family, models)
 
 
+_LOGGED_ONCE = set()
+
+
+def _log_once(key, msg):
+    """One `log` line per process for a given key (loops/b12.md: the ignored-policy and legacy-key diagnostics)."""
+    if key in _LOGGED_ONCE:
+        return
+    _LOGGED_ONCE.add(key)
+    log(msg)
+
+
+def _check_ladder(config, models=None, engines=None):
+    """(ladder in force, the first problem of an ignored `engine_policy.ladder` or None) -- loops/b12.md req. 1."""
+    policy = (config or {}).get("engine_policy")
+    if not isinstance(policy, dict) or "ladder" not in policy:
+        return MANAGER_LADDER, None
+    raw = policy.get("ladder")
+    engines = engines if engines is not None else default_engines(config=config or {})
+    if not isinstance(raw, list):
+        return MANAGER_LADDER, "ladder is not a list"
+    if not raw:
+        return MANAGER_LADDER, "ladder is empty"
+    models = models or load_models()
+    tiers, seen = [], set()
+    for i, entry in enumerate(raw, 1):
+        if not isinstance(entry, dict) or not isinstance(entry.get("model"), str) or not entry.get("model").strip():
+            return MANAGER_LADDER, f"tier {i} has no model"
+        accounts = entry.get("accounts")
+        if not isinstance(accounts, list) or not accounts or not all(isinstance(a, str) and a for a in accounts):
+            return MANAGER_LADDER, f"tier {i} has no list of accounts"
+        resolved = None
+        for acc in accounts:
+            if acc not in engines:
+                return MANAGER_LADDER, f"tier {i}: unknown account {acc}"
+            try:
+                model = resolve_model(family_of(acc, engines), entry["model"], models)
+            except BadEngine as e:
+                return MANAGER_LADDER, f"tier {i}: {e}"
+            if model not in APPROVED_MANAGER_MODELS:
+                return MANAGER_LADDER, f"tier {i}: model {model} is not founder-approved for the manager"
+            if resolved is not None and model != resolved:
+                return MANAGER_LADDER, f"tier {i}: {entry['model']} resolves to different models across its accounts"
+            if (acc, model) in seen:
+                return MANAGER_LADDER, f"tier {i}: {acc} ({model}) repeats an earlier step"
+            resolved = model
+            seen.add((acc, model))
+        tiers.append({"model": resolved, "accounts": tuple(accounts)})
+    return tuple(tiers), None
+
+
+def manager_ladder(config, models=None, engines=None):
+    """The ladder in force: a valid `engine_policy.ladder`, else `MANAGER_LADDER` with one log line per process."""
+    ladder, problem = _check_ladder(config, models, engines)
+    if problem:
+        _log_once(("engine_policy", problem), f"engine_policy ignored: {problem}; the default ladder is in force")
+    return ladder
+
+
+def ladder_steps(ladder, engines):
+    """The flat (tier_number, account, model) list in ladder order, only accounts present in `engines` with a bin."""
+    return [(k, acc, tier["model"]) for k, tier in enumerate(ladder, 1) for acc in tier["accounts"]
+            if acc in (engines or {}) and ((engines or {}).get(acc) or {}).get("bin")]
+
+
+def floor_model(ladder):
+    return ladder[-1]["model"]
+
+
+def ladder_position(pair, ladder):
+    """The 1-based tier whose model is `pair["model"]` and whose accounts include `pair["acc"]`, else None."""
+    for k, tier in enumerate(ladder, 1):
+        if tier["model"] == (pair or {}).get("model") and (pair or {}).get("acc") in tier["accounts"]:
+            return k
+    return None
+
+
+def ladder_text(ladder):
+    return " > ".join(f"{t['model']} [{', '.join(t['accounts'])}]" for t in ladder)
+
+
+def tier_label(pair, ladder):
+    k = ladder_position(pair, ladder)
+    return f"tier {k if k else '-'}/{len(ladder)} {engine_label(pair)}"
+
+
+def enforce_engine_policy(pair, ladder):
+    """Raise BadEngine with one line when `pair` is not a step of the ladder in force (loops/b12.md req. 2)."""
+    if ladder_position(pair, ladder) is not None:
+        return
+    allowed = "; ".join(f"{t['model']} on {', '.join(t['accounts'])}" for t in ladder)
+    raise BadEngine(f"model {pair.get('model')} is not on the manager's allowlist (floor {floor_model(ladder)}); "
+                    f"allowed: {allowed}")
+
+
+def _cap(text, limit):
+    text = str(text)
+    return text if len(text) <= limit else text[:max(0, limit - 3)] + "..."
+
+
+def engine_policy_line(home, cfg=None, engines=None, pair=None, runtime=None, models=None):
+    """`engine policy: floor ...; active tier k/n acc (model); ladder ...` (loops/b12.md requirement 4)."""
+    cfg = cfg if cfg is not None else load_config(home)
+    engines = engines if engines is not None else default_engines(home, cfg)
+    pair = pair if pair is not None else read_engine(home, engines)
+    runtime = runtime if runtime is not None else read_engine_runtime(home)
+    ladder, problem = _check_ladder(cfg, models or load_models(home), engines)
+    n = len(ladder)
+    active = pair
+    if runtime.get("episode_id") and runtime.get("active") and isinstance(runtime.get("effective"), dict) \
+            and runtime["effective"].get("acc"):
+        active = runtime["effective"]
+    k = ladder_position(active, ladder)
+    if k:
+        middle = f"active tier {k}/{n} {_cap(active['acc'], 40)} ({active['model']})"
+    else:
+        steps = ladder_steps(ladder, engines)
+        start = next((s for s in steps if s[1] == active.get("acc")), steps[0] if steps else (1, "", ""))
+        middle = (f"active tier -/{n} (configured {_cap(engine_label(active), 60)} is outside the ladder; "
+                  f"the next turn starts at tier {start[0]})")
+    suffix = f" (engine_policy ignored: {_cap(problem, 80)})" if problem else ""
+    head = f"engine policy: floor {floor_model(ladder)}; {middle}; ladder "
+    room = POLICY_LINE_MAX - len(head) - len(suffix)
+    return head + _cap(ladder_text(ladder), max(room, 0)) + suffix
+
+
 def parse_engine_command(text, current=None, known=ENGINE_ORDER, engines=None, models=None):
     """`acc=<account> [model=<alias|id>] [mode=<persistent|per-turn>]`, or the legacy `<account>`, or
     `model=<alias>`/`mode=<...>` alone when `current` gives the account. Returns {"acc", "model"} with the
@@ -1531,7 +1665,15 @@ def _status_engine_lines(home, pair):
     configured = (pair['acc'], pair['model'])
     latest = turns[-1] if turns else None
     actual = runner(latest) if latest else ('unknown', 'unknown')
-    engine = f'engine: configured {engine_label(pair)}{mode_suffix(pair)} | last turn ran on {actual[0]} ({actual[1]})'
+    runtime = read_engine_runtime(home)
+    operator = runtime.get('configured') if runtime.get('episode_id') and runtime.get('active') else None
+    if isinstance(operator, dict) and operator.get('acc') and (operator.get('acc'), operator.get('model')) != configured:
+        # founder rule 5 (2026-10-15): the operator's pair and the effective pair are shown separately while a
+        # fallback episode has moved the manager; MISMATCH compares the runner with the effective pair.
+        engine = (f'engine: configured {engine_label(operator)}{mode_suffix(pair)} | effective {engine_label(pair)} '
+                  f'| last turn ran on {actual[0]} ({actual[1]})')
+    else:
+        engine = f'engine: configured {engine_label(pair)}{mode_suffix(pair)} | last turn ran on {actual[0]} ({actual[1]})'
     if latest and actual != configured:
         engine += ' | MISMATCH'
     timed_attempts = [(a, _status_timestamp(a['at'])) for a in attempts]
@@ -1636,7 +1778,10 @@ def status_text(home, repo=None):
         lines.append(f"manager in console session ({ws[1]})")
     cur_engines = default_engines(home, cfg)
     cur_pair = read_engine(home, cur_engines)
-    lines.extend(_status_engine_lines(home, cur_pair))
+    engine_lines = _status_engine_lines(home, cur_pair)
+    lines.append(engine_lines[0])
+    lines.append(engine_policy_line(home, cfg, cur_engines, cur_pair))  # loops/b12.md requirement 4: right after engine:
+    lines.extend(engine_lines[1:])
     cur_spec = cur_engines.get(cur_pair["acc"]) or {}
     attempts_tail = [a for a in read_jsonl(os.path.join(home, "logs", "attempts.jsonl")) if isinstance(a, dict)]
     mismatched = next((a for a in reversed(attempts_tail) if a.get("engine") == cur_pair["acc"]
@@ -2333,6 +2478,14 @@ class AllEnginesFailed(Exception):
         self.uncertain = uncertain
 
 
+class EngineFault(AllEnginesFailed):
+    """A non-usage failure on the step that was running: a crash (rc 17), a timeout (rc 124), a rate limit, a
+    session error or any `other` error (loops/b12.md, founder rule 4 of 2026-10-15). The manager never moves to
+    another tier or account on it: the turn fails, nothing is persisted, the same engine is retried on the normal
+    back-off, and one top-level `engine fault: ...` line is posted per fault episode."""
+    fault = True
+
+
 class Supervisor:
     def __init__(self, home=None, engines=None, poster=None, repo=None, config=None, engine_timeout=ENGINE_TIMEOUT_S,
                  codex_home=None, clock=None, buildlog_poster=None, reactor=None, sleep=None):
@@ -2375,6 +2528,8 @@ class Supervisor:
             os.makedirs(os.path.join(self.home, d), exist_ok=True)
         self._reconcile_rollover_intent()  # requirement 13, loops/b7.md: before any Claude invocation
         self._reconcile_fallback_notice()  # requirement 12, loops/b7.md: before the next run_engines
+        self._reconcile_unavailable_notice()
+        self._reconcile_fault_notice()  # loops/b12.md requirement 3: a durable episode's notice is queued
 
     # ---- small helpers
     def path(self, *parts):
@@ -2592,7 +2747,14 @@ class Supervisor:
                           "duration_s": round(time.time() - started, 3), "error": str(e)[:2000]})
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
             self.react_failed(events)
-            self.post_unavailable(events)
+            if getattr(e, "fault", False):
+                text = self._fault_text(getattr(e, "reasons", None))
+                self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
+                self._note_fault(n, text)  # founder rule 4 (2026-10-15): one top-level line per fault episode
+            else:
+                text = self._unavailable_text(getattr(e, "reasons", None))
+                self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
+                self._note_unavailable(n, text)  # loops/b12.md requirement 3: one top-level line per episode
             if getattr(e, "uncertain", False):
                 # requirement 1/8, loops/b8.md: an uncertain submitted request (crash/timeout) gets a durable
                 # disposition that prevents automatic replay -- never reported successful, and not left
@@ -2601,6 +2763,8 @@ class Supervisor:
             return True
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("logs", "retry-after"))
+        self._close_unavailable_episode()  # a turn served by any ladder step ends the unavailability episode
+        self._close_fault_episode()  # and the fault episode (founder rule 4, 2026-10-15)
         reply, handoff = split_handoff(stdout)
         reply = sanitize_reply(reply)
         if handoff:
@@ -2795,30 +2959,91 @@ class Supervisor:
             return True
         return False
 
+    def engine_ladder(self):
+        return manager_ladder(self.config, self.models, self.engines)
+
+    def _ladder_rotation(self, primary, steps):
+        """The steps in the order a turn tries them (loops/b12.md requirement 1): the primary's own step, the other
+        accounts of its tier in listed order, every lower tier in order, then the tiers above it from the top. A
+        primary that is not a step starts at the first step on its account, else at the ladder's first step."""
+        if not steps:
+            return []
+        start = next((s for s in steps if (s[1], s[2]) == (primary.get("acc"), primary.get("model"))), None)
+        if start is None:
+            start = next((s for s in steps if s[1] == primary.get("acc")), steps[0])
+            log(f"engine policy: configured {engine_label(primary)} is outside the ladder; "
+                f"starting at tier {start[0]} {engine_label({'acc': start[1], 'model': start[2]})}")
+        tier = start[0]
+        return ([start] + [s for s in steps if s[0] == tier and s != start] + [s for s in steps if s[0] > tier]
+                + [s for s in steps if s[0] < tier])
+
     def run_engines(self, message, notes):
-        """Try the engines from the current one. Returns (engine, model, stdout, usage, transition), usage being
-        {"tokens", "input_tokens", "context_tokens"} or None. Each attempt gets its own memory preamble (the
-        family may differ), the transition read when the attempt is a family switch, the `[flush]` line on Codex
-        when one is due, and the model carried over from the current pair. On a credits/usage-limit failure, each
-        distinct configured non-Fable model is tried once more on the SAME account before the next account/family
-        (requirement 12, loops/b7.md); auth errors skip that retry; prompt-too-long is session-level and skips the
-        rest of the Claude family outright. Every attempt is recorded in logs/attempts.jsonl."""
+        """Walk the manager ladder from the configured primary (loops/b12.md requirement 1). Returns (engine, model,
+        stdout, usage, transition), usage being {"tokens", "input_tokens", "context_tokens"} or None. Each step
+        invokes exactly that step's model on that step's account, with its own memory preamble, the transition read
+        at a family switch and the `[flush]` line on Codex when one is due. credits/usage_limit/auth persist the
+        switch and move on; rate_limit/other move on without persisting; prompt-too-long skips every remaining
+        Claude step. Nothing outside the ladder is ever invoked; every attempt is recorded in logs/attempts.jsonl.
+        AllEnginesFailed carries `reasons`, one `tier <k> <acc> (<model>): <what>` per step in the order tried."""
         if engine_file_is_legacy(self.home):
             pair = read_engine(self.home, self.engines)
             set_engine(self.home, pair["acc"], pair["model"], self.engines)  # upgrade the one-word file to JSON
+        if "claude_models" in (self.config.get("engine_fallback") or {}):
+            _log_once("engine_fallback.claude_models", "engine_fallback.claude_models is ignored since b12; "
+                                                       "the manager ladder decides every fallback")
         pair = read_engine(self.home, self.engines)
-        current = pair["acc"]
+        runtime = read_engine_runtime(self.home)
+        primary = pair
+        configured = runtime.get("configured")
+        ladder = self.engine_ladder()
+        if runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict) and configured.get("acc"):
+            # During a fallback episode the rotation starts at the configured primary's tier (so a fallback to a
+            # lower tier recovers upward); within that tier the persisted engine file's step goes first, so an
+            # account that just failed is not retried before the one that served (an explicit re-selection
+            # rewrites both and therefore starts, and closes the episode, on the selected pair).
+            conf = {"acc": configured.get("acc"), "model": configured.get("model")}
+            tier = ladder_position(conf, ladder)
+            if tier is None or ladder_position(pair, ladder) != tier:
+                primary = conf
         started_pair = dict(pair)
-        errors = []
+        order = self._ladder_rotation(primary, ladder_steps(ladder, self.engines))
+        eff_tier = None  # the effective tier while an episode runs below the configured tier (founder rule 3)
+        episode = bool(runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict) and configured.get("acc"))
+        if episode:
+            conf_tier = ladder_position({"acc": configured.get("acc"), "model": configured.get("model")}, ladder)
+            tier_now = ladder_position(pair, ladder)
+            if conf_tier is not None and tier_now is not None and tier_now > conf_tier:
+                eff_tier = tier_now
+                if not self._tier_probe_due(runtime):
+                    # Founder rule 3: even exhaustion below does not authorize an early higher-tier probe.
+                    order = self._ladder_rotation(pair, [s for s in ladder_steps(ladder, self.engines) if s[0] >= eff_tier])
+        # requirement 11, loops/b8.md: the account that served (the engine file) runs without a verified sidecar;
+        # during an episode the operator's configured account was selected too. Only switching TO any other
+        # credential requires it to be verified first.
+        current = {pair["acc"]} | ({configured.get("acc")} if episode else set())
+        stale = ladder_position(pair, ladder) is None  # a pre-b12 or hand-edited engine file outside the ladder
+        errors, reasons = [], []
+        failed_steps = []  # (tier, error) of every failed invocation this turn
+        tried_tiers = []
         persist_switch = False  # a quota, auth or budget move is persisted; a plain or session-level failure is not
         skip_claude = False
         last_reason = None
-        for name in self.engine_order():
+
+        def failed(uncertain=False):
+            exc = AllEnginesFailed(errors, uncertain=uncertain)
+            exc.reasons = list(reasons)
+            return exc
+
+        def fault(uncertain=False):
+            exc = EngineFault(errors[-1:], uncertain=uncertain)
+            exc.reasons = reasons[-1:]
+            return exc
+        for tier, name, model in order:
             spec = self.engines.get(name) or {}
-            if not spec.get("bin"):
-                continue
             family = family_of(name, self.engines)
+            step = f"tier {tier} {name} ({model}): "
             if skip_claude and family == "claude":
+                reasons.append(step + "skipped: skipped Claude family")
                 continue
             if family == "claude":
                 observed = None
@@ -2827,70 +3052,84 @@ class Supervisor:
                 identity = credential_identity(self.home, name, spec, observed=observed)
                 if identity.get("mismatch"):
                     reason = f"token identity mismatch (observed account {observed.get('account_id') if observed else '?'})"
-                    record_attempt(self.home, name, carry_model(pair["model"], family_of(current, self.engines), family,
-                                                                 self.models), None, "auth", reason, False)
+                    record_attempt(self.home, name, model, None, "auth", reason, False)
                     errors.append((name, reason))
+                    reasons.append(step + "skipped: identity mismatch")
                     continue
-                if name != current and not identity.get("automatic_allowed"):
+                if name not in current and not identity.get("automatic_allowed"):
                     # requirement 11, loops/b8.md: run_engines checks automatic_allowed before invoking a
                     # fallback credential; the originally selected account still runs (production relies on
                     # that today), only switching TO another credential requires it to be verified first.
                     errors.append((name, "credential unverified; automatic fallback refused"))
+                    reasons.append(step + "skipped: unverified credential")
                     continue
             if self.over_budget(name):
                 notes.append(f"budget: {name} over budget, trying the next engine")
                 errors.append((name, "over budget"))
+                reasons.append(step + "skipped: over budget")
                 persist_switch = True
                 continue
-            base_model = carry_model(pair["model"], family_of(current, self.engines), family, self.models)
-            queue = [base_model]
-            while queue:
-                model = queue.pop(0)
-                preamble = self.preamble_for(name)
-                transition = block = switch_at = None
-                switch = self.switch_for(name)
-                if switch and self.transition_config()["enabled"]:
-                    switch_at = self.now()
-                    block, transition = self.transition_read(switch[0], switch[1], switch_at)
-                    preamble += "\n\n" + block
-                if family == "codex" and self.codex_flush_due():
-                    preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
-                rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
-                if rc == 0:
-                    record_attempt(self.home, name, model, rc, None, "", True)
-                    if family == "claude":
-                        self._mark_working(name, model, spec)
-                    if transition and transition.get("source_path"):
-                        self.save_transition(transition, block, switch_at)
-                    if name != current:
-                        notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
-                    if persist_switch and (name != current or model != pair["model"]):
-                        set_engine(self.home, name, model, self.engines, explicit=False)
-                    self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch)
-                    return name, model, out, usage, transition
-                classification = classify_engine_error(err)
-                record_attempt(self.home, name, model, rc, classification, err, False)
-                errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
-                log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
-                last_reason = err
-                if rc in (17, 124):
-                    # requirement 1/8, loops/b8.md: a process crash (17) or a turn timeout (124) is an
-                    # UNCERTAIN disposition -- the request may have already had a real side effect -- so it
-                    # must never be silently replayed on a different engine within the same turn; the event
-                    # layer (turn()/post_unavailable) gives it a durable, truthful failure outcome instead.
-                    raise AllEnginesFailed(errors, uncertain=True)
-                if classification == "prompt_too_long":
-                    skip_claude = True
-                    if family == "claude" and self._is_working(name, model, spec):
-                        self._set_emergency_pending(name, model, err)
-                    break
-                if classification in ("credits", "usage_limit", "auth"):
-                    persist_switch = True
-                if classification in ("credits", "usage_limit") and family == "claude" and model == base_model:
-                    fb_cfg = (self.config.get("engine_fallback") or {}).get("claude_models")
-                    fb_cfg = fb_cfg if isinstance(fb_cfg, list) else ["claude-sonnet-5"]
-                    queue = [m for m in dict.fromkeys(fb_cfg) if m not in ("claude-fable-5-1", base_model)]
-        raise AllEnginesFailed(errors)
+            preamble = self.preamble_for(name)
+            transition = block = switch_at = None
+            switch = self.switch_for(name)
+            if switch and self.transition_config()["enabled"]:
+                switch_at = self.now()
+                block, transition = self.transition_read(switch[0], switch[1], switch_at)
+                preamble += "\n\n" + block
+            if family == "codex" and self.codex_flush_due():
+                preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
+            tried_tiers.append(tier)
+            rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
+            if rc == 0:
+                record_attempt(self.home, name, model, rc, None, "", True)
+                if family == "claude":
+                    self._mark_working(name, model, spec)
+                if transition and transition.get("source_path"):
+                    self.save_transition(transition, block, switch_at)
+                if name != pair["acc"]:
+                    notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
+                restored = bool(runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict)
+                                and (name, model) == (configured.get("acc"), configured.get("model")))
+                moved_up = eff_tier is not None and tier < eff_tier  # founder rule 2: a success above moves up at once
+                if (persist_switch or restored or moved_up or stale) and (name != pair["acc"] or model != pair["model"]):
+                    # a persist-worthy move, a move up (even after skips only), the configured pair serving again
+                    # during an episode (the return must land in the engine file too), or a stale file normalised
+                    # to the step that actually served
+                    set_engine(self.home, name, model, self.engines, explicit=False)
+                probe_errors = [e for t, e in failed_steps if t < tier]  # errors of the tiers above the winner
+                probed = eff_tier is not None and any(t < eff_tier for t in tried_tiers)
+                self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch or moved_up,
+                                               probe_errors=probe_errors, probed=probed)
+                return name, model, out, usage, transition
+            classification = classify_engine_error(err)
+            record_attempt(self.home, name, model, rc, classification, err, False)
+            errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
+            failed_steps.append((tier, err or ""))
+            log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
+            last_reason = err
+            if rc in (17, 124):
+                # requirement 1/8, loops/b8.md: a process crash (17) or a turn timeout (124) is an
+                # UNCERTAIN disposition -- the request may have already had a real side effect -- so it
+                # must never be silently replayed on a different engine within the same turn; the event
+                # layer (turn()/post_unavailable) gives it a durable, truthful failure outcome instead.
+                reasons.append(step + ("crash" if rc == 17 else "timeout"))
+                raise fault(uncertain=True)
+            if classification == "other":
+                reasons.append(step + "other: " + ((err or "").strip() or f"exit {rc}")[:80])
+            else:
+                reasons.append(step + classification)
+            if classification in ("other", "rate_limit"):
+                # founder rule 4 (2026-10-15): a non-usage failure never moves the manager down a tier or to
+                # the other account; the same engine is retried on the back-off and the fault is posted.
+                raise fault()
+            if classification == "prompt_too_long":
+                skip_claude = True
+                if family == "claude" and self._is_working(name, model, spec):
+                    self._set_emergency_pending(name, model, err)
+                continue
+            if classification in ("credits", "usage_limit", "auth"):
+                persist_switch = True
+        raise failed()
 
     def engine_env(self, spec):
         env = {k: v for k, v in os.environ.items()
@@ -3660,13 +3899,18 @@ class Supervisor:
     # never per retry/turn, surviving a crash at any persistence step without losing or duplicating it.
 
     def _fallback_notice_text(self, runtime, transition):
+        """The b7 requirement 12 notices, naming the ladder tiers (loops/b12.md requirement 4)."""
         episode_id = runtime.get("episode_id")
+        ladder = self.engine_ladder()
         if transition == "start":
             configured, effective = runtime.get("configured") or {}, runtime.get("effective") or {}
-            return (f"fallback started (episode {episode_id}): {engine_label(configured)} unavailable "
-                    f"({(runtime.get('reason') or '').strip()[:300]}); now running {engine_label(effective)}")
+            return (f"fallback started (episode {episode_id}): {tier_label(configured, ladder)} unavailable "
+                    f"({(runtime.get('reason') or '').strip()[:300]}); now running {tier_label(effective, ladder)}")
         effective = runtime.get("effective") or {}
-        return f"fallback ended (episode {episode_id}): back on {engine_label(effective)}"
+        if transition == "move":
+            return (f"fallback moved (episode {episode_id}): {tier_label(runtime.get('move_from') or {}, ladder)} "
+                    f"unavailable ({(runtime.get('reason') or '').strip()[:300]}); now running {tier_label(effective, ladder)}")
+        return f"fallback ended (episode {episode_id}): back on {tier_label(effective, ladder)}"
 
     def _reconcile_fallback_notice(self):
         """Before the next run_engines (restart recovery, requirement 12): finish queueing a notice whose
@@ -3678,7 +3922,8 @@ class Supervisor:
         if not pending or not episode_id:
             return
         text = self._fallback_notice_text(runtime, pending)
-        _queue_notice_once(self.home, self.dev_channel, text, f"fallback-{episode_id}-{pending}")
+        suffix = f"move-{runtime.get('moves')}" if pending == "move" else pending
+        _queue_notice_once(self.home, self.dev_channel, text, f"fallback-{episode_id}-{suffix}")
         self.persistence_checkpoint(f"fallback_{pending}_queued")
         runtime["pending_notice"] = None
         save_engine_runtime(self.home, runtime)
@@ -3707,29 +3952,93 @@ class Supervisor:
         runtime["pending_notice"] = None
         save_engine_runtime(self.home, runtime)
 
-    def _note_fallback_transition(self, winning_acc, winning_model, started_pair, reason, persist_worthy):
+    def _note_fallback_transition(self, winning_acc, winning_model, started_pair, reason, persist_worthy,
+                                  probe_errors=None, probed=False):
         """After a turn resolves successfully: start, update or close the fallback episode. Deliberately
-        selecting a different engine (no failure at all) is never itself a fallback episode."""
+        selecting a different engine (no failure at all) is never itself a fallback episode. `probe_errors` are the
+        errors of the steps above the winning tier tried this turn; `probed` says whether a tier above the
+        effective one was tried. Landing on a tier below the configured one schedules the next re-probe of the
+        tiers above (founder rule 3, 2026-10-15): a probe sets it afresh; a turn that did not probe keeps the
+        pending instant and can only bring it forward (a failing tier between the old and the new effective tier
+        never postpones the configured tier's probe)."""
         runtime = read_engine_runtime(self.home)
         configured = runtime.get("configured") or started_pair
         winning = {"acc": winning_acc, "model": winning_model}
         active = bool(runtime.get("episode_id")) and bool(runtime.get("active"))
+        ladder = self.engine_ladder()
+        conf_tier = ladder_position({"acc": configured.get("acc"), "model": configured.get("model")}, ladder)
+        win_tier = ladder_position(winning, ladder)
+        below = conf_tier is not None and win_tier is not None and win_tier > conf_tier
         # Compare acc/model only: once an operator has ever set mode=... (requirement 7, loops/b8.md),
         # the persisted "configured" pair also carries a "mode" key, which must never prevent recognizing
         # the restored primary and closing the episode (requirement 12/13).
         if winning == {"acc": configured.get("acc"), "model": configured.get("model")}:
             if active:
                 self._close_fallback_episode(runtime)
+            runtime = read_engine_runtime(self.home)
+            if runtime.pop("probe_after", None) is not None:
+                save_engine_runtime(self.home, runtime)
             return
         if not persist_worthy:
-            return  # transient (rate_limit/other) or session-level (prompt_too_long): never announced/persisted
+            return  # session-level (prompt_too_long) or a probe that changed nothing: never announced/persisted
         if not active:
             self._start_fallback_episode(runtime, configured, winning, reason)
         else:
-            runtime["effective"] = winning
-            if reason:
+            previous = runtime.get("effective") or {}
+            if {"acc": previous.get("acc"), "model": previous.get("model")} != winning:
+                # founder rule 5 (2026-10-15): every switch inside an episode gets one top-level notice too; the
+                # move is durable (`pending_notice` = "move", `move_from`) before the line is queued, so a crash
+                # at either side is reconciled at the next start like the start/end notices (requirement 12, b7)
+                runtime.update({"effective": winning, "moves": int(runtime.get("moves") or 0) + 1,
+                                "move_from": {"acc": previous.get("acc"), "model": previous.get("model")},
+                                "pending_notice": "move"})
+                if reason:
+                    runtime["reason"] = reason
+                save_engine_runtime(self.home, runtime)
+                self.persistence_checkpoint("fallback_move_saved")
+                _queue_notice_once(self.home, self.dev_channel, self._fallback_notice_text(runtime, "move"),
+                                   f"fallback-{runtime.get('episode_id')}-move-{runtime['moves']}")
+                self.persistence_checkpoint("fallback_move_queued")
+                runtime["pending_notice"] = None
+                save_engine_runtime(self.home, runtime)
+            elif reason:
                 runtime["reason"] = reason
+                save_engine_runtime(self.home, runtime)
+        runtime = read_engine_runtime(self.home)
+        if below:
+            existing = parse_iso(runtime.get("probe_after"))
+            nxt = self._next_tier_probe(probe_errors or [])
+            if probed or existing is None or existing <= self.clock_dt():
+                runtime["probe_after"] = nxt
+                save_engine_runtime(self.home, runtime)
+            elif probe_errors and parse_iso(nxt) < existing:
+                runtime["probe_after"] = nxt
+                save_engine_runtime(self.home, runtime)
+        elif not below and runtime.get("probe_after"):
+            runtime.pop("probe_after", None)
             save_engine_runtime(self.home, runtime)
+
+    def _tier_probe_due(self, runtime):
+        """Founder rule 3 (2026-10-15): from a lower tier, the tiers above are re-probed when `probe_after` has passed."""
+        after = parse_iso(runtime.get("probe_after"))
+        return after is None or self.clock_dt() >= after
+
+    def _next_tier_probe(self, errors):
+        """The next re-probe instant: the earliest reset time a failing higher-tier step stated, when it lies in
+        the future, else one TIER_PROBE_S from now."""
+        now = self.clock_dt()
+        resets = []
+        for text in errors:
+            m = re.search(r'\bresets?\b\s*:?\s*(?:at\s+)?(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d))', str(text or ''), re.I)
+            if m:
+                try:
+                    at = _dt.datetime.fromisoformat(m.group(1).replace(' ', 'T').replace('Z', '+00:00'))
+                except ValueError:
+                    continue
+                if at > now:
+                    resets.append(at)
+        at = min(resets) if resets else now + _dt.timedelta(seconds=TIER_PROBE_S)
+        return at.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def run_emergency_rollover(self, reason="emergency"):
         """Emergency-only automatic rollover (requirement 6, loops/b8.md): the triggering request already
@@ -4226,14 +4535,111 @@ class Supervisor:
             self._clear_settlement_journal()
         return True
 
-    def post_unavailable(self, events):
+    # ---- the unavailability episode (loops/b12.md requirement 3): logs/unavailable.json is written before the
+    # notice is queued; `queued` turns true only after `_queue_notice_once`, so a crash at either side neither
+    # loses nor duplicates the one top-level line (the outbox id and the bridge receipt deduplicate it).
+    def unavailable_path(self):
+        return self.path("logs", "unavailable.json")
+
+    def _read_unavailable(self):
+        try:
+            data = json.loads(read_text(self.unavailable_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_unavailable(self, data):
+        write_text(self.unavailable_path(), json.dumps(data, indent=1) + "\n")
+
+    @staticmethod
+    def _unavailable_text(reasons):
+        body = "; ".join(reasons or [])[:UNAVAILABLE_REASONS_MAX]
+        return f"manager unavailable: all allowed engines failed ({body})"
+
+    def _queue_unavailable(self, data):
+        _queue_notice_once(self.home, self.dev_channel, data.get("text") or "", f"unavailable-{data['episode_id']}")
+        data["queued"] = True
+        self._save_unavailable(data)
+
+    def _reconcile_unavailable_notice(self):
+        data = self._read_unavailable()
+        if data.get("episode_id") and not data.get("queued"):
+            self._queue_unavailable(data)
+
+    def _note_unavailable(self, n, text):
+        data = self._read_unavailable()
+        if data.get("episode_id"):
+            if not data.get("queued"):
+                self._queue_unavailable(data)
+            return  # a retry that fails again inside the same episode posts nothing more
+        data = {"episode_id": str(uuid.uuid4()), "since": self.now(), "turn": n,
+                "reasons": text[len("manager unavailable: all allowed engines failed ("):-1], "text": text,
+                "queued": False}
+        self._save_unavailable(data)
+        self._queue_unavailable(data)
+
+    def _close_unavailable_episode(self):
+        data = self._read_unavailable()
+        if not data.get("episode_id"):
+            return
+        if not data.get("queued"):
+            self._queue_unavailable(data)  # the durable line of a crashed episode is still delivered once
+        data.update({"episode_id": None, "closed_at": self.now()})
+        self._save_unavailable(data)
+
+    # ---- the engine fault episode (loops/b12.md, founder rule 4 of 2026-10-15): the same shape as the
+    # unavailability episode, in logs/fault.json; one top-level `engine fault:` line per episode.
+    def fault_path(self):
+        return self.path("logs", "fault.json")
+
+    def _read_fault(self):
+        try:
+            data = json.loads(read_text(self.fault_path(), "{}") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _fault_text(reasons):
+        return "engine fault: " + "; ".join(reasons or [])[:UNAVAILABLE_REASONS_MAX]
+
+    def _queue_fault(self, data):
+        _queue_notice_once(self.home, self.dev_channel, data.get("text") or "", f"fault-{data['episode_id']}")
+        data["queued"] = True
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+
+    def _reconcile_fault_notice(self):
+        data = self._read_fault()
+        if data.get("episode_id") and not data.get("queued"):
+            self._queue_fault(data)
+
+    def _note_fault(self, n, text):
+        data = self._read_fault()
+        if data.get("episode_id"):
+            if not data.get("queued"):
+                self._queue_fault(data)
+            return  # the same fault repeating inside the episode posts nothing more
+        data = {"episode_id": str(uuid.uuid4()), "since": self.now(), "turn": n, "text": text, "queued": False}
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+        self._queue_fault(data)
+
+    def _close_fault_episode(self):
+        data = self._read_fault()
+        if not data.get("episode_id"):
+            return
+        if not data.get("queued"):
+            self._queue_fault(data)
+        data.update({"episode_id": None, "closed_at": self.now()})
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+
+    def post_unavailable(self, events, msg=None):
         """The shared all-engines-failed notice sink (requirement 25, loops/b7.md; audit gap correction): a
         founder CLI event still gets its reply file; every other event's notice goes to its own usable
         (channel, thread_ts) at most once per note_once window, deduplicated across restarts. A `self` event
         with no usable channel+thread never falls back to a dev-channel top-level post: it is durably recorded
         in logs/self-replies.jsonl instead, with zero Slack posts, idempotent by event id (the same sink used
         for an unroutable self reply)."""
-        msg = "manager unavailable (every engine failed), will retry"
+        msg = msg or "manager unavailable: all allowed engines failed, will retry"
         seen = set()
         for ev in events:
             p = _payload(ev)
