@@ -1312,7 +1312,148 @@ def stated_reset_time_governs_the_probe():
     no_downgrade(h)
 
 
-SCENARIOS = [quota_then_fault_retries_the_unchanged_rotation, stated_reset_time_governs_the_probe, sticky_account_after_r2d2_out, l_out_tries_r2d2_then_both_out_lands_on_astra, hourly_probe_from_astra_returns_to_fable, session_error_on_l_changes_nothing, filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+def _crash_windows(prefix, arrange, durable_check, delivered_text, after_restart, windows=('before-queue', 'after-queue', 'after-receipt')):
+    """Crash at the durable-state/enqueue boundary of a notice whose outbox id starts with `prefix`: before the
+    enqueue, after it, and after the delivery receipt. `arrange(h, d)` builds the home and returns (sup, eid);
+    `durable_check(h, note_id)` asserts the durable state at the seam; `after_restart(h, d, window, eid)` finishes
+    the scenario. Exactly one eventual top-level delivery of the original id in every window."""
+    for window in windows:
+        h, d, poster = home(), fakes(), Poster()
+        sup, eid = arrange(h, d)
+        original = S._queue_notice_once
+        reached = []
+        def crash_queue(home_arg, channel, text, note_id):
+            if not note_id.startswith(prefix) or (prefix == 'fallback-' and '-move-' not in note_id):
+                return original(home_arg, channel, text, note_id)
+            durable_check(h, note_id)
+            reached.append((note_id, text))
+            if window != 'before-queue':
+                original(home_arg, channel, text, note_id)
+            if window == 'after-receipt':
+                S.drain_outbox(h, poster)
+                check(S.post_receipt(h, note_id) is not None, 'delivery must have a durable receipt')
+            raise SimulatedCrash()
+        S._queue_notice_once = crash_queue
+        try:
+            try:
+                sup.run_once()
+            except SimulatedCrash:
+                pass
+        finally:
+            S._queue_notice_once = original
+        check(len(reached) == 1, f'{prefix}{window}: crash seam not reached exactly once: {reached}')
+        note_id, text = reached[0]
+        pending = [it for it in S.read_outbox(h) if it.get('id') == note_id]
+        check(len(pending) == (1 if window == 'after-queue' else 0), f'{prefix}{window}: unexpected outbox state {pending}')
+        retry = Path(h, 'logs/retry-after')
+        if retry.exists():
+            retry.unlink()
+        restarted = make(h, d)  # the start-up reconcile finishes a durable, not-yet-queued line
+        after_restart(h, d, restarted, window, eid)
+        S.drain_outbox(h, poster)
+        delivered = [(c, t, x) for c, t, x in poster.posted if delivered_text in x]
+        check(len(delivered) == 1 and delivered[0][0:2] == ('C_DEV', None), f'{prefix}{window}: exactly one eventual delivery: {delivered}')
+        check(S.post_receipt(h, note_id) is not None, f'{prefix}{window}: the original id must be receipted')
+        check(len([it for it in S.read_outbox(h) if it.get('id') == note_id]) <= 1, f'{prefix}{window}: duplicated outbox item')
+        no_downgrade(h)
+
+
+def fault_notice_survives_crash_windows():
+    """Review r2 2.1: the fault line is durable in logs/fault.json before it is queued; a crash at either side of
+    the enqueue, or after the receipt, yields exactly one delivery; recovery before the restart still delivers it."""
+    def arrange(h, d):
+        set_table(d, {f'claude-r2d2|{FABLE}': 'other'})
+        return make(h, d), event(h, 'fault crash')
+    def durable(h, note_id):
+        ep = json.loads(Path(h, 'logs/fault.json').read_text())
+        check(note_id == f"fault-{ep['episode_id']}" and ep.get('text', '').startswith('engine fault: tier 1 claude-r2d2') and ep.get('queued') is False,
+              f'fault episode must be durable and unqueued before the enqueue: {ep}')
+    def after_restart(h, d, restarted, window, eid):
+        if window == 'before-queue':
+            set_table(d, {})  # recovery before the restart must not erase the durable, not-yet-queued line
+        check(restarted.run_once() is True, f'{window}: the restart must retry the pending event')
+        ep = json.loads(Path(h, 'logs/fault.json').read_text())
+        if window == 'before-queue':
+            check(eid in S.handled_ids(h) and ep.get('episode_id') is None, f'{window}: recovery serves the event and closes the episode: {ep}')
+        else:
+            check(eid not in S.handled_ids(h) and ep.get('episode_id'), f'{window}: the fault persists, the event waits: {ep}')
+    _crash_windows('fault-', arrange, durable, 'engine fault: tier 1 claude-r2d2', after_restart)
+
+
+def move_notice_survives_crash_windows():
+    """Review r2 2.2: the move is durable (moves counter, move_from, pending_notice) before its line is queued; a
+    crash around the enqueue or after the receipt yields exactly one delivery with the original move id."""
+    def arrange(h, d):
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+        sup = make(h, d)
+        event(h, 'to astra')
+        check(sup.run_once() is True and engine_file(h)['acc'] == 'codex', 'arrange: Astra')
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits'})  # L is back; the hourly probe will move up
+        sup.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)
+        return sup, event(h, 'move crash')
+    def durable(h, note_id):
+        rt = S.read_engine_runtime(h)
+        check(note_id == f"fallback-{rt['episode_id']}-move-1" and rt.get('moves') == 1 and rt.get('pending_notice') == 'move'
+              and rt.get('move_from') == {'acc': 'codex', 'model': ASTRA} and rt.get('effective') == {'acc': 'claude-l', 'model': FABLE},
+              f'the move must be durable before the enqueue: {rt}')
+    def after_restart(h, d, restarted, window, eid):
+        rt = S.read_engine_runtime(h)
+        check(rt.get('pending_notice') is None and rt.get('moves') == 1, f'{window}: reconcile must clear the pending move: {rt}')
+        check(engine_file(h) == {'acc': 'claude-l', 'model': FABLE}, f'{window}: the move itself is kept: {engine_file(h)}')
+        event(h, 'after')
+        check(restarted.run_once() is True and invoked(d)[-1] == ('claude-l', FABLE), f'{window}: the next turn runs on L')
+    _crash_windows('fallback-', arrange, durable, 'fallback moved (episode', after_restart)
+
+
+def fault_text_reaches_console_and_self_events():
+    """Review r2 1.1: a founder console event gets the fault text in its reply file; an unroutable self event gets it
+    in logs/self-replies.jsonl; both stay pending for the retry like a Slack event."""
+    h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'other'})
+    sup = make(h, d)
+    S.append_event(h, {'id': 'cli-fault', 'source': 'cli', 'at': time.time(), 'payload': {'text': 'status please', 'instructs': True}})
+    S.append_event(h, {'id': 'self-fault', 'source': 'self', 'at': time.time(), 'payload': {'text': 'continue b', 'instructs': False}})
+    check(sup.run_once() is True, 'the faulting turn must run')
+    text = f'engine fault: tier 1 claude-r2d2 ({FABLE}): other: a plain runtime crash'
+    reply = Path(h, 'inbox', 'replies', 'cli-fault.txt')
+    check(reply.exists() and reply.read_text() == text + '\n', f'console reply file: {reply.read_text() if reply.exists() else None!r}')
+    rows = S.read_jsonl(os.path.join(h, 'logs', 'self-replies.jsonl'))
+    mine = [r for r in rows if isinstance(r, dict) and r.get('id') == 'self-fault']
+    check(len(mine) == 1 and mine[0].get('text') == text, f'self-replies record: {rows}')
+    check(len(notices(h, 'engine fault: ')) == 1, 'one top-level line as well')
+    check('self-fault' not in S.handled_ids(h) and 'cli-fault' not in S.handled_ids(h), 'both events wait for the retry')
+    no_downgrade(h)
+
+
+def probe_due_during_fault_backoff_is_taken_on_the_retry():
+    """Review r2 5.1: on a lower tier, a fault starts the back-off; when probe_after expires meanwhile, the retry
+    (in-process or after a restart) probes the tiers above first."""
+    for restart in (False, True):
+        h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+        sup = make(h, d)
+        event(h, 'A')
+        check(sup.run_once() is True and engine_file(h)['acc'] == 'codex', 'arrange: Astra')
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits', f'codex|{ASTRA}': 'rate_limit'})
+        eid = event(h, 'B')
+        check(sup.run_once() is True and invoked(d)[3:] == [('codex', ASTRA)], f'inside the hour the fault hits Astra alone: {invoked(d)[3:]}')
+        check(len(notices(h, 'engine fault: ')) == 1 and eid not in S.handled_ids(h), 'fault line, event waits')
+        sup.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)  # the probe becomes due during the back-off
+        os.remove(os.path.join(h, 'logs', 'retry-after'))
+        runner = make(h, d) if restart else sup
+        if restart:
+            runner.clock.now = sup.clock.now
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})  # Astra works again, Fable still out
+        check(runner.run_once() is True, 'the retry must run')
+        check(invoked(d)[4:] == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)], f'restart={restart}: the retry probes first: {invoked(d)[4:]}')
+        check(eid in S.handled_ids(h) and json.loads(Path(h, 'logs', 'fault.json').read_text()).get('episode_id') is None, 'served, fault episode closed')
+        no_downgrade(h)
+
+
+SCENARIOS = [fault_notice_survives_crash_windows, move_notice_survives_crash_windows, fault_text_reaches_console_and_self_events, probe_due_during_fault_backoff_is_taken_on_the_retry, quota_then_fault_retries_the_unchanged_rotation, stated_reset_time_governs_the_probe, sticky_account_after_r2d2_out, l_out_tries_r2d2_then_both_out_lands_on_astra, hourly_probe_from_astra_returns_to_fable, session_error_on_l_changes_nothing, filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,
