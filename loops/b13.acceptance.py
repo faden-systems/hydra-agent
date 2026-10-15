@@ -155,10 +155,27 @@ with tempfile.TemporaryDirectory() as d:
  base=os.environ.get('BASE_REF')
  if base:
   bp=h/'baseline.py';bp.write_bytes(subprocess.check_output(['git','show',base+':manager/supervisor.py'],cwd=ROOT));B=module(bp,'correction_baseline')
-  changed=('engine:','last turn attempts:','off configured engine:','accounts:','context:','compaction:','timer:','heartbeat:','last turn:','engine fallback:','waiting on ','idle until ','continuation:')
-  assert [x for x in status(str(h)).splitlines() if not x.startswith(changed)]==[x for x in B.status_text(str(h)).splitlines() if not x.startswith(changed)]
+  import re
+  from datetime import datetime
+  from zoneinfo import ZoneInfo
+  def normalize(text):
+   text=re.sub(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)',lambda m:datetime.fromisoformat(m[0].replace('Z','+00:00')).astimezone(ZoneInfo('America/Los_Angeles')).strftime('%Y-%m-%d %H:%M:%S %Z'),text)
+   text=re.sub(r' \(stale: last Claude turn .*?; \d+ turns since on .*\)', '', text)
+   # The populated old idle line is HH:MM only; authorize its precise replacement.
+   return text.replace('idle until 15:00 PDT','idle until 2026-10-14 15:00:00 PDT')
+  diagnostics=('engine:','last turn attempts:','off configured engine:','accounts:')
+  assert [normalize(x) for x in status(str(h)).splitlines() if not x.startswith(diagnostics)]==[normalize(x) for x in B.status_text(str(h)).splitlines() if not x.startswith(diagnostics)]
  turns=[dict(n=1,at=t,duration_s=5,engine='claude-r2d2'),dict(n=2,at=t+10,duration_s=5,engine='codex'),dict(n=3,at=t+20,duration_s=5,engine='other-engine'),dict(n=4,at=t+30,duration_s=5,engine='claude-r2d2',kind='compaction')]
  write(h,turns,[]);out=status(str(h));assert '2 turns since on mixed (codex, other-engine)' in out,out
  write(h,turns[1:3],[]);out=status(str(h));assert 'last Claude turn unknown' in out,out
  print('PASS classifier routes, per-account usage, missing logs, timestamp sources and mixed context')
+with tempfile.TemporaryDirectory() as d:
+ h=Path(d);t=1792015200
+ rs=[attempt(t,'claude-l',classification='credits',reason='out of usage credits'),attempt(t+1,'claude-l')]
+ write(h,[],rs);assert 'usage: limit at' in account(status(str(h)),'claude-l')
+ rs.append(attempt(t+2,'claude-l',True));write(h,[],rs)
+ assert account(status(str(h)),'claude-l')=='claude-l: ok; last ok 2026-10-14 15:00:02 PDT; usage: ok'
+ rs.append(attempt(t+3,'claude-l'));write(h,[],rs)
+ assert account(status(str(h)),'claude-l')=='claude-l: session_in_use since 2026-10-14 15:00:03 PDT; last ok 2026-10-14 15:00:02 PDT; usage: unknown (API not reached since 2026-10-14 15:00:02 PDT)'
+ assert account(status(str(h)),'codex')=='codex: unknown; last ok unknown; usage: unknown'
 print('[b13.acceptance] PASS')
