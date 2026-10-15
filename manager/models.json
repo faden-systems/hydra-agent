@@ -4,9 +4,7 @@
     "id_prefix": "claude-",
     "aliases": {
       "fable5.1": "claude-fable-5-1",
-      "sonnet5": "claude-sonnet-5",
       "opus5": "claude-opus-5",
-      "haiku4.5": "claude-haiku-4-5-20251001",
       "opus5.5": "claude-opus-5-5"
     }
   },
@@ -17,7 +15,9 @@
       "gpt6": "gpt-6-astra",
       "astra": "gpt-6-astra",
       "gpt5.6": "gpt-5.6-sol",
-      "sol": "gpt-5.6-sol"
+      "sol": "gpt-5.6-sol",
+      "gpt6.1": "gpt-6.1-sol",
+      "sol6.1": "gpt-6.1-sol"
     }
   }
 }

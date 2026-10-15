@@ -94,10 +94,14 @@ def test_all_engines_fail_keeps_events_and_notes_once(home, quota_engine, poster
     assert eid not in S.handled_ids(home)
     turn = S.read_jsonl(os.path.join(home, "logs", "turns.jsonl"))[-1]
     assert "error" in turn and "claude-r2d2" in turn["error"]
-    assert len(poster.posted) == 1 and "unavailable" in poster.posted[0][2]
+    assert not poster.posted, "b12: no per-thread note any more"
+    lines = [it for it in S.read_outbox(home) if "all allowed engines failed" in it["text"]]
+    assert len(lines) == 1 and lines[0]["thread_ts"] is None
+    assert lines[0]["text"].startswith("manager unavailable: all allowed engines failed (tier 1 claude-r2d2 (claude-fable-5-1): ")
     os.remove(os.path.join(home, "logs", "retry-after"))
     assert sup.run_once() is True
-    assert len(poster.posted) == 1, "the unavailable note is posted at most once per hour per thread"
+    assert len([it for it in S.read_outbox(home) if "all allowed engines failed" in it["text"]]) == 1, \
+        "one top-level line per unavailability episode"
     assert not os.path.exists(os.path.join(home, "MANAGER-HANDOFF.md"))
 
 

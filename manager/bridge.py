@@ -436,7 +436,13 @@ class Bridge:
                 self.reply(channel, thread_ts, f"engine: {S.engine_label(current)}{S.mode_suffix(current)}")
             else:
                 try:
-                    pair = S.parse_engine_command(target, current=current)
+                    # loops/b12.md requirement 2: the engine_policy ladder is enforced BEFORE set_engine; a refused
+                    # command leaves the engine file and engine-runtime.json untouched
+                    cfg = S.load_config(self.home)
+                    models = S.load_models(self.home)
+                    engines = S.default_engines(self.home, cfg)
+                    pair = S.parse_engine_command(target, current=current, models=models)
+                    S.enforce_engine_policy(pair, S.manager_ladder(cfg, models, engines))
                 except S.BadEngine as e:
                     self.reply(channel, thread_ts, f"{e}; nothing changed (engine: {S.engine_label(current)}{S.mode_suffix(current)})")
                     return {"command": word, "ok": False}
