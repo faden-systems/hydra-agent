@@ -33,6 +33,9 @@ REAL_ATTEMPTS = [{'at': '2026-10-15T05:55:19Z', 'engine': 'claude-r2d2', 'model'
 def attempt(at,engine,success=False,classification='other',reason='Error: Session ID preserved-session is already in use.'):
  from datetime import datetime,timezone
  return dict(at=datetime.fromtimestamp(at,timezone.utc).isoformat(),engine=engine,model='gpt-6-astra' if engine=='codex' else 'claude-fable-5-1',rc=0 if success else 1,success=success,classification=None if success else classification,reason='' if success else reason)
+def account(text,name):
+ import re
+ return re.split(r'; (?=(?:claude-r2d2|claude-l|codex):)',line(text,'accounts:').removeprefix('accounts: '))[["claude-r2d2","claude-l","codex"].index(name)]
 def line(text,prefix):return next(x for x in text.splitlines() if x.startswith(prefix))
 with tempfile.TemporaryDirectory() as d:
  h=Path(d); start=1792015200; turns=[]; attempts=[]
@@ -96,7 +99,9 @@ with tempfile.TemporaryDirectory() as d:
  # Malformed rows and partial final writes cannot break diagnostics.
  for name in ['turns','attempts']:
   (h/'logs'/f'{name}.jsonl').write_text('null\n[]\n{"at":"bad"}\n{"partial":')
- status(str(h))
+ malformed=status(str(h));assert 'last turn ran on unknown (unknown)' in malformed;assert 'last turn attempts: none recorded' in malformed
+ for name in ['turns','attempts']:
+  (h/'logs'/f'{name}.jsonl').unlink();assert 'last turn attempts: none recorded' in status(str(h))
  print('PASS missing and malformed evidence')
 
 
@@ -106,16 +111,17 @@ with tempfile.TemporaryDirectory() as d:
  write(h,[],REAL_HISTORY);out=status(str(h));accounts=line(out,'accounts:')
  assert 'claude-l: session_in_use since 2026-10-14 10:54:26 PDT' in accounts,accounts
  assert 'before: usage_limit at 2026-10-11 11:56:23 PDT' in accounts,accounts
- assert 'usage: limit at 2026-10-11 11:56:23 PDT' in accounts,accounts
+ assert 'usage: limit at 2026-10-11 11:56:23 PDT' in account(out,'claude-l'),accounts
+ assert account(out,'claude-r2d2').endswith('usage: ok'),accounts
  assert 'claude-r2d2: session_in_use since 2026-10-14 10:54:25 PDT' in accounts,accounts
  assert 'before: timeout at 2026-10-14 10:49:23 PDT' in accounts,accounts
  assert 'last ok 2026-10-14 10:01:51 PDT' in accounts,accounts
  # API not reached: all failures pre-API; a previous limit before success is cleared.
  rs=[a for a in REAL_HISTORY if a['engine']=='claude-r2d2' and 'timeout' not in a['reason']]
  write(h,[],rs);out=status(str(h))
- assert 'usage: unknown (API not reached since 2026-10-14 10:01:51 PDT)' in out,out
+ assert 'usage: unknown (API not reached since 2026-10-14 10:01:51 PDT)' in account(out,'claude-r2d2'),out
  rs.append(attempt(1792100000,'claude-r2d2',True));write(h,[],rs);out=status(str(h))
- assert 'claude-r2d2: ok' in out and 'usage: ok' in out
+ assert account(out,'claude-r2d2').endswith('usage: ok')
  # Winter date is a separate fixture; generated times must all be Pacific.
  from datetime import datetime,timezone
  t=datetime(2026,11,2,12,tzinfo=timezone.utc).timestamp()
@@ -129,4 +135,30 @@ with tempfile.TemporaryDirectory() as d:
  turns.append(dict(n=4,at=t+180,duration_s=5,engine='claude-r2d2',model='claude-fable-5-1'))
  write(h,turns,[]);assert '(stale:' not in status(str(h))
  print('PASS real history, usage uncertainty, DST and stale context')
+# Additional frozen review cases.
+with tempfile.TemporaryDirectory() as d:
+ h=Path(d);write(h,[],[])
+ for cls,reason in [('startup','startup failed'),('supervisor_died','supervisor died mid-turn'),('timeout','timeout after 1800s')]:
+  for recorded in [cls,'other']:
+   write(h,[],[attempt(1792015200,'claude-r2d2',classification=recorded,reason=reason)])
+   assert f'claude-r2d2: {cls} since' in account(status(str(h)),'claude-r2d2')
+ write(h,[],[attempt(1792015200,'claude-r2d2',classification='auth',reason='unrelated')]);assert 'claude-r2d2: auth since' in status(str(h))
+ # Existing status sources are populated, not mocked away.
+ t=1792015200;iso='2026-10-14T22:00:00Z'
+ (h/'logs/compaction.json').write_text(json.dumps(dict(last=dict(at=iso,before_tokens=10,after_tokens=5,ok=True))))
+ target=h/S.TIMER_SNAPSHOT;target.parent.mkdir(exist_ok=True,parents=True);target.write_text(json.dumps(dict(last_check=dict(at=iso,cost_ms=4),last_wake=dict(at=iso,reasons=['test']))))
+ (h/'work-status.json').write_text(json.dumps(dict(mode='waiting',who='fixture',since=t)))
+ out=status(str(h));assert 'last compaction: 2026-10-14 15:00:00 PDT' in out;assert 'last check 2026-10-14 15:00:00 PDT' in out;assert 'last wake 2026-10-14 15:00:00 PDT' in out;assert 'waiting on fixture since 2026-10-14 15:00:00 PDT' in out
+ (h/'work-status.json').write_text(json.dumps(dict(mode='idle',deadline=t)))
+ assert 'idle until 2026-10-14 15:00:00 PDT' in status(str(h))
+ # Preserve all unrelated lines versus BASE_REF.
+ base=os.environ.get('BASE_REF')
+ if base:
+  bp=h/'baseline.py';bp.write_bytes(subprocess.check_output(['git','show',base+':manager/supervisor.py'],cwd=ROOT));B=module(bp,'correction_baseline')
+  changed=('engine:','last turn attempts:','off configured engine:','accounts:','context:','compaction:','timer:','heartbeat:','last turn:','engine fallback:','waiting on ','idle until ','continuation:')
+  assert [x for x in status(str(h)).splitlines() if not x.startswith(changed)]==[x for x in B.status_text(str(h)).splitlines() if not x.startswith(changed)]
+ turns=[dict(n=1,at=t,duration_s=5,engine='claude-r2d2'),dict(n=2,at=t+10,duration_s=5,engine='codex'),dict(n=3,at=t+20,duration_s=5,engine='other-engine'),dict(n=4,at=t+30,duration_s=5,engine='claude-r2d2',kind='compaction')]
+ write(h,turns,[]);out=status(str(h));assert '2 turns since on mixed (codex, other-engine)' in out,out
+ write(h,turns[1:3],[]);out=status(str(h));assert 'last Claude turn unknown' in out,out
+ print('PASS classifier routes, per-account usage, missing logs, timestamp sources and mixed context')
 print('[b13.acceptance] PASS')
