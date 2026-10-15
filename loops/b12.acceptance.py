@@ -21,6 +21,9 @@ import bridge as B  # noqa: E402
 HYDRA = str(ROOT / 'manager' / 'hydra')
 FABLE, ASTRA, OPUS = 'claude-fable-5-1', 'gpt-6-astra', 'claude-opus-5-5'
 LADDER_MODELS = {FABLE, ASTRA, OPUS}
+LADDER_PAIRS = {('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA), ('claude-r2d2', OPUS), ('claude-l', OPUS)}
+HOUR = dt.timedelta(seconds=3600)  # review r3 2.1: the hourly re-probe is measured against this literal, not the candidate's constant
+HOME_FAKES = {}  # home -> its recording fakes dir (filled by make), for the process-start side of no_downgrade
 BELOW = ('claude-sonnet-5', 'claude-haiku-4-5-20251001', 'claude-opus-5', 'gpt-5.6-sol', 'gpt-6.1-sol')
 
 
@@ -176,6 +179,7 @@ class Clock:
 
 
 def make(h, d, poster=None, blog=None):
+    HOME_FAKES[h] = d
     return S.Supervisor(home=h, engines=engines(d), poster=poster or Poster(), buildlog_poster=blog or Poster(),
                         clock=Clock(dt.datetime(2026, 10, 11, 19, 0, 0, tzinfo=dt.timezone.utc)))
 
@@ -205,11 +209,18 @@ def policy_line(h):
     return lines[0]
 
 
-def no_downgrade(h, allowed=LADDER_MODELS):
-    bad = [a for a in attempts(h) if a.get('model') not in allowed]
-    check(not bad, f'attempts.jsonl carries a model outside the ladder: {bad}')
+def no_downgrade(h, pairs=LADDER_PAIRS):
+    """Review r3 2.2: every attempt record and every recorded engine process start names an (account, model) pair of
+    the ladder in force; a model set alone would let an approved model run on an excluded account."""
+    bad = [a for a in attempts(h) if (a.get('engine'), a.get('model')) not in pairs]
+    check(not bad, f'attempts.jsonl carries an (account, model) pair outside the ladder: {bad}')
     for a in attempts(h):
         check(a.get('model') not in BELOW, f'a model below the floor was invoked: {a}')
+    d = HOME_FAKES.get(h)
+    if d is not None:
+        started = [(c.get('acc'), c.get('model')) for c in calls(d)]
+        bad = [p for p in started if p not in pairs]
+        check(not bad, f'an engine process was started outside the ladder pairs: {bad}')
 
 
 def unavailable_lines(h):
@@ -269,13 +280,22 @@ def astra_out_lands_on_opus55():
     check('active tier 3/3 claude-r2d2 (claude-opus-5-5)' in policy_line(h) and 'floor claude-opus-5-5' in policy_line(h),
           f'status at the floor: {policy_line(h)!r}')
     no_downgrade(h)
-    # recovery upward: tier 1 working again closes the episode and the next turn is back on fable/r2d2
+    # requirement 11: inside the hour the higher tiers are not re-probed even when they would work again
     set_table(d, {})
     event(h, 'B')
     check(sup.run_once() is True, 'turn B did not run')
-    check(invoked(d)[-1] == ('claude-r2d2', FABLE), f'the rotation from the floor must reach tier 1 again: {invoked(d)}')
+    check(invoked(d)[4:] == [('claude-r2d2', OPUS)], f'no probe inside the hour: {invoked(d)[4:]}')
+    check(engine_file(h) == {'acc': 'claude-r2d2', 'model': OPUS}, 'still on the floor inside the hour')
+    # the hour passes: the probe reaches tier 1, the episode ends, the engine file returns to the configured pair
+    sup.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)
+    event(h, 'C')
+    check(sup.run_once() is True, 'turn C did not run')
+    check(invoked(d)[5:] == [('claude-r2d2', FABLE)], f'the hourly probe must reach tier 1 first: {invoked(d)[5:]}')
     ended = [it['text'] for it in S.read_outbox(h) if 'fallback ended' in it.get('text', '')]
     check(ended and 'tier 1/3 claude-r2d2 (claude-fable-5-1)' in ended[-1], f'the ended notice names the tier: {ended}')
+    check(engine_file(h) == {'acc': 'claude-r2d2', 'model': FABLE}, f'the return lands in the engine file: {engine_file(h)}')
+    rt = json.loads(Path(h, 'engine-runtime.json').read_text())
+    check(not rt.get('active') and 'probe_after' not in rt, f'episode closed, no probe pending: {rt}')
     no_downgrade(h)
 
 
@@ -484,6 +504,12 @@ def commands_refuse_outside_the_allowlist():
           f'a coder alias is refused in Slack: {poster.posted[-1][2]!r}')
     check(Path(h, 'engine').read_bytes() == before and runtime_path.read_bytes() == runtime_before,
           'both files must remain byte-identical after the refused coder alias in Slack')
+    for ts, text, model in (('20.11', '<@U_MANAGER> engine model=opus5', 'claude-opus-5'),
+                            ('20.12', '<@U_MANAGER> engine acc=codex model=gpt-5.6-sol', 'gpt-5.6-sol')):
+        slack(br, text, ts)  # review r3 1.1: the whole refusal matrix in Slack, not only on the console
+        check(poster.posted[-1][2] == refusal(model, f'claude-l ({FABLE}) [persistent]'), f'Slack refusal of {model}: {poster.posted[-1][2]!r}')
+        check(Path(h, 'engine').read_bytes() == before and runtime_path.read_bytes() == runtime_before,
+              f'both files must remain byte-identical after the refused Slack command {text!r}')
     slack(br, '<@U_MANAGER> engine model=sonnet5', '20.15')
     reply = poster.posted[-1][2]
     check('unknown model' in reply and 'sonnet5 ->' not in reply and 'fable5.1' in reply
@@ -705,7 +731,7 @@ def configured_ladder_controls_execution_and_commands():
     check(invoked(d) == expected, f'override order/account membership ignored: {invoked(d)}')
     check([(a['engine'], a['model']) for a in attempts(h)] == expected,
           f'custom ladder attempt records disagree: {attempts(h)}')
-    no_downgrade(h, {ASTRA, OPUS})
+    no_downgrade(h, {('codex', ASTRA), ('claude-l', OPUS)})
     # Same approved model, excluded account; also an approved model excluded entirely.
     for acc, model in [('claude-r2d2', OPUS), ('claude-l', FABLE)]:
         before = Path(h, 'engine').read_bytes()
@@ -795,12 +821,14 @@ def attach_refuses_outside_the_allowlist():
 
 
 def unavailable_reason_contract():
-    """Exercise the real turn/error/notice path; only engine invocation and eligibility inputs are fake."""
+    """Exercise the real turn/error/notice path; only engine invocation and eligibility inputs are fake. A usage
+    walk through every step posts the unavailable line; a fault (rate limit, other, crash, timeout) ends the walk
+    at that step and posts the `engine fault:` line instead (requirement 12)."""
     ladder = [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA),
               ('claude-r2d2', OPUS), ('claude-l', OPUS)]
     labels = [f'tier {tier} {acc} ({model}): ' for tier, (acc, model) in zip((1, 1, 2, 3, 3), ladder)]
 
-    def run(replies, expected, expected_calls, *, skip=None, custom=None):
+    def run(replies, expected, expected_calls, *, skip=None, custom=None, fault=False):
         cfg = {'engine_fallback': {'claude_models': []}}
         specs = None
         if custom:
@@ -835,20 +863,36 @@ def unavailable_reason_contract():
             S.credential_identity = original_identity
         check(observed == expected_calls, f'wrong attempts for reasons: {observed!r}')
         lines = unavailable_lines(h)
-        wanted = 'manager unavailable: all allowed engines failed (' + expected[:1000] + ')'
-        check(len(lines) == 1 and lines[0]['text'] == wanted,
-              f'exact reason contract: expected {wanted!r}, got {lines!r}')
+        faults = [it for it in S.read_outbox(h) if (it.get('text') or '').startswith('engine fault: ')]
+        if fault:
+            wanted = 'engine fault: ' + expected[:1000]
+            check(not lines, f'a fault must not post the unavailable line: {lines!r}')
+            check(len(faults) == 1 and faults[0]['text'] == wanted, f'exact fault contract: expected {wanted!r}, got {faults!r}')
+            check(not S.read_engine_runtime(h).get('active'), 'a fault never starts a fallback episode')
+            lines = faults
+        else:
+            wanted = 'manager unavailable: all allowed engines failed (' + expected[:1000] + ')'
+            check(not faults, f'a usage walk posts no fault line: {faults!r}')
+            check(len(lines) == 1 and lines[0]['text'] == wanted,
+                  f'exact reason contract: expected {wanted!r}, got {lines!r}')
         check(lines[0].get('channel') == 'C_DEV' and lines[0].get('thread_ts') is None,
               'reason notice must be top level')
         # Encoding must round-trip: limits count code points, never slices of UTF-8 bytes.
         check(lines[0]['text'].encode('utf-8').decode('utf-8') == wanted, 'broken Unicode boundary')
-        no_downgrade(h)
+        no_downgrade(h, {(name, ASTRA) for name in custom} if custom else LADDER_PAIRS)
 
     error = '界🙂é' * 45 + 'UNTRUNCATED_SENTINEL'
+    # a rate limit on tier 3 ends the walk there: three usage steps before it, the fault line names only that step
     outcomes = [(1, 'out of usage credits'), (1, 'usage limit reached'),
                 (1, 'HTTP 401 Unauthorized'), (1, '429 Too Many Requests'), (1, error)]
-    reasons = ['credits', 'usage_limit', 'auth', 'rate_limit', 'other: ' + error[:80]]
-    run(dict(zip(ladder, outcomes)), '; '.join(l + r for l, r in zip(labels, reasons)), ladder)
+    run(dict(zip(ladder, outcomes)), labels[3] + 'rate_limit', ladder[:4], fault=True)
+    # an `other` error on the first step: nothing else is tried, the error text is bounded to 80 code points
+    run(dict(zip(ladder, [(1, error)] + outcomes[1:])), labels[0] + 'other: ' + error[:80], ladder[:1], fault=True)
+    # every step out on usage: the unavailable line with all five reasons
+    usage = [(1, 'out of usage credits'), (1, 'usage limit reached'), (1, 'HTTP 401 Unauthorized'),
+             (1, 'out of usage credits'), (1, 'usage limit reached')]
+    reasons = ['credits', 'usage_limit', 'auth', 'credits', 'usage_limit']
+    run(dict(zip(ladder, usage)), '; '.join(l + r for l, r in zip(labels, reasons)), ladder)
     for why in ('unverified credential', 'over budget', 'identity mismatch'):
         reasons = ['credits', 'skipped: ' + why, 'credits', 'credits', 'skipped: ' + why]
         run({pair: (1, 'out of usage credits') for pair in ladder},
@@ -858,12 +902,12 @@ def unavailable_reason_contract():
     run({ladder[0]: (1, 'Prompt is too long for this model'), ladder[2]: (1, 'HTTP 401 Unauthorized')},
         '; '.join(l + r for l, r in zip(labels, reasons)), [ladder[0], ladder[2]])
     for rc, reason in ((17, 'crash'), (124, 'timeout')):
-        # An uncertain attempt terminates traversal immediately; no later tier is falsely called failed.
-        run({ladder[0]: (rc, 'unstructured process failure')}, labels[0] + reason, [ladder[0]])
-    names = [f'codex{i:02d}' for i in range(12)]
-    long_reasons = '; '.join(f'tier 1 {name} ({ASTRA}): other: {error[:80]}' for name in names)
-    check(len(long_reasons) > 1000, 'Unicode total-bound fixture must exceed the limit')
-    run({(name, ASTRA): (1, error) for name in names}, long_reasons,
+        # An uncertain attempt terminates traversal immediately as a fault; no later tier is falsely called failed.
+        run({ladder[0]: (rc, 'unstructured process failure')}, labels[0] + reason, [ladder[0]], fault=True)
+    names = [f'codex{i:02d}' for i in range(30)]
+    long_reasons = '; '.join(f'tier 1 {name} ({ASTRA}): credits' for name in names)
+    check(len(long_reasons) > 1000, 'total-bound fixture must exceed the limit')
+    run({(name, ASTRA): (1, 'out of usage credits') for name in names}, long_reasons,
         [(name, ASTRA) for name in names], custom=names)
 
 
@@ -898,7 +942,8 @@ def alias_remapping_cannot_extend_allowlist():
 
 
 def failure_success_persistence_matrix():
-    """Auth persists a successful fallback; transient errors leave both state files unchanged."""
+    """Auth persists a successful fallback; rate_limit/other are faults (requirement 12): nothing moves, nothing
+    persists, one top-level `engine fault:` line, the event waits for the retry on the same engine."""
     for reason in ('auth', 'rate_limit', 'other'):
         h, d = home(), fakes({f'claude-r2d2|{FABLE}': reason})
         primary = {'acc': 'claude-r2d2', 'model': FABLE}
@@ -907,24 +952,42 @@ def failure_success_persistence_matrix():
         runtime.write_text(json.dumps({'configured': primary}))
         before = Path(h, 'engine').read_bytes(), runtime.read_bytes()
         eid = event(h, f'failure-success {reason}')
-        check(make(h, d).run_once() is True and eid in S.handled_ids(h), f'{reason}: event not served')
-        check(invoked(d) == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'{reason}: wrong attempts {invoked(d)}')
+        sup = make(h, d)
+        check(sup.run_once() is True, f'{reason}: turn did not run')
         att = attempts(h)
-        check(len(att) == 2 and att[0]['classification'] == reason and att[1]['success'] is True,
-              f'{reason}: wrong attempt classification {att}')
         notices = [it['text'] for it in S.read_outbox(h) if 'fallback started' in it.get('text', '')]
+        faults = [it for it in S.read_outbox(h) if (it.get('text') or '').startswith('engine fault: ')]
         state = json.loads(runtime.read_text())
         if reason == 'auth':
+            check(eid in S.handled_ids(h), 'auth: event not served')
+            check(invoked(d) == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'auth: wrong attempts {invoked(d)}')
+            check(len(att) == 2 and att[0]['classification'] == 'auth' and att[1]['success'] is True, f'auth: {att}')
             check(engine_file(h) == winner, 'auth fallback must persist winner in engine file')
             check(state.get('configured') == primary and state.get('effective') == winner
                   and state.get('active') is True and state.get('episode_id') and state.get('reason') == att[0]['reason'],
                   f'auth fallback runtime state: {state}')
             check(len(notices) == 1 and f'claude-l ({FABLE})' in notices[0], f'auth fallback notice: {notices}')
+            check(not faults, f'auth is not a fault: {faults}')
         else:
-            check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before,
-                  f'{reason}: transient fallback persisted state')
-            check(not notices and not state.get('active') and not state.get('episode_id'),
-                  f'{reason}: transient fallback started an episode')
+            check(eid not in S.handled_ids(h), f'{reason}: a fault leaves the event pending')
+            check(invoked(d) == [('claude-r2d2', FABLE)], f'{reason}: a fault never tries the next step: {invoked(d)}')
+            check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before, f'{reason}: a fault persisted state')
+            check(not notices and not state.get('active') and not state.get('episode_id'), f'{reason}: a fault started an episode')
+            what = {'rate_limit': 'rate_limit', 'other': 'other: a plain runtime crash'}[reason]
+            check(len(faults) == 1 and faults[0]['text'] == f'engine fault: tier 1 claude-r2d2 ({FABLE}): {what}'
+                  and faults[0].get('channel') == 'C_DEV' and faults[0].get('thread_ts') is None, f'{reason}: fault line {faults}')
+            fault = json.loads(Path(h, 'logs', 'fault.json').read_text())
+            check(fault.get('episode_id') and faults[0].get('id') == f"fault-{fault['episode_id']}", f'fault episode: {fault}')
+            check(Path(h, 'logs', 'retry-after').exists(), f'{reason}: retry-after missing')
+            os.remove(os.path.join(h, 'logs', 'retry-after'))
+            check(sup.run_once() is True and invoked(d) == [('claude-r2d2', FABLE)] * 2, f'{reason}: the retry must use the same engine')
+            check(len([it for it in S.read_outbox(h) if (it.get('text') or '').startswith('engine fault: ')]) == 1,
+                  f'{reason}: a repeated fault inside the episode posts nothing more')
+            set_table(d, {})
+            os.remove(os.path.join(h, 'logs', 'retry-after'))
+            check(sup.run_once() is True and eid in S.handled_ids(h), f'{reason}: recovery did not serve the event')
+            check(json.loads(Path(h, 'logs', 'fault.json').read_text()).get('episode_id') is None, 'recovery closes the fault episode')
+            check((Path(h, 'engine').read_bytes(), runtime.read_bytes()) == before, f'{reason}: recovery on the same engine changed state')
         no_downgrade(h)
 
 
@@ -1055,7 +1118,393 @@ def mode_only_commands_enforce_policy():
         no_downgrade(h)
 
 
-SCENARIOS = [filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+
+STICKY_RUNTIME = {'configured': {'acc': 'claude-r2d2', 'model': FABLE}, 'effective': {'acc': 'claude-l', 'model': FABLE},
+                  'episode_id': 'sticky-acceptance', 'since': '2026-10-11T18:00:00Z', 'reason': 'credits', 'active': True}
+
+
+def notices(h, needle):
+    return [it for it in S.read_outbox(h) if needle in (it.get('text') or '')]
+
+
+def engine_line(h):
+    return status(h).splitlines()[0]
+
+
+def sticky_account_after_r2d2_out():
+    """Founder acceptance (w): R2D2 out -> L; the next turn stays on L with no R2D2 call; status separates the pairs."""
+    h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits'})
+    sup = make(h, d)
+    event(h, 'A')
+    check(sup.run_once() is True, 'turn A did not run')
+    check(invoked(d) == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'turn A order: {invoked(d)}')
+    check(engine_file(h) == {'acc': 'claude-l', 'model': FABLE}, f'the winner is persisted: {engine_file(h)}')
+    rt = S.read_engine_runtime(h)
+    check(rt.get('configured') == {'acc': 'claude-r2d2', 'model': FABLE} and rt.get('active') and 'probe_after' not in rt,
+          f'same-tier move: configured kept, no probe: {rt}')
+    event(h, 'B')
+    check(sup.run_once() is True, 'turn B did not run')
+    check(invoked(d)[2:] == [('claude-l', FABLE)], f'the next turn must stay on L with no R2D2 call: {invoked(d)[2:]}')
+    line = engine_line(h)
+    check(line.startswith(f'engine: configured claude-r2d2 ({FABLE}) | effective claude-l ({FABLE}) | last turn ran on claude-l ({FABLE})')
+          and 'MISMATCH' not in line, f'first status line: {line!r}')
+    check('active tier 1/3 claude-l (claude-fable-5-1)' in policy_line(h), f'policy line: {policy_line(h)!r}')
+    no_downgrade(h)
+
+
+def l_out_tries_r2d2_then_both_out_lands_on_astra():
+    """Founder acceptance (x): on L, L out -> R2D2 tried -> both out -> Astra; one moved line; the probe an hour out."""
+    h = home(engine={'acc': 'claude-l', 'model': FABLE})
+    Path(h, 'engine-runtime.json').write_text(json.dumps(STICKY_RUNTIME))
+    d = fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+    sup = make(h, d)
+    event(h, 'A')
+    check(sup.run_once() is True, 'turn A did not run')
+    check(invoked(d) == [('claude-l', FABLE), ('claude-r2d2', FABLE), ('codex', ASTRA)], f'order: {invoked(d)}')
+    check(engine_file(h) == {'acc': 'codex', 'model': ASTRA}, f'Astra persisted: {engine_file(h)}')
+    moved = notices(h, 'fallback moved')
+    check(len(moved) == 1 and moved[0].get('thread_ts') is None and f'tier 1/3 claude-l ({FABLE}) unavailable' in moved[0]['text']
+          and moved[0]['text'].endswith(f'now running tier 2/3 codex ({ASTRA})'), f'moved line: {moved}')
+    rt = S.read_engine_runtime(h)
+    check(S.TIER_PROBE_S == 3600, f'TIER_PROBE_S must be 3600 s (founder rule 3): {S.TIER_PROBE_S!r}')
+    due = S.parse_iso(rt.get('probe_after')) - sup.clock.now
+    check(HOUR - dt.timedelta(seconds=10) <= due <= HOUR, f'probe an hour out (literal 3600 s): {rt}')
+    check(rt.get('configured') == {'acc': 'claude-r2d2', 'model': FABLE}, 'the operator pair is never rewritten')
+    check(engine_line(h).startswith(f'engine: configured claude-r2d2 ({FABLE}) | effective codex ({ASTRA}) | last turn ran on codex ({ASTRA})'),
+          f'first status line: {engine_line(h)!r}')
+    no_downgrade(h)
+
+
+def hourly_probe_from_astra_returns_to_fable():
+    """Founder acceptance (y): no Fable call inside the hour; one probe at the hour; back up as soon as a Fable
+    account works; the configured pair's return ends the episode and restores the engine file."""
+    h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+    sup = make(h, d)
+    event(h, 'A')
+    check(sup.run_once() is True and engine_file(h)['acc'] == 'codex', 'turn A must land on Astra')
+    event(h, 'B')
+    check(sup.run_once() is True and invoked(d)[3:] == [('codex', ASTRA)], f'no Fable call inside the hour: {invoked(d)[3:]}')
+    sup.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)
+    event(h, 'C')
+    check(sup.run_once() is True, 'turn C did not run')
+    check(invoked(d)[4:] == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)], f'one probe of both Fable accounts: {invoked(d)[4:]}')
+    check(S.parse_iso(S.read_engine_runtime(h)['probe_after']) > sup.clock.now + dt.timedelta(seconds=S.TIER_PROBE_S - 60), 'the failed probe moves the next one out an hour')
+    event(h, 'D')
+    check(sup.run_once() is True and invoked(d)[7:] == [('codex', ASTRA)], f'no second probe inside the hour: {invoked(d)[7:]}')
+    set_table(d, {f'claude-r2d2|{FABLE}': 'credits'})
+    sup.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)
+    event(h, 'E')
+    check(sup.run_once() is True, 'turn E did not run')
+    check(invoked(d)[8:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'back up as soon as L works: {invoked(d)[8:]}')
+    check(engine_file(h) == {'acc': 'claude-l', 'model': FABLE}, f'L persisted: {engine_file(h)}')
+    rt = S.read_engine_runtime(h)
+    check(rt.get('active') and rt.get('effective') == {'acc': 'claude-l', 'model': FABLE} and 'probe_after' not in rt, f'runtime after the move up: {rt}')
+    moved = notices(h, 'fallback moved')
+    check(len(moved) == 1 and moved[0]['text'].endswith(f'now running tier 1/3 claude-l ({FABLE})'), f'moved line: {moved}')
+    check(moved[0].get('id') == f"fallback-{rt['episode_id']}-move-1" and rt.get('moves') == 1, f'move id and counter: {moved[0].get("id")} {rt}')
+    make(h, d)  # a restart after the move reconciles nothing new
+    check(len(notices(h, 'fallback moved')) == 1, 'a restart after the move must not duplicate its line')
+    set_table(d, {})
+    event(h, 'F')
+    check(sup.run_once() is True and invoked(d)[10:] == [('claude-l', FABLE)], f'sticky on L while it works: {invoked(d)[10:]}')
+    # the configured pair serving again (here after the operator's re-selection) ends the episode
+    S.set_engine(h, 'claude-r2d2', FABLE, engines(d))
+    event(h, 'G')
+    check(sup.run_once() is True and invoked(d)[11:] == [('claude-r2d2', FABLE)], f'turn G: {invoked(d)[11:]}')
+    check(not S.read_engine_runtime(h).get('active') and len(notices(h, 'fallback ended')) == 1, 'episode ended once')
+    # and a probe that succeeds on the configured pair restores the engine file by itself
+    h2, d2 = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+    sup2 = make(h2, d2)
+    event(h2, 'A')
+    check(sup2.run_once() is True and engine_file(h2)['acc'] == 'codex', 'h2: Astra')
+    set_table(d2, {})
+    sup2.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)
+    event(h2, 'B')
+    check(sup2.run_once() is True and invoked(d2)[3:] == [('claude-r2d2', FABLE)], f'h2 probe: {invoked(d2)[3:]}')
+    check(engine_file(h2) == {'acc': 'claude-r2d2', 'model': FABLE}, f'h2: the return lands in the engine file: {engine_file(h2)}')
+    rt2 = S.read_engine_runtime(h2)
+    check(not rt2.get('active') and 'probe_after' not in rt2 and len(notices(h2, 'fallback ended')) == 1, f'h2 runtime: {rt2}')
+    check(engine_line(h2).startswith(f'engine: configured claude-r2d2 ({FABLE}) | last turn ran on claude-r2d2 ({FABLE})'), f'h2 line: {engine_line(h2)!r}')
+    no_downgrade(h)
+    no_downgrade(h2)
+
+
+def session_error_on_l_changes_nothing():
+    """Founder acceptance (z): a session error on L never moves the manager; one engine fault line per episode."""
+    h = home(engine={'acc': 'claude-l', 'model': FABLE})
+    rt_path = Path(h, 'engine-runtime.json')
+    rt_path.write_text(json.dumps(STICKY_RUNTIME))
+    d = fakes({f'claude-l|{FABLE}': 'other'})
+    before = Path(h, 'engine').read_bytes(), rt_path.read_bytes()
+    sup = make(h, d)
+    eid = event(h, 'A')
+    check(sup.run_once() is True, 'turn A did not run')
+    check(invoked(d) == [('claude-l', FABLE)], f'only the running engine is called: {invoked(d)}')
+    check((Path(h, 'engine').read_bytes(), rt_path.read_bytes()) == before, 'engine file and runtime must stay byte-identical')
+    check(eid not in S.handled_ids(h) and Path(h, 'logs', 'retry-after').exists(), 'the event waits for the retry')
+    check(not unavailable_lines(h) and not notices(h, 'fallback'), 'no unavailable or fallback line')
+    faults = notices(h, 'engine fault: ')
+    check(len(faults) == 1 and faults[0].get('thread_ts') is None and faults[0].get('channel') == 'C_DEV'
+          and faults[0]['text'] == f'engine fault: tier 1 claude-l ({FABLE}): other: a plain runtime crash', f'fault line: {faults}')
+    fault = json.loads(Path(h, 'logs', 'fault.json').read_text())
+    fault['queued'] = False  # the process died between writing the episode and queueing its line
+    Path(h, 'logs', 'fault.json').write_text(json.dumps(fault))
+    make(h, d)  # the next supervisor's start-up reconcile delivers it exactly once (the outbox id deduplicates)
+    check(len(notices(h, 'engine fault: ')) == 1 and json.loads(Path(h, 'logs', 'fault.json').read_text()).get('queued') is True,
+          'reconcile after a crash must deliver the line once and mark it queued')
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    check(sup.run_once() is True and invoked(d)[1:] == [('claude-l', FABLE)] and len(notices(h, 'engine fault: ')) == 1,
+          'the retry uses the same engine and posts no second line')
+    check('active tier 1/3 claude-l (claude-fable-5-1)' in policy_line(h), f'policy unchanged: {policy_line(h)!r}')
+    set_table(d, {})
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    check(sup.run_once() is True and eid in S.handled_ids(h), 'recovery serves the pending event')
+    check(json.loads(Path(h, 'logs', 'fault.json').read_text()).get('episode_id') is None, 'recovery closes the fault episode')
+    check((Path(h, 'engine').read_bytes(), rt_path.read_bytes()) == before, 'recovery on the same engine changes no state')
+    no_downgrade(h)
+
+
+
+def quota_then_fault_retries_the_unchanged_rotation():
+    """Review B2: r2d2 out of credits, then a fault on l: the walk stops at l, nothing is persisted, the retry (in the
+    same process and after a restart) repeats the unchanged rotation; when l recovers the credits move persists."""
+    h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'other'})
+    before = Path(h, 'engine').read_bytes()
+    sup = make(h, d)
+    eid = event(h, 'A')
+    check(sup.run_once() is True, 'turn A did not run')
+    check(invoked(d) == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'the walk stops at the faulting step: {invoked(d)}')
+    check(Path(h, 'engine').read_bytes() == before and not S.read_engine_runtime(h).get('active'), 'a fault after a quota step persists nothing')
+    faults = notices(h, 'engine fault: ')
+    check(len(faults) == 1 and faults[0]['text'] == f'engine fault: tier 1 claude-l ({FABLE}): other: a plain runtime crash', f'fault line: {faults}')
+    check(not unavailable_lines(h) and not notices(h, 'fallback started'), 'no unavailable or fallback line')
+    check(eid not in S.handled_ids(h), 'the event waits')
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    check(sup.run_once() is True and invoked(d)[2:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'the retry repeats the rotation: {invoked(d)[2:]}')
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    sup2 = make(h, d)
+    check(sup2.run_once() is True and invoked(d)[4:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'after a restart too: {invoked(d)[4:]}')
+    check(len(notices(h, 'engine fault: ')) == 1 and eid not in S.handled_ids(h), 'one fault line per episode; the event still waits')
+    set_table(d, {f'claude-r2d2|{FABLE}': 'credits'})
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    check(sup2.run_once() is True and eid in S.handled_ids(h), 'recovery serves the event')
+    check(engine_file(h) == {'acc': 'claude-l', 'model': FABLE} and S.read_engine_runtime(h).get('active'), 'the credits move persists on the recovering turn')
+    check(len(notices(h, 'fallback started')) == 1, 'the fallback episode starts on the recovering turn')
+    check(json.loads(Path(h, 'logs', 'fault.json').read_text()).get('episode_id') is None, 'the fault episode closes')
+    no_downgrade(h)
+
+
+def stated_reset_time_governs_the_probe():
+    """Review 1.1: several stated resets, past and future -> the earliest future one; past-only -> now + TIER_PROBE_S."""
+    reply = 'REPLY: ok\n---HANDOFF---\ntracks: t\nwaiting on: n\nlast decision: n\nnext action: n\nopen question: n'
+    def iso(t):
+        return t.strftime('%Y-%m-%dT%H:%M:%SZ')
+    def run(resets):
+        h, d = home(), fakes()
+        sup = make(h, d)
+        now = sup.clock.now
+        stated = {name: iso(now + delta) for name, delta in resets.items()}
+        seen = []
+        def invoke(name, spec, message, model, preamble=''):
+            seen.append((name, model))
+            if name == 'codex':
+                return 0, reply, '', {}
+            return 1, '', f'usage limit reached; resets {stated[name]}', {}
+        sup.invoke = invoke
+        event(h, 'A')
+        check(sup.run_once() is True and seen == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)], f'walk: {seen}')
+        return h, sup, seen, now
+    h, sup, seen, now = run({'claude-r2d2': dt.timedelta(minutes=50), 'claude-l': dt.timedelta(minutes=20)})
+    check(S.read_engine_runtime(h).get('probe_after') == iso(now + dt.timedelta(minutes=20)), f'earliest future reset: {S.read_engine_runtime(h)}')
+    sup.clock.now += dt.timedelta(minutes=10)
+    event(h, 'B')
+    check(sup.run_once() is True and seen[3:] == [('codex', ASTRA)], f'no probe before the reset: {seen[3:]}')
+    sup.clock.now += dt.timedelta(minutes=10)
+    event(h, 'C')
+    check(sup.run_once() is True and seen[4:6] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'probe at the reset: {seen[4:]}')
+    h, sup, seen, now = run({'claude-r2d2': dt.timedelta(hours=-1), 'claude-l': dt.timedelta(minutes=20)})
+    check(S.read_engine_runtime(h).get('probe_after') == iso(now + dt.timedelta(minutes=20)), 'a past reset is ignored in favour of the future one')
+    h, sup, seen, now = run({'claude-r2d2': dt.timedelta(hours=-2), 'claude-l': dt.timedelta(hours=-1)})
+    due = S.parse_iso(S.read_engine_runtime(h).get('probe_after')) - now
+    check(HOUR - dt.timedelta(seconds=10) <= due <= HOUR + dt.timedelta(seconds=10), f'past-only resets fall back to one literal hour: {due}')
+    no_downgrade(h)
+
+
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+def _crash_windows(prefix, arrange, durable_check, delivered_text, after_restart, windows=('before-queue', 'after-queue', 'after-receipt'), before_restart=None):
+    """Crash at the durable-state/enqueue boundary of a notice whose outbox id starts with `prefix`: before the
+    enqueue, after it, and after the delivery receipt. `arrange(h, d)` builds the home and returns (sup, eid);
+    `durable_check(h, note_id)` asserts the durable state at the seam; `after_restart(h, d, window, eid)` finishes
+    the scenario; `before_restart(h, d, window)`, when given, changes the world before the restarted supervisor is
+    built (review r3 8.1). Exactly one eventual top-level delivery of the original id in every window."""
+    for window in windows:
+        h, d, poster = home(), fakes(), Poster()
+        sup, eid = arrange(h, d)
+        original = S._queue_notice_once
+        reached = []
+        def crash_queue(home_arg, channel, text, note_id):
+            if not note_id.startswith(prefix) or (prefix == 'fallback-' and '-move-' not in note_id):
+                return original(home_arg, channel, text, note_id)
+            durable_check(h, note_id)
+            reached.append((note_id, text))
+            if window != 'before-queue':
+                original(home_arg, channel, text, note_id)
+            if window == 'after-receipt':
+                S.drain_outbox(h, poster)
+                check(S.post_receipt(h, note_id) is not None, 'delivery must have a durable receipt')
+            raise SimulatedCrash()
+        S._queue_notice_once = crash_queue
+        try:
+            try:
+                sup.run_once()
+            except SimulatedCrash:
+                pass
+        finally:
+            S._queue_notice_once = original
+        check(len(reached) == 1, f'{prefix}{window}: crash seam not reached exactly once: {reached}')
+        note_id, text = reached[0]
+        pending = [it for it in S.read_outbox(h) if it.get('id') == note_id]
+        check(len(pending) == (1 if window == 'after-queue' else 0), f'{prefix}{window}: unexpected outbox state {pending}')
+        retry = Path(h, 'logs/retry-after')
+        if retry.exists():
+            retry.unlink()
+        if before_restart:
+            before_restart(h, d, window)
+        restarted = make(h, d)  # the start-up reconcile finishes a durable, not-yet-queued line
+        after_restart(h, d, restarted, window, eid)
+        S.drain_outbox(h, poster)
+        delivered = [(c, t, x) for c, t, x in poster.posted if delivered_text in x]
+        check(len(delivered) == 1 and delivered[0][0:2] == ('C_DEV', None), f'{prefix}{window}: exactly one eventual delivery: {delivered}')
+        check(S.post_receipt(h, note_id) is not None, f'{prefix}{window}: the original id must be receipted')
+        check(len([it for it in S.read_outbox(h) if it.get('id') == note_id]) <= 1, f'{prefix}{window}: duplicated outbox item')
+        no_downgrade(h)
+
+
+def fault_notice_survives_crash_windows():
+    """Review r2 2.1: the fault line is durable in logs/fault.json before it is queued; a crash at either side of
+    the enqueue, or after the receipt, yields exactly one delivery; recovery before the restart still delivers it."""
+    def arrange(h, d):
+        set_table(d, {f'claude-r2d2|{FABLE}': 'other'})
+        return make(h, d), event(h, 'fault crash')
+    def durable(h, note_id):
+        ep = json.loads(Path(h, 'logs/fault.json').read_text())
+        check(note_id == f"fault-{ep['episode_id']}" and ep.get('text', '').startswith('engine fault: tier 1 claude-r2d2') and ep.get('queued') is False,
+              f'fault episode must be durable and unqueued before the enqueue: {ep}')
+    def before_restart(h, d, window):
+        if window == 'before-queue':
+            set_table(d, {})  # the engines recover BEFORE the restart: the start-up reconcile must still deliver the line
+    def after_restart(h, d, restarted, window, eid):
+        check(restarted.run_once() is True, f'{window}: the restart must retry the pending event')
+        ep = json.loads(Path(h, 'logs/fault.json').read_text())
+        if window == 'before-queue':
+            check(eid in S.handled_ids(h) and ep.get('episode_id') is None, f'{window}: recovery serves the event and closes the episode: {ep}')
+        else:
+            check(eid not in S.handled_ids(h) and ep.get('episode_id'), f'{window}: the fault persists, the event waits: {ep}')
+    _crash_windows('fault-', arrange, durable, 'engine fault: tier 1 claude-r2d2', after_restart, before_restart=before_restart)
+
+
+def move_notice_survives_crash_windows():
+    """Review r2 2.2: the move is durable (moves counter, move_from, pending_notice) before its line is queued; a
+    crash around the enqueue or after the receipt yields exactly one delivery with the original move id."""
+    def arrange(h, d):
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+        sup = make(h, d)
+        event(h, 'to astra')
+        check(sup.run_once() is True and engine_file(h)['acc'] == 'codex', 'arrange: Astra')
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits'})  # L is back; the hourly probe will move up
+        sup.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)
+        return sup, event(h, 'move crash')
+    def durable(h, note_id):
+        rt = S.read_engine_runtime(h)
+        check(note_id == f"fallback-{rt['episode_id']}-move-1" and rt.get('moves') == 1 and rt.get('pending_notice') == 'move'
+              and rt.get('move_from') == {'acc': 'codex', 'model': ASTRA} and rt.get('effective') == {'acc': 'claude-l', 'model': FABLE},
+              f'the move must be durable before the enqueue: {rt}')
+    def after_restart(h, d, restarted, window, eid):
+        rt = S.read_engine_runtime(h)
+        check(rt.get('pending_notice') is None and rt.get('moves') == 1, f'{window}: reconcile must clear the pending move: {rt}')
+        check(engine_file(h) == {'acc': 'claude-l', 'model': FABLE}, f'{window}: the move itself is kept: {engine_file(h)}')
+        event(h, 'after')
+        check(restarted.run_once() is True and invoked(d)[-1] == ('claude-l', FABLE), f'{window}: the next turn runs on L')
+    _crash_windows('fallback-', arrange, durable, 'fallback moved (episode', after_restart)
+
+
+def fault_text_reaches_console_and_self_events():
+    """Review r2 1.1: a founder console event gets the fault text in its reply file; an unroutable self event gets it
+    in logs/self-replies.jsonl; both stay pending for the retry like a Slack event."""
+    h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'other'})
+    sup = make(h, d)
+    S.append_event(h, {'id': 'cli-fault', 'source': 'cli', 'at': time.time(), 'payload': {'text': 'status please', 'instructs': True}})
+    S.append_event(h, {'id': 'self-fault', 'source': 'self', 'at': time.time(), 'payload': {'text': 'continue b', 'instructs': False}})
+    check(sup.run_once() is True, 'the faulting turn must run')
+    text = f'engine fault: tier 1 claude-r2d2 ({FABLE}): other: a plain runtime crash'
+    reply = Path(h, 'inbox', 'replies', 'cli-fault.txt')
+    check(reply.exists() and reply.read_text() == text + '\n', f'console reply file: {reply.read_text() if reply.exists() else None!r}')
+    rows = S.read_jsonl(os.path.join(h, 'logs', 'self-replies.jsonl'))
+    mine = [r for r in rows if isinstance(r, dict) and r.get('id') == 'self-fault']
+    check(len(mine) == 1 and mine[0].get('text') == text, f'self-replies record: {rows}')
+    check(len(notices(h, 'engine fault: ')) == 1, 'one top-level line as well')
+    check('self-fault' not in S.handled_ids(h) and 'cli-fault' not in S.handled_ids(h), 'both events wait for the retry')
+    no_downgrade(h)
+
+
+def probe_due_during_fault_backoff_is_taken_on_the_retry():
+    """Review r2 5.1: on a lower tier, a fault starts the back-off; when probe_after expires meanwhile, the retry
+    (in-process or after a restart) probes the tiers above first."""
+    for restart in (False, True):
+        h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+        sup = make(h, d)
+        event(h, 'A')
+        check(sup.run_once() is True and engine_file(h)['acc'] == 'codex', 'arrange: Astra')
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits', f'codex|{ASTRA}': 'rate_limit'})
+        eid = event(h, 'B')
+        check(sup.run_once() is True and invoked(d)[3:] == [('codex', ASTRA)], f'inside the hour the fault hits Astra alone: {invoked(d)[3:]}')
+        check(len(notices(h, 'engine fault: ')) == 1 and eid not in S.handled_ids(h), 'fault line, event waits')
+        sup.clock.now += dt.timedelta(seconds=S.TIER_PROBE_S)  # the probe becomes due during the back-off
+        os.remove(os.path.join(h, 'logs', 'retry-after'))
+        runner = make(h, d) if restart else sup
+        if restart:
+            runner.clock.now = sup.clock.now
+        set_table(d, {f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})  # Astra works again, Fable still out
+        check(runner.run_once() is True, 'the retry must run')
+        check(invoked(d)[4:] == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)], f'restart={restart}: the retry probes first: {invoked(d)[4:]}')
+        check(eid in S.handled_ids(h) and json.loads(Path(h, 'logs', 'fault.json').read_text()).get('episode_id') is None, 'served, fault episode closed')
+        no_downgrade(h)
+
+
+def missing_or_invalid_probe_after_is_immediately_eligible():
+    """Review r3 5.1: an active lower-tier runtime whose `probe_after` is missing or unparsable (migrated or
+    interrupted state) probes the tiers above on the first turn after a restart, then carries a fresh probe_after
+    one hour out; no indefinite stickiness."""
+    for state in (None, 'not-a-time', ''):
+        h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+        sup = make(h, d)
+        event(h, 'A')
+        check(sup.run_once() is True and engine_file(h)['acc'] == 'codex', f'{state!r}: arrange: Astra')
+        rt = S.read_engine_runtime(h)
+        check(rt.get('active') and rt.get('probe_after'), f'{state!r}: arrange: an active episode with a probe pending: {rt}')
+        if state is None:
+            rt.pop('probe_after', None)
+        else:
+            rt['probe_after'] = state
+        Path(h, 'engine-runtime.json').write_text(json.dumps(rt) + '\n')
+        restarted = make(h, d)
+        event(h, 'B')
+        check(restarted.run_once() is True, f'{state!r}: turn B did not run')
+        check(invoked(d)[3:] == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)],
+              f'{state!r}: the tiers above are eligible at once after the restart: {invoked(d)[3:]}')
+        rt = S.read_engine_runtime(h)
+        due = (S.parse_iso(rt.get('probe_after')) - restarted.clock.now) if rt.get('probe_after') else None
+        check(due is not None and HOUR - dt.timedelta(seconds=10) <= due <= HOUR, f'{state!r}: a fresh probe_after one hour out: {rt}')
+        event(h, 'C')
+        check(restarted.run_once() is True and invoked(d)[6:] == [('codex', ASTRA)], f'{state!r}: no second probe inside the hour: {invoked(d)[6:]}')
+        no_downgrade(h)
+
+
+SCENARIOS = [fault_notice_survives_crash_windows, move_notice_survives_crash_windows, fault_text_reaches_console_and_self_events, probe_due_during_fault_backoff_is_taken_on_the_retry, missing_or_invalid_probe_after_is_immediately_eligible, quota_then_fault_retries_the_unchanged_rotation, stated_reset_time_governs_the_probe, sticky_account_after_r2d2_out, l_out_tries_r2d2_then_both_out_lands_on_astra, hourly_probe_from_astra_returns_to_fable, session_error_on_l_changes_nothing, filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,

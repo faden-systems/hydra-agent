@@ -13,7 +13,7 @@ git merge-base --is-ancestor 421b7bd9c2f4387bf306b1e573e22087b1f69f44 "$BASE" ||
 FROZEN="loops/b12.md loops/b12.exit.sh loops/b12.acceptance.py"
 for f in $FROZEN; do git show "$SPEC:$f" | cmp -s - <(git show "$BASE:$f") || fail "exit-owned file differs between SPEC_REF and BASE_REF: $f"; done
 # Requirement 7: the eleven baseline tests that contradict this spec (file::name), replaced by the candidate's own.
-EXEMPT="tests/manager/test_cli.py::test_engine_acc_model_round_trip_and_rejection tests/manager/test_cli.py::test_attach_uses_the_configured_model tests/manager/test_bridge.py::test_engine_command_acc_and_model tests/manager/test_memory.py::test_parse_engine_command_aliases_legacy_and_full_ids tests/manager/test_memory.py::test_parse_engine_command_rejects_with_a_reason tests/manager/test_memory.py::test_models_json_is_extendable_from_home tests/manager/test_memory.py::test_turn_exports_memory_dir_stamps_header_snapshots_and_ledgers tests/manager/test_memory.py::test_auto_switch_carries_the_model_alias_or_uses_the_family_default tests/manager/test_engine_fallback.py::test_same_account_non_fable_retry_before_next_account tests/manager/test_engine_fallback.py::test_fallback_episode_closes_when_mode_was_ever_explicitly_set tests/manager/test_engines.py::test_all_engines_fail_keeps_events_and_notes_once"
+EXEMPT="tests/manager/test_cli.py::test_engine_acc_model_round_trip_and_rejection tests/manager/test_cli.py::test_attach_uses_the_configured_model tests/manager/test_bridge.py::test_engine_command_acc_and_model tests/manager/test_memory.py::test_parse_engine_command_aliases_legacy_and_full_ids tests/manager/test_memory.py::test_parse_engine_command_rejects_with_a_reason tests/manager/test_memory.py::test_models_json_is_extendable_from_home tests/manager/test_memory.py::test_turn_exports_memory_dir_stamps_header_snapshots_and_ledgers tests/manager/test_memory.py::test_auto_switch_carries_the_model_alias_or_uses_the_family_default tests/manager/test_engine_fallback.py::test_same_account_non_fable_retry_before_next_account tests/manager/test_engine_fallback.py::test_fallback_episode_closes_when_mode_was_ever_explicitly_set tests/manager/test_engines.py::test_all_engines_fail_keeps_events_and_notes_once tests/manager/test_engines.py::test_non_quota_failure_tries_next_without_persisting tests/manager/test_b13_status.py::test_preserve_populated_runtime"
 fence() {
   local changed fixtures bad f
   changed=$( (git diff --no-renames --name-only "$BASE" HEAD; git diff --no-renames --name-only "$BASE"; git diff --no-renames --name-only; git diff --no-renames --cached --name-only; git ls-files --others --exclude-standard) | sort -u)
@@ -71,6 +71,11 @@ assert '["claude-sonnet-5"]' not in src,'the old default same-account retry list
 assert 'all allowed engines failed' in src,'the unavailable line wording is missing (requirement 3)'
 assert 'engine policy:' in src,'the status line is missing (requirement 4)'
 assert "not on the manager's allowlist" in src,'the refusal wording is missing (requirement 2)'
+assert 'EngineFault' in names and 'TIER_PROBE_S' in consts,'EngineFault / TIER_PROBE_S missing (requirements 11-12)'
+assert 'engine fault: ' in src and 'fallback moved (episode ' in src,'fault / moved notice wording missing (requirements 12-13)'
+assert '| effective ' in src,'the configured/effective status line is missing (requirement 14)'
+for m in ('_tier_probe_due','_next_tier_probe','_note_fault','_close_fault_episode','_reconcile_fault_notice'):
+    assert m in methods,f'Supervisor.{m} missing (requirements 11-12)'
 assert 'manager unavailable (every engine failed)' not in src,'the old per-thread unavailable note must go (requirement 3)'
 for f in ('manager/hydra','manager/bridge.py'):
     assert 'engine_policy' in Path(f).read_text(),f'{f} does not enforce the engine policy (requirement 2)'
@@ -148,9 +153,15 @@ for n in sorted(nodes):
     assert n in passed,f'baseline test did not pass unskipped against candidate code: {n}'
 print(f'[b12] baseline suite: {len(nodes)} node ids executed and passed against candidate code')
 import re
-notes=Path('docs/notes/b12.md').read_text()
-m=re.search(r'(\d+) passed',notes)
-assert m and int(m.group(1))>=len(nodes),f'notes pytest count {m.group(1) if m else None} is below the {len(nodes)} baseline node ids the exit executed'
+text=Path('docs/notes/b12.md').read_text()
+evidence='';current=None
+for line in text.splitlines():
+    if line.startswith('## '):
+        current=line[3:].strip();continue
+    if current=='Evidence':
+        evidence+=line+'\n'
+counts=[int(x) for x in re.findall(r'(\d+) passed',evidence)]
+assert counts and max(counts)>=len(nodes),f'Evidence pytest count {counts} is below the {len(nodes)} baseline node ids the exit executed'
 PY
 "$PYTHON" - "$PYTHON" <<'PY'
 import subprocess,sys
