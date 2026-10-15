@@ -19,7 +19,7 @@ def status(home):
  def forbidden(*a,**kw):raise AssertionError('status attempted side effect')
  with ExitStack() as stack:
   stack.enter_context(patch('builtins.open',guarded(real)));stack.enter_context(patch('io.open',guarded(realio)))
-  for name in ['subprocess.Popen','socket.socket','os.remove','os.unlink','os.rename','os.replace','os.mkdir','os.makedirs']:
+  for name in ['subprocess.Popen','socket.socket','os.remove','os.unlink','os.rename','os.replace','os.mkdir','os.makedirs','os.utime','os.chmod']:
    stack.enter_context(patch(name,forbidden))
   stack.enter_context(patch.object(S.time,'time',return_value=1792108800))  # Oct16 UTC; fixtures deterministic
   return S.status_text(home)
@@ -45,13 +45,14 @@ with tempfile.TemporaryDirectory() as d:
   for recorded,offset in zip(REAL_ATTEMPTS,[1,6,50]):
    row=dict(recorded);row['at']=attempt(t+offset,recorded['engine'])['at'];attempts.append(row)
  write(h,turns,attempts)
- before={p:p.read_bytes() for p in h.rglob('*') if p.is_file()}; out=status(str(h))
+ def snapshot():return {p:(p.read_bytes(),p.stat().st_mode,p.stat().st_mtime_ns) for p in h.rglob('*') if p.is_file()}
+ before=snapshot(); out=status(str(h))
  assert line(out,'engine:')=='engine: configured claude-r2d2 (claude-fable-5-1) | last turn ran on codex (gpt-6-astra) | MISMATCH'
  assert line(out,'off configured engine:')=='off configured engine: 12 turns since 2026-10-14 15:00:00 PDT, reason: session_in_use'
  expected='; '.join([f'{a}/claude-fable-5-1 session_in_use: Error: Session ID preserved-session is already in use.' for a in ['claude-r2d2','claude-l']]+['codex/gpt-6-astra ok'])
  assert line(out,'last turn attempts:')=='last turn attempts: '+expected
  assert 'claude-r2d2: session_in_use since 2026-10-14 15:00:01 PDT' in out
- assert before=={p:p.read_bytes() for p in h.rglob('*') if p.is_file()},'status wrote files'
+ assert before==snapshot(),'status wrote or touched files'
  print('PASS real collision sequence and preserved status')
  # In-flight failures do not contaminate last completed turn attempts.
  attempts.append(attempt(start+12*300,'claude-r2d2',reason='new unfinished failure'))

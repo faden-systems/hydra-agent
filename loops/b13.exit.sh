@@ -25,6 +25,11 @@ for node in new.body:
   for default in node.args.defaults+node.args.kw_defaults:
    if default is not None: ast.literal_eval(default)
 assert ast.dump(next(n for n in old.body if isinstance(n,ast.FunctionDef) and n.name=='status_text').args)==ast.dump(next(n for n in new.body if isinstance(n,ast.FunctionDef) and n.name=='status_text').args),'status signature changed'
+olddefs={x.name:ast.dump(x) for x in old.body if isinstance(x,ast.FunctionDef)}
+newdefs={x.name:ast.dump(x) for x in new.body if isinstance(x,ast.FunctionDef)}
+for name,dump in olddefs.items():
+ if name.startswith('_status_') and name!='_status_engine_lines':
+  assert newdefs.get(name)==dump,f'pre-existing status helper changed: {name}'
 def filtered(tree):
  return [ast.dump(x) for x in tree.body if not (isinstance(x,ast.FunctionDef) and (x.name=='status_text' or x.name.startswith('_status_')))]
 assert filtered(old)==filtered(new),'runtime AST changed or executable statement added'
