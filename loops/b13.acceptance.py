@@ -164,7 +164,7 @@ with tempfile.TemporaryDirectory() as d:
    # The populated old idle line is HH:MM only; authorize its precise replacement.
    return text.replace('idle until 15:00 PDT','idle until 2026-10-14 15:00:00 PDT')
   diagnostics=('engine:','last turn attempts:','off configured engine:','accounts:')
-  assert [normalize(x) for x in status(str(h)).splitlines() if not x.startswith(diagnostics)]==[normalize(x) for x in B.status_text(str(h)).splitlines() if not x.startswith(diagnostics)]
+  assert [x for x in status(str(h)).splitlines() if not x.startswith(diagnostics)]==[normalize(x) for x in B.status_text(str(h)).splitlines() if not x.startswith(diagnostics)]
  turns=[dict(n=1,at=t,duration_s=5,engine='claude-r2d2'),dict(n=2,at=t+10,duration_s=5,engine='codex'),dict(n=3,at=t+20,duration_s=5,engine='other-engine'),dict(n=4,at=t+30,duration_s=5,engine='claude-r2d2',kind='compaction')]
  write(h,turns,[]);out=status(str(h));assert '2 turns since on mixed (codex, other-engine)' in out,out
  write(h,turns[1:3],[]);out=status(str(h));assert 'last Claude turn unknown' in out,out
