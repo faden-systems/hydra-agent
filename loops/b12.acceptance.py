@@ -1183,6 +1183,9 @@ def hourly_probe_from_astra_returns_to_fable():
     check(rt.get('active') and rt.get('effective') == {'acc': 'claude-l', 'model': FABLE} and 'probe_after' not in rt, f'runtime after the move up: {rt}')
     moved = notices(h, 'fallback moved')
     check(len(moved) == 1 and moved[0]['text'].endswith(f'now running tier 1/3 claude-l ({FABLE})'), f'moved line: {moved}')
+    check(moved[0].get('id') == f"fallback-{rt['episode_id']}-move-1" and rt.get('moves') == 1, f'move id and counter: {moved[0].get("id")} {rt}')
+    make(h, d)  # a restart after the move reconciles nothing new
+    check(len(notices(h, 'fallback moved')) == 1, 'a restart after the move must not duplicate its line')
     set_table(d, {})
     event(h, 'F')
     check(sup.run_once() is True and invoked(d)[10:] == [('claude-l', FABLE)], f'sticky on L while it works: {invoked(d)[10:]}')
@@ -1225,6 +1228,12 @@ def session_error_on_l_changes_nothing():
     faults = notices(h, 'engine fault: ')
     check(len(faults) == 1 and faults[0].get('thread_ts') is None and faults[0].get('channel') == 'C_DEV'
           and faults[0]['text'] == f'engine fault: tier 1 claude-l ({FABLE}): other: a plain runtime crash', f'fault line: {faults}')
+    fault = json.loads(Path(h, 'logs', 'fault.json').read_text())
+    fault['queued'] = False  # the process died between writing the episode and queueing its line
+    Path(h, 'logs', 'fault.json').write_text(json.dumps(fault))
+    make(h, d)  # the next supervisor's start-up reconcile delivers it exactly once (the outbox id deduplicates)
+    check(len(notices(h, 'engine fault: ')) == 1 and json.loads(Path(h, 'logs', 'fault.json').read_text()).get('queued') is True,
+          'reconcile after a crash must deliver the line once and mark it queued')
     os.remove(os.path.join(h, 'logs', 'retry-after'))
     check(sup.run_once() is True and invoked(d)[1:] == [('claude-l', FABLE)] and len(notices(h, 'engine fault: ')) == 1,
           'the retry uses the same engine and posts no second line')
@@ -1237,7 +1246,73 @@ def session_error_on_l_changes_nothing():
     no_downgrade(h)
 
 
-SCENARIOS = [sticky_account_after_r2d2_out, l_out_tries_r2d2_then_both_out_lands_on_astra, hourly_probe_from_astra_returns_to_fable, session_error_on_l_changes_nothing, filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+
+def quota_then_fault_retries_the_unchanged_rotation():
+    """Review B2: r2d2 out of credits, then a fault on l: the walk stops at l, nothing is persisted, the retry (in the
+    same process and after a restart) repeats the unchanged rotation; when l recovers the credits move persists."""
+    h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'other'})
+    before = Path(h, 'engine').read_bytes()
+    sup = make(h, d)
+    eid = event(h, 'A')
+    check(sup.run_once() is True, 'turn A did not run')
+    check(invoked(d) == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'the walk stops at the faulting step: {invoked(d)}')
+    check(Path(h, 'engine').read_bytes() == before and not S.read_engine_runtime(h).get('active'), 'a fault after a quota step persists nothing')
+    faults = notices(h, 'engine fault: ')
+    check(len(faults) == 1 and faults[0]['text'] == f'engine fault: tier 1 claude-l ({FABLE}): other: a plain runtime crash', f'fault line: {faults}')
+    check(not unavailable_lines(h) and not notices(h, 'fallback started'), 'no unavailable or fallback line')
+    check(eid not in S.handled_ids(h), 'the event waits')
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    check(sup.run_once() is True and invoked(d)[2:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'the retry repeats the rotation: {invoked(d)[2:]}')
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    sup2 = make(h, d)
+    check(sup2.run_once() is True and invoked(d)[4:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'after a restart too: {invoked(d)[4:]}')
+    check(len(notices(h, 'engine fault: ')) == 1 and eid not in S.handled_ids(h), 'one fault line per episode; the event still waits')
+    set_table(d, {f'claude-r2d2|{FABLE}': 'credits'})
+    os.remove(os.path.join(h, 'logs', 'retry-after'))
+    check(sup2.run_once() is True and eid in S.handled_ids(h), 'recovery serves the event')
+    check(engine_file(h) == {'acc': 'claude-l', 'model': FABLE} and S.read_engine_runtime(h).get('active'), 'the credits move persists on the recovering turn')
+    check(len(notices(h, 'fallback started')) == 1, 'the fallback episode starts on the recovering turn')
+    check(json.loads(Path(h, 'logs', 'fault.json').read_text()).get('episode_id') is None, 'the fault episode closes')
+    no_downgrade(h)
+
+
+def stated_reset_time_governs_the_probe():
+    """Review 1.1: several stated resets, past and future -> the earliest future one; past-only -> now + TIER_PROBE_S."""
+    reply = 'REPLY: ok\n---HANDOFF---\ntracks: t\nwaiting on: n\nlast decision: n\nnext action: n\nopen question: n'
+    def iso(t):
+        return t.strftime('%Y-%m-%dT%H:%M:%SZ')
+    def run(resets):
+        h, d = home(), fakes()
+        sup = make(h, d)
+        now = sup.clock.now
+        stated = {name: iso(now + delta) for name, delta in resets.items()}
+        seen = []
+        def invoke(name, spec, message, model, preamble=''):
+            seen.append((name, model))
+            if name == 'codex':
+                return 0, reply, '', {}
+            return 1, '', f'usage limit reached; resets {stated[name]}', {}
+        sup.invoke = invoke
+        event(h, 'A')
+        check(sup.run_once() is True and seen == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)], f'walk: {seen}')
+        return h, sup, seen, now
+    h, sup, seen, now = run({'claude-r2d2': dt.timedelta(minutes=50), 'claude-l': dt.timedelta(minutes=20)})
+    check(S.read_engine_runtime(h).get('probe_after') == iso(now + dt.timedelta(minutes=20)), f'earliest future reset: {S.read_engine_runtime(h)}')
+    sup.clock.now += dt.timedelta(minutes=10)
+    event(h, 'B')
+    check(sup.run_once() is True and seen[3:] == [('codex', ASTRA)], f'no probe before the reset: {seen[3:]}')
+    sup.clock.now += dt.timedelta(minutes=10)
+    event(h, 'C')
+    check(sup.run_once() is True and seen[4:6] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'probe at the reset: {seen[4:]}')
+    h, sup, seen, now = run({'claude-r2d2': dt.timedelta(hours=-1), 'claude-l': dt.timedelta(minutes=20)})
+    check(S.read_engine_runtime(h).get('probe_after') == iso(now + dt.timedelta(minutes=20)), 'a past reset is ignored in favour of the future one')
+    h, sup, seen, now = run({'claude-r2d2': dt.timedelta(hours=-2), 'claude-l': dt.timedelta(hours=-1)})
+    due = S.parse_iso(S.read_engine_runtime(h).get('probe_after')) - now
+    check(dt.timedelta(seconds=S.TIER_PROBE_S - 10) <= due <= dt.timedelta(seconds=S.TIER_PROBE_S + 10), f'past-only resets fall back to one hour: {due}')
+    no_downgrade(h)
+
+
+SCENARIOS = [quota_then_fault_retries_the_unchanged_rotation, stated_reset_time_governs_the_probe, sticky_account_after_r2d2_out, l_out_tries_r2d2_then_both_out_lands_on_astra, hourly_probe_from_astra_returns_to_fable, session_error_on_l_changes_nothing, filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,

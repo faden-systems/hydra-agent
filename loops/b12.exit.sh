@@ -153,9 +153,15 @@ for n in sorted(nodes):
     assert n in passed,f'baseline test did not pass unskipped against candidate code: {n}'
 print(f'[b12] baseline suite: {len(nodes)} node ids executed and passed against candidate code')
 import re
-notes=Path('docs/notes/b12.md').read_text()
-m=re.search(r'(\d+) passed',notes)
-assert m and int(m.group(1))>=len(nodes),f'notes pytest count {m.group(1) if m else None} is below the {len(nodes)} baseline node ids the exit executed'
+text=Path('docs/notes/b12.md').read_text()
+evidence='';current=None
+for line in text.splitlines():
+    if line.startswith('## '):
+        current=line[3:].strip();continue
+    if current=='Evidence':
+        evidence+=line+'\n'
+counts=[int(x) for x in re.findall(r'(\d+) passed',evidence)]
+assert counts and max(counts)>=len(nodes),f'Evidence pytest count {counts} is below the {len(nodes)} baseline node ids the exit executed'
 PY
 "$PYTHON" - "$PYTHON" <<'PY'
 import subprocess,sys
