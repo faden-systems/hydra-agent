@@ -3015,10 +3015,8 @@ class Supervisor:
             if conf_tier is not None and tier_now is not None and tier_now > conf_tier:
                 eff_tier = tier_now
                 if not self._tier_probe_due(runtime):
-                    # inside the hour the turn starts at the effective pair and walks toward the floor; the tiers
-                    # above come last, reached only when every step at or below the effective tier failed (so a
-                    # dead floor never posts "all allowed engines failed" while a higher tier was merely on hold)
-                    order = self._ladder_rotation(pair, ladder_steps(ladder, self.engines))
+                    # Founder rule 3: even exhaustion below does not authorize an early higher-tier probe.
+                    order = self._ladder_rotation(pair, [s for s in ladder_steps(ladder, self.engines) if s[0] >= eff_tier])
         # requirement 11, loops/b8.md: the account that served (the engine file) runs without a verified sidecar;
         # during an episode the operator's configured account was selected too. Only switching TO any other
         # credential requires it to be verified first.

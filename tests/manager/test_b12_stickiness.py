@@ -258,19 +258,20 @@ def test_preserve_populated_runtime_with_policy_line(tmp_path, monkeypatch, acti
 # ---- review of build PR #77 (manager, 2026-10-15): six fixes, each with its regression
 
 
-def test_probe_hold_reaches_the_tiers_above_only_after_everything_below_failed(home, tmp_path):
-    """#77 F3: inside the hour the turn starts at the effective pair and walks toward the floor; when every step at
-    or below the effective tier fails, the tiers above are tried before 'all allowed engines failed' is posted."""
+def test_probe_hold_survives_exhaustion_of_every_lower_step(home, tmp_path):
+    """Founder rule 3 still forbids early Fable probes when the effective tier is exhausted."""
     fk, sup = setup(home, tmp_path, table={f"claude-r2d2|{FABLE}": "credits", f"claude-l|{FABLE}": "credits", f"codex|{ASTRA}": "usage_limit"})
     queue_event(home, "A")
-    assert sup.run_once() is True and json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-r2d2", "model": OPUS}
-    # the floor dies inside the hour while tier 1 has recovered: the walk reaches it last and moves up
-    fk.table({f"claude-r2d2|{OPUS}": "credits", f"claude-l|{OPUS}": "credits", f"codex|{ASTRA}": "usage_limit"})
-    queue_event(home, "B")
     assert sup.run_once() is True
-    assert fk.invoked()[4:] == [("claude-r2d2", OPUS), ("claude-l", OPUS), ("claude-r2d2", FABLE)], fk.invoked()[4:]
-    assert not runtime(home).get("active") and len(outbox(home, "fallback ended")) == 1
-    assert not outbox(home, "all allowed engines failed")
+    before = runtime(home)
+    count = len(fk.invoked())
+    fk.table({f"claude-r2d2|{OPUS}": "credits", f"claude-l|{OPUS}": "credits"})
+    eid = queue_event(home, "B")
+    assert sup.run_once() is True
+    assert fk.invoked()[count:] == [("claude-r2d2", OPUS), ("claude-l", OPUS)]
+    assert eid not in S.handled_ids(home)
+    assert runtime(home)["probe_after"] == before["probe_after"]
+    assert runtime(home)["effective"] == before["effective"]
     no_downgrade(home)
 
 
