@@ -17,12 +17,16 @@ def status(home):
    return fn(file,mode,*args,**kwargs)
   return call
  def forbidden(*a,**kw):raise AssertionError('status attempted side effect')
+ def tree():return sorted((str(p.relative_to(home)),p.read_bytes() if p.is_file() else None,p.lstat().st_mode,p.lstat().st_mtime_ns) for p in Path(home).rglob('*'))
+ before=tree() if Path(home).exists() else None
  with ExitStack() as stack:
   stack.enter_context(patch('builtins.open',guarded(real)));stack.enter_context(patch('io.open',guarded(realio)))
-  for name in ['subprocess.Popen','socket.socket','os.remove','os.unlink','os.rename','os.replace','os.mkdir','os.makedirs']:
+  for name in ['subprocess.Popen','socket.socket','os.remove','os.unlink','os.rename','os.replace','os.mkdir','os.makedirs','os.utime','os.chmod']:
    stack.enter_context(patch(name,forbidden))
   stack.enter_context(patch.object(S.time,'time',return_value=1792108800))  # Oct16 UTC; fixtures deterministic
-  return S.status_text(home)
+  out=S.status_text(home)
+  assert (tree() if Path(home).exists() else None)==before,'status wrote, touched or created files'
+  return out
 def write(home,turns,attempts):
  (home/'logs').mkdir(exist_ok=True)
  (home/'engine').write_text(json.dumps({'acc':'claude-r2d2','model':'claude-fable-5-1'}))
@@ -45,13 +49,14 @@ with tempfile.TemporaryDirectory() as d:
   for recorded,offset in zip(REAL_ATTEMPTS,[1,6,50]):
    row=dict(recorded);row['at']=attempt(t+offset,recorded['engine'])['at'];attempts.append(row)
  write(h,turns,attempts)
- before={p:p.read_bytes() for p in h.rglob('*') if p.is_file()}; out=status(str(h))
+ def snapshot():return {p:(p.read_bytes(),p.stat().st_mode,p.stat().st_mtime_ns) for p in h.rglob('*') if p.is_file()}
+ before=snapshot(); out=status(str(h))
  assert line(out,'engine:')=='engine: configured claude-r2d2 (claude-fable-5-1) | last turn ran on codex (gpt-6-astra) | MISMATCH'
  assert line(out,'off configured engine:')=='off configured engine: 12 turns since 2026-10-14 15:00:00 PDT, reason: session_in_use'
  expected='; '.join([f'{a}/claude-fable-5-1 session_in_use: Error: Session ID preserved-session is already in use.' for a in ['claude-r2d2','claude-l']]+['codex/gpt-6-astra ok'])
  assert line(out,'last turn attempts:')=='last turn attempts: '+expected
  assert 'claude-r2d2: session_in_use since 2026-10-14 15:00:01 PDT' in out
- assert before=={p:p.read_bytes() for p in h.rglob('*') if p.is_file()},'status wrote files'
+ assert before==snapshot(),'status wrote or touched files'
  print('PASS real collision sequence and preserved status')
  # In-flight failures do not contaminate last completed turn attempts.
  attempts.append(attempt(start+12*300,'claude-r2d2',reason='new unfinished failure'))
@@ -76,6 +81,8 @@ with tempfile.TemporaryDirectory() as d:
  assert line(out,'last turn attempts:')=='last turn attempts: claude-r2d2/claude-fable-5-1 auth: '+('é'*80)+'; claude-r2d2/claude-fable-5-1 rate_limit: slow; codex/gpt-6-astra ok; codex/gpt-6-astra ok'
  assert line(out,'off configured engine:').endswith('reason: auth')
  attempts.insert(2,attempt(t+3,'claude-r2d2',classification='rate_limit',reason='slow'))
+ write(h,turns,attempts);assert line(status(str(h)),'off configured engine:').endswith('reason: rate_limit')
+ attempts+=[attempt(t+4+i,'claude-l',classification='auth',reason='auth') for i in range(3)]  # another account's majority never drives the reason
  write(h,turns,attempts);assert line(status(str(h)),'off configured engine:').endswith('reason: rate_limit')
  # Missing model/runner is a boundary, not a skipped row; compaction is excluded.
  turns=[dict(at=t,duration_s=20,engine='codex',model='gpt-6-astra'),dict(at=t+30,duration_s=2),dict(at=t+40,duration_s=10,engine='codex',model='gpt-6-astra'),dict(at=t+60,duration_s=1,engine='claude-r2d2',kind='compaction')]
@@ -112,14 +119,26 @@ with tempfile.TemporaryDirectory() as d:
  assert 'claude-l: session_in_use since 2026-10-14 10:54:26 PDT' in accounts,accounts
  assert 'before: usage_limit at 2026-10-11 11:56:23 PDT' in accounts,accounts
  assert 'usage: limit at 2026-10-11 11:56:23 PDT' in account(out,'claude-l'),accounts
- assert account(out,'claude-r2d2').endswith('usage: ok'),accounts
+ assert account(out,'claude-r2d2').endswith('usage: unknown (no successful call since 2026-10-14 10:01:51 PDT)'),accounts
  assert 'claude-r2d2: session_in_use since 2026-10-14 10:54:25 PDT' in accounts,accounts
  assert 'before: timeout at 2026-10-14 10:49:23 PDT' in accounts,accounts
  assert 'last ok 2026-10-14 10:01:51 PDT' in accounts,accounts
- # API not reached: all failures pre-API; a previous limit before success is cleared.
+ # Founder usage rule (1792093638.592389): ok only on a latest success; a limit row after last ok is retained; otherwise unknown.
+ REAL_LIMIT={'at': '2026-10-15T19:49:49Z', 'engine': 'claude-r2d2', 'model': 'claude-fable-5-1', 'rc': 1, 'classification': 'credits', 'reason': "You're out of usage credits. Switch to another model to continue.", 'success': False}
+ REAL_L_OK={'at': '2026-10-15T19:52:43Z', 'engine': 'claude-l', 'model': 'claude-fable-5-1', 'rc': 0, 'classification': None, 'reason': '', 'success': True}
+ rs=REAL_HISTORY+[REAL_LIMIT,dict(REAL_HISTORY[-1],at='2026-10-15T20:05:00Z'),REAL_L_OK]
+ write(h,[],rs);out=status(str(h))
+ assert account(out,'claude-r2d2')=='claude-r2d2: session_in_use since 2026-10-15 13:05:00 PDT; last ok 2026-10-14 10:01:51 PDT; before: usage_limit at 2026-10-15 12:49:49 PDT; usage: limit at 2026-10-15 12:49:49 PDT',out
+ assert account(out,'claude-l')=='claude-l: ok; last ok 2026-10-15 12:52:43 PDT; usage: ok',out
  rs=[a for a in REAL_HISTORY if a['engine']=='claude-r2d2' and 'timeout' not in a['reason']]
  write(h,[],rs);out=status(str(h))
- assert 'usage: unknown (API not reached since 2026-10-14 10:01:51 PDT)' in account(out,'claude-r2d2'),out
+ assert 'usage: unknown (no successful call since 2026-10-14 10:01:51 PDT)' in account(out,'claude-r2d2'),out
+ rs=[a for a in REAL_HISTORY if a['engine']=='claude-r2d2' and ('timeout' in a['reason'] or a['success'])]
+ write(h,[],rs);out=status(str(h))
+ assert account(out,'claude-r2d2')=='claude-r2d2: timeout since 2026-10-14 10:49:23 PDT; last ok 2026-10-14 10:01:51 PDT; usage: unknown (no successful call since 2026-10-14 10:01:51 PDT)',out
+ write(h,[],[REAL_HISTORY[-1]]);out=status(str(h))
+ assert account(out,'claude-r2d2')=='claude-r2d2: session_in_use since 2026-10-14 11:07:38 PDT; last ok unknown; usage: unknown (no successful call recorded)',out
+ assert 'API not reached' not in out
  rs.append(attempt(1792100000,'claude-r2d2',True));write(h,[],rs);out=status(str(h))
  assert account(out,'claude-r2d2').endswith('usage: ok')
  # Winter date is a separate fixture; generated times must all be Pacific.
@@ -164,7 +183,11 @@ with tempfile.TemporaryDirectory() as d:
    # The populated old idle line is HH:MM only; authorize its precise replacement.
    return text.replace('idle until 15:00 PDT','idle until 2026-10-14 15:00:00 PDT')
   diagnostics=('engine:','last turn attempts:','off configured engine:','accounts:')
-  assert [x for x in status(str(h)).splitlines() if not x.startswith(diagnostics)]==[normalize(x) for x in B.status_text(str(h)).splitlines() if not x.startswith(diagnostics)]
+  def compare():assert [x for x in status(str(h)).splitlines() if not x.startswith(diagnostics)]==[normalize(x) for x in B.status_text(str(h)).splitlines() if not x.startswith(diagnostics)],'preserved lines differ from BASE_REF'
+  compare()  # idle
+  (h/'work-status.json').write_text(json.dumps(dict(mode='waiting',who='fixture',since=t)));compare()  # waiting
+  (h/'engine').write_text(json.dumps(dict(acc='claude-r2d2',model='claude-fable-5-1',mode='persistent')));compare()  # persistent
+  (h/'work-status.json').write_text(json.dumps(dict(mode='idle',deadline=t)));(h/'engine').write_text(json.dumps({'acc':'claude-r2d2','model':'claude-fable-5-1'}))
  turns=[dict(n=1,at=t,duration_s=5,engine='claude-r2d2'),dict(n=2,at=t+10,duration_s=5,engine='codex'),dict(n=3,at=t+20,duration_s=5,engine='other-engine'),dict(n=4,at=t+30,duration_s=5,engine='claude-r2d2',kind='compaction')]
  write(h,turns,[]);out=status(str(h));assert '2 turns since on mixed (codex, other-engine)' in out,out
  write(h,turns[1:3],[]);out=status(str(h));assert 'last Claude turn unknown' in out,out
@@ -176,6 +199,6 @@ with tempfile.TemporaryDirectory() as d:
  rs.append(attempt(t+2,'claude-l',True));write(h,[],rs)
  assert account(status(str(h)),'claude-l')=='claude-l: ok; last ok 2026-10-14 15:00:02 PDT; usage: ok'
  rs.append(attempt(t+3,'claude-l'));write(h,[],rs)
- assert account(status(str(h)),'claude-l')=='claude-l: session_in_use since 2026-10-14 15:00:03 PDT; last ok 2026-10-14 15:00:02 PDT; usage: unknown (API not reached since 2026-10-14 15:00:02 PDT)'
+ assert account(status(str(h)),'claude-l')=='claude-l: session_in_use since 2026-10-14 15:00:03 PDT; last ok 2026-10-14 15:00:02 PDT; usage: unknown (no successful call since 2026-10-14 15:00:02 PDT)'
  assert account(status(str(h)),'codex')=='codex: unknown; last ok unknown; usage: unknown'
 print('[b13.acceptance] PASS')
