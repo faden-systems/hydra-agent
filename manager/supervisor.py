@@ -1583,13 +1583,19 @@ def _status_engine_lines(home, pair):
         if failures and first:
             earlier = failures[first-1]
             text += f'; before: {_status_classification(earlier)} at {_status_pdt(earlier["at"])}'
+        # Usage rule (loops/b13.md, founder amendment 2026-10-15): ok only when the latest attempt succeeded; a
+        # recorded limit after the last success is retained; any other failure proves nothing about quota.
         limits = [a for a in failures if _status_classification(a) == 'usage_limit']
-        if limits:
+        if not rows:
+            usage = 'unknown'
+        elif not failures:
+            usage = 'ok'
+        elif limits:
             usage = 'limit at ' + _status_pdt(limits[-1]['at'])
-        elif failures and all(_status_classification(a) in ('session_in_use', 'startup', 'supervisor_died') for a in failures):
-            usage = f'unknown (API not reached since {last_ok})'
+        elif ok >= 0:
+            usage = f'unknown (no successful call since {last_ok})'
         else:
-            usage = 'ok' if rows else 'unknown'
+            usage = 'unknown (no successful call recorded)'
         accounts.append(text + '; usage: ' + usage)
     lines.append('accounts: ' + '; '.join(accounts))
     return lines
