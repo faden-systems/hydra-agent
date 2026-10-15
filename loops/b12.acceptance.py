@@ -21,6 +21,9 @@ import bridge as B  # noqa: E402
 HYDRA = str(ROOT / 'manager' / 'hydra')
 FABLE, ASTRA, OPUS = 'claude-fable-5-1', 'gpt-6-astra', 'claude-opus-5-5'
 LADDER_MODELS = {FABLE, ASTRA, OPUS}
+LADDER_PAIRS = {('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA), ('claude-r2d2', OPUS), ('claude-l', OPUS)}
+HOUR = dt.timedelta(seconds=3600)  # review r3 2.1: the hourly re-probe is measured against this literal, not the candidate's constant
+HOME_FAKES = {}  # home -> its recording fakes dir (filled by make), for the process-start side of no_downgrade
 BELOW = ('claude-sonnet-5', 'claude-haiku-4-5-20251001', 'claude-opus-5', 'gpt-5.6-sol', 'gpt-6.1-sol')
 
 
@@ -176,6 +179,7 @@ class Clock:
 
 
 def make(h, d, poster=None, blog=None):
+    HOME_FAKES[h] = d
     return S.Supervisor(home=h, engines=engines(d), poster=poster or Poster(), buildlog_poster=blog or Poster(),
                         clock=Clock(dt.datetime(2026, 10, 11, 19, 0, 0, tzinfo=dt.timezone.utc)))
 
@@ -205,11 +209,18 @@ def policy_line(h):
     return lines[0]
 
 
-def no_downgrade(h, allowed=LADDER_MODELS):
-    bad = [a for a in attempts(h) if a.get('model') not in allowed]
-    check(not bad, f'attempts.jsonl carries a model outside the ladder: {bad}')
+def no_downgrade(h, pairs=LADDER_PAIRS):
+    """Review r3 2.2: every attempt record and every recorded engine process start names an (account, model) pair of
+    the ladder in force; a model set alone would let an approved model run on an excluded account."""
+    bad = [a for a in attempts(h) if (a.get('engine'), a.get('model')) not in pairs]
+    check(not bad, f'attempts.jsonl carries an (account, model) pair outside the ladder: {bad}')
     for a in attempts(h):
         check(a.get('model') not in BELOW, f'a model below the floor was invoked: {a}')
+    d = HOME_FAKES.get(h)
+    if d is not None:
+        started = [(c.get('acc'), c.get('model')) for c in calls(d)]
+        bad = [p for p in started if p not in pairs]
+        check(not bad, f'an engine process was started outside the ladder pairs: {bad}')
 
 
 def unavailable_lines(h):
@@ -493,6 +504,12 @@ def commands_refuse_outside_the_allowlist():
           f'a coder alias is refused in Slack: {poster.posted[-1][2]!r}')
     check(Path(h, 'engine').read_bytes() == before and runtime_path.read_bytes() == runtime_before,
           'both files must remain byte-identical after the refused coder alias in Slack')
+    for ts, text, model in (('20.11', '<@U_MANAGER> engine model=opus5', 'claude-opus-5'),
+                            ('20.12', '<@U_MANAGER> engine acc=codex model=gpt-5.6-sol', 'gpt-5.6-sol')):
+        slack(br, text, ts)  # review r3 1.1: the whole refusal matrix in Slack, not only on the console
+        check(poster.posted[-1][2] == refusal(model, f'claude-l ({FABLE}) [persistent]'), f'Slack refusal of {model}: {poster.posted[-1][2]!r}')
+        check(Path(h, 'engine').read_bytes() == before and runtime_path.read_bytes() == runtime_before,
+              f'both files must remain byte-identical after the refused Slack command {text!r}')
     slack(br, '<@U_MANAGER> engine model=sonnet5', '20.15')
     reply = poster.posted[-1][2]
     check('unknown model' in reply and 'sonnet5 ->' not in reply and 'fable5.1' in reply
@@ -714,7 +731,7 @@ def configured_ladder_controls_execution_and_commands():
     check(invoked(d) == expected, f'override order/account membership ignored: {invoked(d)}')
     check([(a['engine'], a['model']) for a in attempts(h)] == expected,
           f'custom ladder attempt records disagree: {attempts(h)}')
-    no_downgrade(h, {ASTRA, OPUS})
+    no_downgrade(h, {('codex', ASTRA), ('claude-l', OPUS)})
     # Same approved model, excluded account; also an approved model excluded entirely.
     for acc, model in [('claude-r2d2', OPUS), ('claude-l', FABLE)]:
         before = Path(h, 'engine').read_bytes()
@@ -862,7 +879,7 @@ def unavailable_reason_contract():
               'reason notice must be top level')
         # Encoding must round-trip: limits count code points, never slices of UTF-8 bytes.
         check(lines[0]['text'].encode('utf-8').decode('utf-8') == wanted, 'broken Unicode boundary')
-        no_downgrade(h)
+        no_downgrade(h, {(name, ASTRA) for name in custom} if custom else LADDER_PAIRS)
 
     error = '界🙂é' * 45 + 'UNTRUNCATED_SENTINEL'
     # a rate limit on tier 3 ends the walk there: three usage steps before it, the fault line names only that step
@@ -1149,8 +1166,9 @@ def l_out_tries_r2d2_then_both_out_lands_on_astra():
     check(len(moved) == 1 and moved[0].get('thread_ts') is None and f'tier 1/3 claude-l ({FABLE}) unavailable' in moved[0]['text']
           and moved[0]['text'].endswith(f'now running tier 2/3 codex ({ASTRA})'), f'moved line: {moved}')
     rt = S.read_engine_runtime(h)
+    check(S.TIER_PROBE_S == 3600, f'TIER_PROBE_S must be 3600 s (founder rule 3): {S.TIER_PROBE_S!r}')
     due = S.parse_iso(rt.get('probe_after')) - sup.clock.now
-    check(dt.timedelta(seconds=S.TIER_PROBE_S - 10) <= due <= dt.timedelta(seconds=S.TIER_PROBE_S), f'probe an hour out: {rt}')
+    check(HOUR - dt.timedelta(seconds=10) <= due <= HOUR, f'probe an hour out (literal 3600 s): {rt}')
     check(rt.get('configured') == {'acc': 'claude-r2d2', 'model': FABLE}, 'the operator pair is never rewritten')
     check(engine_line(h).startswith(f'engine: configured claude-r2d2 ({FABLE}) | effective codex ({ASTRA}) | last turn ran on codex ({ASTRA})'),
           f'first status line: {engine_line(h)!r}')
@@ -1308,7 +1326,7 @@ def stated_reset_time_governs_the_probe():
     check(S.read_engine_runtime(h).get('probe_after') == iso(now + dt.timedelta(minutes=20)), 'a past reset is ignored in favour of the future one')
     h, sup, seen, now = run({'claude-r2d2': dt.timedelta(hours=-2), 'claude-l': dt.timedelta(hours=-1)})
     due = S.parse_iso(S.read_engine_runtime(h).get('probe_after')) - now
-    check(dt.timedelta(seconds=S.TIER_PROBE_S - 10) <= due <= dt.timedelta(seconds=S.TIER_PROBE_S + 10), f'past-only resets fall back to one hour: {due}')
+    check(HOUR - dt.timedelta(seconds=10) <= due <= HOUR + dt.timedelta(seconds=10), f'past-only resets fall back to one literal hour: {due}')
     no_downgrade(h)
 
 
@@ -1317,11 +1335,12 @@ class SimulatedCrash(BaseException):
     pass
 
 
-def _crash_windows(prefix, arrange, durable_check, delivered_text, after_restart, windows=('before-queue', 'after-queue', 'after-receipt')):
+def _crash_windows(prefix, arrange, durable_check, delivered_text, after_restart, windows=('before-queue', 'after-queue', 'after-receipt'), before_restart=None):
     """Crash at the durable-state/enqueue boundary of a notice whose outbox id starts with `prefix`: before the
     enqueue, after it, and after the delivery receipt. `arrange(h, d)` builds the home and returns (sup, eid);
     `durable_check(h, note_id)` asserts the durable state at the seam; `after_restart(h, d, window, eid)` finishes
-    the scenario. Exactly one eventual top-level delivery of the original id in every window."""
+    the scenario; `before_restart(h, d, window)`, when given, changes the world before the restarted supervisor is
+    built (review r3 8.1). Exactly one eventual top-level delivery of the original id in every window."""
     for window in windows:
         h, d, poster = home(), fakes(), Poster()
         sup, eid = arrange(h, d)
@@ -1353,6 +1372,8 @@ def _crash_windows(prefix, arrange, durable_check, delivered_text, after_restart
         retry = Path(h, 'logs/retry-after')
         if retry.exists():
             retry.unlink()
+        if before_restart:
+            before_restart(h, d, window)
         restarted = make(h, d)  # the start-up reconcile finishes a durable, not-yet-queued line
         after_restart(h, d, restarted, window, eid)
         S.drain_outbox(h, poster)
@@ -1373,16 +1394,17 @@ def fault_notice_survives_crash_windows():
         ep = json.loads(Path(h, 'logs/fault.json').read_text())
         check(note_id == f"fault-{ep['episode_id']}" and ep.get('text', '').startswith('engine fault: tier 1 claude-r2d2') and ep.get('queued') is False,
               f'fault episode must be durable and unqueued before the enqueue: {ep}')
-    def after_restart(h, d, restarted, window, eid):
+    def before_restart(h, d, window):
         if window == 'before-queue':
-            set_table(d, {})  # recovery before the restart must not erase the durable, not-yet-queued line
+            set_table(d, {})  # the engines recover BEFORE the restart: the start-up reconcile must still deliver the line
+    def after_restart(h, d, restarted, window, eid):
         check(restarted.run_once() is True, f'{window}: the restart must retry the pending event')
         ep = json.loads(Path(h, 'logs/fault.json').read_text())
         if window == 'before-queue':
             check(eid in S.handled_ids(h) and ep.get('episode_id') is None, f'{window}: recovery serves the event and closes the episode: {ep}')
         else:
             check(eid not in S.handled_ids(h) and ep.get('episode_id'), f'{window}: the fault persists, the event waits: {ep}')
-    _crash_windows('fault-', arrange, durable, 'engine fault: tier 1 claude-r2d2', after_restart)
+    _crash_windows('fault-', arrange, durable, 'engine fault: tier 1 claude-r2d2', after_restart, before_restart=before_restart)
 
 
 def move_notice_survives_crash_windows():
@@ -1453,7 +1475,36 @@ def probe_due_during_fault_backoff_is_taken_on_the_retry():
         no_downgrade(h)
 
 
-SCENARIOS = [fault_notice_survives_crash_windows, move_notice_survives_crash_windows, fault_text_reaches_console_and_self_events, probe_due_during_fault_backoff_is_taken_on_the_retry, quota_then_fault_retries_the_unchanged_rotation, stated_reset_time_governs_the_probe, sticky_account_after_r2d2_out, l_out_tries_r2d2_then_both_out_lands_on_astra, hourly_probe_from_astra_returns_to_fable, session_error_on_l_changes_nothing, filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
+def missing_or_invalid_probe_after_is_immediately_eligible():
+    """Review r3 5.1: an active lower-tier runtime whose `probe_after` is missing or unparsable (migrated or
+    interrupted state) probes the tiers above on the first turn after a restart, then carries a fresh probe_after
+    one hour out; no indefinite stickiness."""
+    for state in (None, 'not-a-time', ''):
+        h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'credits'})
+        sup = make(h, d)
+        event(h, 'A')
+        check(sup.run_once() is True and engine_file(h)['acc'] == 'codex', f'{state!r}: arrange: Astra')
+        rt = S.read_engine_runtime(h)
+        check(rt.get('active') and rt.get('probe_after'), f'{state!r}: arrange: an active episode with a probe pending: {rt}')
+        if state is None:
+            rt.pop('probe_after', None)
+        else:
+            rt['probe_after'] = state
+        Path(h, 'engine-runtime.json').write_text(json.dumps(rt) + '\n')
+        restarted = make(h, d)
+        event(h, 'B')
+        check(restarted.run_once() is True, f'{state!r}: turn B did not run')
+        check(invoked(d)[3:] == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)],
+              f'{state!r}: the tiers above are eligible at once after the restart: {invoked(d)[3:]}')
+        rt = S.read_engine_runtime(h)
+        due = (S.parse_iso(rt.get('probe_after')) - restarted.clock.now) if rt.get('probe_after') else None
+        check(due is not None and HOUR - dt.timedelta(seconds=10) <= due <= HOUR, f'{state!r}: a fresh probe_after one hour out: {rt}')
+        event(h, 'C')
+        check(restarted.run_once() is True and invoked(d)[6:] == [('codex', ASTRA)], f'{state!r}: no second probe inside the hour: {invoked(d)[6:]}')
+        no_downgrade(h)
+
+
+SCENARIOS = [fault_notice_survives_crash_windows, move_notice_survives_crash_windows, fault_text_reaches_console_and_self_events, probe_due_during_fault_backoff_is_taken_on_the_retry, missing_or_invalid_probe_after_is_immediately_eligible, quota_then_fault_retries_the_unchanged_rotation, stated_reset_time_governs_the_probe, sticky_account_after_r2d2_out, l_out_tries_r2d2_then_both_out_lands_on_astra, hourly_probe_from_astra_returns_to_fable, session_error_on_l_changes_nothing, filtered_engine_accounts, mode_only_commands_enforce_policy, explicit_primary_reselection_closes_episode, alias_remapping_cannot_extend_allowlist, failure_success_persistence_matrix, persistent_model_switch_replaces_child, unavailable_reason_contract, fable_out_on_both_accounts_lands_on_astra, astra_out_lands_on_opus55, all_out_posts_one_unavailable_line,
              commands_refuse_outside_the_allowlist, stale_engine_file_never_runs_below_the_floor, status_line_contract,
              ladder_rotation_from_a_selected_lower_tier, prompt_too_long_skips_the_claude_family,
              legacy_claude_models_config_is_ignored, persistent_mode_covered, models_json_aliases,
