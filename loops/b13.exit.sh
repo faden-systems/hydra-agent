@@ -36,6 +36,14 @@ assert '[b13.acceptance] PASS' in notes
 import re
 assert re.search(r'\b\d+ passed\b',notes),'notes need measured pytest count'
 PY
-"$PYTHON" -m pytest -q tests/manager
+RESULT=$(mktemp)
+trap 'rm -f "$RESULT"' EXIT
+"$PYTHON" -m pytest -q tests/manager | tee "$RESULT"
+"$PYTHON" - "$RESULT" <<'PYCOUNT'
+import re,sys
+from pathlib import Path
+counts=re.findall(r'(\d+) passed',Path(sys.argv[1]).read_text())
+assert counts and re.search(r'\b'+counts[-1]+r' passed\b',Path('docs/notes/b13.md').read_text()),'notes count differs from measured pytest result'
+PYCOUNT
 BASE_REF="$BASE" "$PYTHON" loops/b13.acceptance.py
 echo '[b13] PASS'
