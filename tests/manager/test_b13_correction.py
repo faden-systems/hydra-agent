@@ -27,3 +27,20 @@ def test_continuation_and_unknown_context(tmp_path,monkeypatch):
     out=S.status_text(str(tmp_path))
     assert 'continuation: capped until 2026-11-02 04:59:50 PST' in out
     assert 'last Claude turn unknown; 1 turns since on codex' in out
+
+
+def test_mixed_unknown_context_and_compaction(tmp_path):
+    at=1793620800
+    rows=[dict(at=at+i,duration_s=1,engine=e) for i,e in enumerate(['claude-l','codex',None,'codex','other-engine'])]
+    rows.insert(3,dict(at=at+2,kind='compaction',duration_s=1,engine='claude-l'))
+    setup(tmp_path,rows)
+    assert '(stale: last Claude turn 2026-11-02 04:00:00 PST; 4 turns since on mixed (codex, unknown, other-engine))' in S.status_text(str(tmp_path))
+    setup(tmp_path,rows[1:])
+    assert '(stale: last Claude turn unknown; 4 turns since on mixed (codex, unknown, other-engine))' in S.status_text(str(tmp_path))
+
+
+def test_display_conflict_precedence():
+    collision='Error: Session ID x is already in use.'
+    assert S._status_classification(dict(classification='credits',reason=collision))=='usage_limit'
+    assert S._status_classification(dict(classification='timeout',reason=collision))=='session_in_use'
+    assert S._status_classification(dict(classification='startup',reason='supervisor died mid-turn'))=='supervisor_died'
