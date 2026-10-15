@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory() as d:
  write(h,turns,attempts);assert line(status(str(h)),'last turn attempts:')=='last turn attempts: '+expected
  # Usage and credits normalize only in status; reset survives.
  t=start+13*300;turns.append(dict(n=1712,at=t,duration_s=20,engine='claude-l',model='claude-fable-5-1',events=[]))
- attempts += [attempt(t+1,'claude-r2d2',classification='usage_limit',reason='Usage limit reached; resets 2026-10-15T03:00:00Z'),attempt(t+20,'claude-l',True)]
+ attempts += [attempt(t+1,'claude-r2d2',classification='other',reason='Usage limit reached; resets 2026-10-15T03:00:00Z'),attempt(t+20,'claude-l',True)]
  write(h,turns,attempts);out=status(str(h));assert 'claude-r2d2/claude-fable-5-1 usage_limit:' in out;assert 'reset 2026-10-14 20:00:00 PDT' in out;assert 'claude-l: ok' in out
  attempts[-2]['classification']='credits'; attempts[-2]['reason']='Credit balance is too low'
  write(h,turns,attempts);assert 'claude-r2d2/claude-fable-5-1 usage_limit:' in status(str(h))
@@ -91,7 +91,7 @@ with tempfile.TemporaryDirectory() as d:
  # Persistent suffix never changes account/model comparison.
  turns=[dict(at=t,duration_s=10,engine='claude-r2d2',model='claude-fable-5-1')];write(h,turns,[])
  (h/'engine').write_text(json.dumps(dict(acc='claude-r2d2',model='claude-fable-5-1',mode='persistent')))
- out=status(str(h));assert 'persistent' in line(out,'engine:');assert 'MISMATCH' not in out
+ out=status(str(h));assert line(out,'engine:')=='engine: configured claude-r2d2 (claude-fable-5-1) [persistent] | last turn ran on claude-r2d2 (claude-fable-5-1)'
  # Account failure streak after a success, latest classification and reset conversions.
  for reset,expected_reset in [('2026-01-15T03:00:00+02:00','2026-01-14 18:00:00 PDT'),('8pm','8pm PDT'),('8pm XYZ','8pm XYZ')]:
   attempts=[attempt(t,'claude-r2d2',True),attempt(t+1,'claude-r2d2',classification='auth',reason='auth'),attempt(t+2,'claude-l',True),attempt(t+3,'claude-r2d2',classification='usage_limit',reason='Usage limit reached; resets '+reset)]

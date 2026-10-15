@@ -2,6 +2,7 @@
 set -euo pipefail
 BASE=${BASE_REF:?}; SPEC=${SPEC_REF:?}; PYTHON=${PYTHON:-python3}
 [[ $BASE =~ ^[0-9a-f]{40}$ && $SPEC =~ ^[0-9a-f]{40}$ ]]
+[[ "$BASE" == "$SPEC" ]]
 git merge-base --is-ancestor "$SPEC" "$BASE"
 git merge-base --is-ancestor "$BASE" HEAD
 unset PYTHONOPTIMIZE
