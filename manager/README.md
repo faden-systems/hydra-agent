@@ -521,3 +521,8 @@ message and managed paths, including rename origins. Mixed ranges, unknown ident
 missing or truncated responses and API failures retain the normal head wake immediately. PR and
 issue changes remain observable. Bounds are 100 commits and fewer than 100 files per commit;
 metadata identity follows the trusted repository convention and is not cryptographic attestation.
+
+### Engine evidence in status (b13)
+`hydra status` compares the configured account/model with the last completed ordinary turn's recorded runner and marks differences `MISMATCH`. It lists that turn's attempts in log order, trailing off-configured turns, and the latest consecutive failures for every account. These diagnostics read existing turn/attempt logs without model calls or new state. Session collisions are displayed as `session_in_use`, while credit and usage exhaustion display as `usage_limit`; runtime classification and fallback policy are unchanged.
+
+Attempts have no turn IDs, so attribution uses completed turn start/duration intervals at the log's one-second precision, excluding the next turn's start when intervals overlap. Missing evidence is `unknown` or `none recorded`; no success is inferred. New diagnostic timestamps use fixed PDT (UTC-07:00); existing status lines retain their formats. Unparseable reset timezone text is retained literally. Accounts include recent in-flight attempts, while the last-turn list includes only the completed interval.

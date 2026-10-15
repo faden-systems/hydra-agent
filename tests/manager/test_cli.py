@@ -46,7 +46,7 @@ def test_status_renders_from_fixtures(home):
     queue_event(home, "x")
     r = run(home, "status")
     assert r.returncode == 0
-    assert "engine: claude-r2d2" in r.stdout and "on codex (2 events" in r.stdout and "queue: 1 pending" in r.stdout
+    assert "engine: configured claude-r2d2" in r.stdout and "on codex (2 events" in r.stdout and "queue: 1 pending" in r.stdout
     assert "t1: building" in r.stdout
 
 
@@ -80,7 +80,7 @@ def test_engine_acc_model_round_trip_and_rejection(home):
     assert run(home, "engine", "model=haiku4.5").returncode == 0
     assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": "claude-haiku-4-5-20251001"}
     assert run(home, "engine", "acc=codex", "model=sol").stdout.strip() == "engine: codex (gpt-5.6-sol)"
-    assert "engine: codex (gpt-5.6-sol)" in run(home, "status").stdout
+    assert "engine: configured codex (gpt-5.6-sol)" in run(home, "status").stdout
 
 
 def test_attach_uses_the_configured_model(home, tmp_path):

@@ -311,7 +311,7 @@ def test_failed_turn_writes_no_ledger_line_but_logs_the_model(home, quota_engine
 
 def test_status_shows_acc_and_model(home):
     open(os.path.join(home, "engine"), "w").write(json.dumps({"acc": "claude-l", "model": "claude-sonnet-5"}))
-    assert "engine: claude-l (claude-sonnet-5)" in S.status_text(home)
+    assert "engine: configured claude-l (claude-sonnet-5)" in S.status_text(home)
 
 
 def test_claude_md_carries_the_memory_rule():
