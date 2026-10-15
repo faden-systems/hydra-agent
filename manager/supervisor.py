@@ -3899,6 +3899,9 @@ class Supervisor:
             return (f"fallback started (episode {episode_id}): {tier_label(configured, ladder)} unavailable "
                     f"({(runtime.get('reason') or '').strip()[:300]}); now running {tier_label(effective, ladder)}")
         effective = runtime.get("effective") or {}
+        if transition == "move":
+            return (f"fallback moved (episode {episode_id}): {tier_label(runtime.get('move_from') or {}, ladder)} "
+                    f"unavailable ({(runtime.get('reason') or '').strip()[:300]}); now running {tier_label(effective, ladder)}")
         return f"fallback ended (episode {episode_id}): back on {tier_label(effective, ladder)}"
 
     def _reconcile_fallback_notice(self):
@@ -3911,7 +3914,8 @@ class Supervisor:
         if not pending or not episode_id:
             return
         text = self._fallback_notice_text(runtime, pending)
-        _queue_notice_once(self.home, self.dev_channel, text, f"fallback-{episode_id}-{pending}")
+        suffix = f"move-{runtime.get('moves')}" if pending == "move" else pending
+        _queue_notice_once(self.home, self.dev_channel, text, f"fallback-{episode_id}-{suffix}")
         self.persistence_checkpoint(f"fallback_{pending}_queued")
         runtime["pending_notice"] = None
         save_engine_runtime(self.home, runtime)
@@ -3971,16 +3975,21 @@ class Supervisor:
         else:
             previous = runtime.get("effective") or {}
             if {"acc": previous.get("acc"), "model": previous.get("model")} != winning:
-                # founder rule 5 (2026-10-15): every switch inside an episode gets one top-level notice too
-                runtime.update({"effective": winning, "moves": int(runtime.get("moves") or 0) + 1})
+                # founder rule 5 (2026-10-15): every switch inside an episode gets one top-level notice too; the
+                # move is durable (`pending_notice` = "move", `move_from`) before the line is queued, so a crash
+                # at either side is reconciled at the next start like the start/end notices (requirement 12, b7)
+                runtime.update({"effective": winning, "moves": int(runtime.get("moves") or 0) + 1,
+                                "move_from": {"acc": previous.get("acc"), "model": previous.get("model")},
+                                "pending_notice": "move"})
                 if reason:
                     runtime["reason"] = reason
                 save_engine_runtime(self.home, runtime)
                 self.persistence_checkpoint("fallback_move_saved")
-                text = (f"fallback moved (episode {runtime.get('episode_id')}): {tier_label(previous, ladder)} "
-                        f"unavailable ({(reason or '').strip()[:300]}); now running {tier_label(winning, ladder)}")
-                _queue_notice_once(self.home, self.dev_channel, text,
+                _queue_notice_once(self.home, self.dev_channel, self._fallback_notice_text(runtime, "move"),
                                    f"fallback-{runtime.get('episode_id')}-move-{runtime['moves']}")
+                self.persistence_checkpoint("fallback_move_queued")
+                runtime["pending_notice"] = None
+                save_engine_runtime(self.home, runtime)
             elif reason:
                 runtime["reason"] = reason
                 save_engine_runtime(self.home, runtime)
