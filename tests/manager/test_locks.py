@@ -170,5 +170,5 @@ def test_status_text_renders_from_fixtures(home):
     S.append_jsonl(os.path.join(home, "logs", "turns.jsonl"), {"n": 1, "at": 1000.0, "engine": "claude-l", "events": ["a"], "duration_s": 2.0})
     queue_event(home, "pending one")
     text = S.status_text(home)
-    assert "engine: configured claude-r2d2" in text and "last turn: 1970-01-01T00:16:40Z on claude-l (1 events" in text
+    assert "engine: configured claude-r2d2" in text and "last turn: 1969-12-31 16:16:40 PST on claude-l (1 events" in text
     assert "queue: 1 pending" in text and "t1: building (coder)" in text and "t2: review" in text
