@@ -17,12 +17,16 @@ def status(home):
    return fn(file,mode,*args,**kwargs)
   return call
  def forbidden(*a,**kw):raise AssertionError('status attempted side effect')
+ def tree():return sorted((str(p.relative_to(home)),p.read_bytes() if p.is_file() else None,p.lstat().st_mode,p.lstat().st_mtime_ns) for p in Path(home).rglob('*'))
+ before=tree() if Path(home).exists() else None
  with ExitStack() as stack:
   stack.enter_context(patch('builtins.open',guarded(real)));stack.enter_context(patch('io.open',guarded(realio)))
   for name in ['subprocess.Popen','socket.socket','os.remove','os.unlink','os.rename','os.replace','os.mkdir','os.makedirs','os.utime','os.chmod']:
    stack.enter_context(patch(name,forbidden))
   stack.enter_context(patch.object(S.time,'time',return_value=1792108800))  # Oct16 UTC; fixtures deterministic
-  return S.status_text(home)
+  out=S.status_text(home)
+  assert (tree() if Path(home).exists() else None)==before,'status wrote, touched or created files'
+  return out
 def write(home,turns,attempts):
  (home/'logs').mkdir(exist_ok=True)
  (home/'engine').write_text(json.dumps({'acc':'claude-r2d2','model':'claude-fable-5-1'}))
@@ -77,6 +81,8 @@ with tempfile.TemporaryDirectory() as d:
  assert line(out,'last turn attempts:')=='last turn attempts: claude-r2d2/claude-fable-5-1 auth: '+('é'*80)+'; claude-r2d2/claude-fable-5-1 rate_limit: slow; codex/gpt-6-astra ok; codex/gpt-6-astra ok'
  assert line(out,'off configured engine:').endswith('reason: auth')
  attempts.insert(2,attempt(t+3,'claude-r2d2',classification='rate_limit',reason='slow'))
+ write(h,turns,attempts);assert line(status(str(h)),'off configured engine:').endswith('reason: rate_limit')
+ attempts+=[attempt(t+4+i,'claude-l',classification='auth',reason='auth') for i in range(3)]  # another account's majority never drives the reason
  write(h,turns,attempts);assert line(status(str(h)),'off configured engine:').endswith('reason: rate_limit')
  # Missing model/runner is a boundary, not a skipped row; compaction is excluded.
  turns=[dict(at=t,duration_s=20,engine='codex',model='gpt-6-astra'),dict(at=t+30,duration_s=2),dict(at=t+40,duration_s=10,engine='codex',model='gpt-6-astra'),dict(at=t+60,duration_s=1,engine='claude-r2d2',kind='compaction')]
