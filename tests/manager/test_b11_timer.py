@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 import time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from b11_helpers import (FADEN_REPO, HYDRA_REPO, Clock, S, calls, checks_log, coder_dir, event, fakes, home, make, pr,
@@ -107,7 +108,9 @@ def test_s_sources_wake_once_per_difference_and_never_for_the_excluded_inputs():
         assert len(rows) == tick.n and all({"at", "woke", "reasons", "cost_ms"} <= set(r) for r in rows)
         line = next(l for l in S.status_text(h).splitlines() if l.startswith("timer: "))
         last_wake = [r for r in rows if r["woke"]][-1]
-        assert line == f"timer: every 60s | last check {rows[-1]['at']} ({rows[-1]['cost_ms']} ms) | last wake {last_wake['at']}: fallback episode ep-1 ended", line
+        def pacific(value):
+            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        assert line == f"timer: every 60s | last check {pacific(rows[-1]['at'])} ({rows[-1]['cost_ms']} ms) | last wake {pacific(last_wake['at'])}: fallback episode ep-1 ended", line
     finally:
         dog.close()
 
