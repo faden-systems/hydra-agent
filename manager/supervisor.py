@@ -1482,7 +1482,7 @@ def _status_pdt(value):
     if at is None:
         return 'unknown'
     try:
-        return datetime.datetime.fromtimestamp(at, datetime.timezone(datetime.timedelta(hours=-7))).strftime('%Y-%m-%d %H:%M:%S PDT')
+        return datetime.datetime.fromtimestamp(at, LA_ZONE).strftime('%Y-%m-%d %H:%M:%S %Z')
     except (ValueError, OverflowError, OSError):
         return 'unknown'
 
@@ -1494,10 +1494,13 @@ def _status_classification(row):
         return 'usage_limit'
     if re.search(r'session\s+id.*already\s+in\s+use', reason, re.I):
         return 'session_in_use'
+    for cls, pattern in [('supervisor_died', r'supervisor died'), ('timeout', r'timeout|timed out'), ('startup', r'startup')]:
+        if recorded == cls or re.search(pattern, reason, re.I):
+            return cls
     return str(recorded)
 
 
-def _status_reset(reason):
+def _status_reset(reason, at=None):
     match = re.search(r'\bresets?\s*:?\s+(.+)', str(reason or ''), re.I)
     if not match:
         return ''
@@ -1507,7 +1510,7 @@ def _status_reset(reason):
         return ', reset ' + _status_pdt(iso.group())
     # Clock-only reset messages from the CLI are local; unknown explicit zones stay literal.
     if re.fullmatch(r'\d{1,2}(?::\d\d)?\s*(?:am|pm)?', value, re.I):
-        value += ' PDT'
+        value += ' ' + _status_pdt(at if at is not None else time.time()).rsplit(' ', 1)[-1]
     return ', reset ' + value
 
 
@@ -1562,18 +1565,57 @@ def _status_engine_lines(home, pair):
     accounts = []
     for account in ENGINE_ORDER:
         rows = [a for a in attempts if a.get('engine') == account]
+        ok = next((i for i in range(len(rows)-1, -1, -1) if rows[i].get('success') is True), -1)
+        last_ok = _status_pdt(rows[ok]['at']) if ok >= 0 else 'unknown'
+        failures = rows[ok+1:]
         if not rows:
-            accounts.append(f'{account}: unknown')
-        elif rows[-1].get('success') is True:
-            accounts.append(f'{account}: ok')
+            text = f'{account}: unknown'
+        elif not failures:
+            text = f'{account}: ok'
         else:
-            first = len(rows)-1
-            while first and rows[first-1].get('success') is not True:
+            cls = _status_classification(failures[-1])
+            first = len(failures)-1
+            while first and _status_classification(failures[first-1]) == cls:
                 first -= 1
-            accounts.append(f'{account}: {_status_classification(rows[-1])} since {_status_pdt(rows[first]["at"])}'
-                            + _status_reset(rows[-1].get('reason')))
+            text = f'{account}: {cls} since {_status_pdt(failures[first]["at"])}'
+            text += _status_reset(failures[-1].get('reason'), failures[-1]['at'])
+        text += f'; last ok {last_ok}'
+        if failures and first:
+            earlier = failures[first-1]
+            text += f'; before: {_status_classification(earlier)} at {_status_pdt(earlier["at"])}'
+        limits = [a for a in failures if _status_classification(a) == 'usage_limit']
+        if limits:
+            usage = 'limit at ' + _status_pdt(limits[-1]['at'])
+        elif failures and all(_status_classification(a) in ('session_in_use', 'startup', 'supervisor_died') for a in failures):
+            usage = f'unknown (API not reached since {last_ok})'
+        else:
+            usage = 'ok' if rows else 'unknown'
+        accounts.append(text + '; usage: ' + usage)
     lines.append('accounts: ' + '; '.join(accounts))
     return lines
+
+
+def _status_pacific_line(text):
+    """Convert timestamp instants only on system-generated status lines."""
+    return re.sub(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)',
+                  lambda m: _status_pdt(m.group()), text)
+
+
+def _status_context_suffix(home):
+    rows = [r for r in read_jsonl(os.path.join(home, 'logs', 'turns.jsonl'))
+            if isinstance(r, dict) and r.get('kind') != 'compaction'
+            and isinstance(r.get('at'), (int, float)) and _status_timestamp(r.get('at')) is not None
+            and isinstance(r.get('duration_s'), (int, float)) and not isinstance(r.get('duration_s'), bool)
+            and _status_timestamp(r['duration_s']) is not None and r['duration_s'] >= 0]
+    if not rows or str(rows[-1].get('engine') or '').startswith('claude-'):
+        return ''
+    last = next((i for i in range(len(rows)-1, -1, -1)
+                 if str(rows[i].get('engine') or '').startswith('claude-')), -1)
+    when = _status_pdt(rows[last]['at']) if last >= 0 else 'unknown'
+    subsequent = rows[last+1:]
+    engines = list(dict.fromkeys(str(r.get('engine') or 'unknown') for r in subsequent))
+    runner = engines[0] if len(engines) == 1 else 'mixed (' + ', '.join(engines) + ')'
+    return f' (stale: last Claude turn {when}; {len(subsequent)} turns since on {runner})'
 
 
 def status_text(home, repo=None):
@@ -1604,7 +1646,7 @@ def status_text(home, repo=None):
     runtime = read_engine_runtime(home)
     if runtime.get("episode_id") and runtime.get("active"):
         lines.append(f"engine fallback: configured {engine_label(runtime.get('configured') or {})}, "
-                     f"effective {engine_label(runtime.get('effective') or {})} (since {runtime.get('since')}, "
+                     f"effective {engine_label(runtime.get('effective') or {})} (since {_status_pdt(runtime.get('since'))}, "
                      f"{(runtime.get('reason') or '').strip()[:200]})")
     pstat = persistent_status(home)
     if cur_pair["mode"] == "persistent" or pstat.get("pid") or pstat.get("state") != "stopped":
@@ -1618,7 +1660,7 @@ def status_text(home, repo=None):
     lt = next((r for r in reversed(read_jsonl(os.path.join(home, "logs", "turns.jsonl")))
                if isinstance(r, dict) and _status_timestamp(r.get("at")) is not None), None)
     if lt:
-        when = now_iso(lt.get("at")) if isinstance(lt.get("at"), (int, float)) else str(lt.get("at"))
+        when = _status_pdt(lt.get("at"))
         extra = f", error: {lt['error']}" if lt.get("error") else ""
         lines.append(f"last turn: {when} on {lt.get('engine')} ({len(lt.get('events') or [])} events, "
                      f"{lt.get('duration_s', 0):.0f}s{extra})")
@@ -1632,13 +1674,13 @@ def status_text(home, repo=None):
         direct += f", {st['failed']} set aside"
     lines.append(direct)
     try:
-        lines.append(compaction_status_line(home))
+        lines.append(_status_pacific_line(compaction_status_line(home)) + _status_context_suffix(home))
     except (AttributeError, TypeError, ValueError):
         lines.append("compaction: unavailable (malformed turn log)")
-    lines.append(timer_status_line(home))  # requirement 10, loops/b11.md
+    lines.append(_status_pacific_line(timer_status_line(home)))  # requirement 10, loops/b11.md
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
-        lines.append(f"heartbeat: {now_iso(os.path.getmtime(hb))}")
+        lines.append(f"heartbeat: {_status_pdt(os.path.getmtime(hb))}")
     # idle-until / waiting-on-since (requirement 18, loops/b7.md); legacy output with no (valid) work-status
     work_status = read_work_status(home)
     if isinstance(work_status, dict):
@@ -1646,11 +1688,11 @@ def status_text(home, repo=None):
         if mode == "waiting":
             who, since = work_status.get("who"), _ws_num(work_status.get("since"))
             if isinstance(who, str) and who and since is not None:
-                lines.append(f"waiting on {who} since {la_time_label(since)}")
+                lines.append(f"waiting on {who} since {_status_pdt(since)}")
         elif mode == "idle":
             deadline = _ws_num(work_status.get("deadline"))
             if deadline is not None:
-                lines.append(f"idle until {la_time_label(deadline)}")
+                lines.append(f"idle until {_status_pdt(deadline)}")
     cont_cfg = cfg.get("continuation")
     cont_cfg = cont_cfg if isinstance(cont_cfg, dict) else {}
     limit = cont_cfg.get("max_per_hour", CONTINUATION_DEFAULT_MAX_PER_HOUR)
@@ -1662,7 +1704,7 @@ def status_text(home, repo=None):
                   if isinstance(r.get("at"), (int, float)) and not isinstance(r.get("at"), bool)
                   and now - r["at"] < CONTINUATION_WINDOW_S]
         if len(recent) >= limit:
-            lines.append(f"continuation: capped until {now_iso(min(recent) + CONTINUATION_WINDOW_S)}")
+            lines.append(f"continuation: capped until {_status_pdt(min(recent) + CONTINUATION_WINDOW_S)}")
     # persistence pending/blocked until remote verification (requirement 19, loops/b7.md)
     try:
         persistence = json.loads(read_text(os.path.join(home, "logs", "persistence.json"), "{}") or "{}")
