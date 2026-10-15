@@ -15,7 +15,7 @@ def show(ref,p):return subprocess.check_output(['git','show',f'{ref}:{p}'])
 for p in ['loops/b13.md','loops/b13.exit.sh','loops/b13.acceptance.py']:
  assert show(base,p)==show(spec,p)==Path(p).read_bytes(),f'frozen file changed: {p}'
 changed=set().union(*(set(subprocess.check_output(cmd).decode().splitlines()) for cmd in [['git','diff','--name-only',base,'HEAD'],['git','diff','--cached','--name-only','HEAD'],['git','diff','--name-only']]))|set(subprocess.check_output(['git','ls-files','--others','--exclude-standard']).decode().splitlines())
-assert changed <= {'manager/supervisor.py','manager/README.md','tests/manager/test_b13_status.py','docs/notes/b13.md','tests/manager/test_memory.py','tests/manager/test_bridge.py','tests/manager/test_locks.py','tests/manager/test_cli.py','tests/manager/test_b13_correction.py'},changed
+assert changed <= {'manager/supervisor.py','manager/README.md','tests/manager/test_b13_status.py','docs/notes/b13.md','tests/manager/test_memory.py','tests/manager/test_bridge.py','tests/manager/test_locks.py','tests/manager/test_cli.py','tests/manager/test_b13_correction.py','tests/manager/test_b13_usage.py'},changed
 old=ast.parse(show(base,'manager/supervisor.py'));new=ast.parse(Path('manager/supervisor.py').read_text())
 names=[x.name for x in new.body if isinstance(x,(ast.FunctionDef,ast.ClassDef))]
 assert len(names)==len(set(names)),'duplicate definition'

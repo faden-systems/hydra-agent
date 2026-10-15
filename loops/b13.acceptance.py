@@ -112,14 +112,26 @@ with tempfile.TemporaryDirectory() as d:
  assert 'claude-l: session_in_use since 2026-10-14 10:54:26 PDT' in accounts,accounts
  assert 'before: usage_limit at 2026-10-11 11:56:23 PDT' in accounts,accounts
  assert 'usage: limit at 2026-10-11 11:56:23 PDT' in account(out,'claude-l'),accounts
- assert account(out,'claude-r2d2').endswith('usage: ok'),accounts
+ assert account(out,'claude-r2d2').endswith('usage: unknown (no successful call since 2026-10-14 10:01:51 PDT)'),accounts
  assert 'claude-r2d2: session_in_use since 2026-10-14 10:54:25 PDT' in accounts,accounts
  assert 'before: timeout at 2026-10-14 10:49:23 PDT' in accounts,accounts
  assert 'last ok 2026-10-14 10:01:51 PDT' in accounts,accounts
- # API not reached: all failures pre-API; a previous limit before success is cleared.
+ # Founder usage rule (1792093638.592389): ok only on a latest success; a limit row after last ok is retained; otherwise unknown.
+ REAL_LIMIT={'at': '2026-10-15T19:49:49Z', 'engine': 'claude-r2d2', 'model': 'claude-fable-5-1', 'rc': 1, 'classification': 'credits', 'reason': "You're out of usage credits. Switch to another model to continue.", 'success': False}
+ REAL_L_OK={'at': '2026-10-15T19:52:43Z', 'engine': 'claude-l', 'model': 'claude-fable-5-1', 'rc': 0, 'classification': None, 'reason': '', 'success': True}
+ rs=REAL_HISTORY+[REAL_LIMIT,dict(REAL_HISTORY[-1],at='2026-10-15T20:05:00Z'),REAL_L_OK]
+ write(h,[],rs);out=status(str(h))
+ assert account(out,'claude-r2d2')=='claude-r2d2: session_in_use since 2026-10-15 13:05:00 PDT; last ok 2026-10-14 10:01:51 PDT; before: usage_limit at 2026-10-15 12:49:49 PDT; usage: limit at 2026-10-15 12:49:49 PDT',out
+ assert account(out,'claude-l')=='claude-l: ok; last ok 2026-10-15 12:52:43 PDT; usage: ok',out
  rs=[a for a in REAL_HISTORY if a['engine']=='claude-r2d2' and 'timeout' not in a['reason']]
  write(h,[],rs);out=status(str(h))
- assert 'usage: unknown (API not reached since 2026-10-14 10:01:51 PDT)' in account(out,'claude-r2d2'),out
+ assert 'usage: unknown (no successful call since 2026-10-14 10:01:51 PDT)' in account(out,'claude-r2d2'),out
+ rs=[a for a in REAL_HISTORY if a['engine']=='claude-r2d2' and ('timeout' in a['reason'] or a['success'])]
+ write(h,[],rs);out=status(str(h))
+ assert account(out,'claude-r2d2')=='claude-r2d2: timeout since 2026-10-14 10:49:23 PDT; last ok 2026-10-14 10:01:51 PDT; usage: unknown (no successful call since 2026-10-14 10:01:51 PDT)',out
+ write(h,[],[REAL_HISTORY[-1]]);out=status(str(h))
+ assert account(out,'claude-r2d2')=='claude-r2d2: session_in_use since 2026-10-14 11:07:38 PDT; last ok unknown; usage: unknown (no successful call recorded)',out
+ assert 'API not reached' not in out
  rs.append(attempt(1792100000,'claude-r2d2',True));write(h,[],rs);out=status(str(h))
  assert account(out,'claude-r2d2').endswith('usage: ok')
  # Winter date is a separate fixture; generated times must all be Pacific.
@@ -176,6 +188,6 @@ with tempfile.TemporaryDirectory() as d:
  rs.append(attempt(t+2,'claude-l',True));write(h,[],rs)
  assert account(status(str(h)),'claude-l')=='claude-l: ok; last ok 2026-10-14 15:00:02 PDT; usage: ok'
  rs.append(attempt(t+3,'claude-l'));write(h,[],rs)
- assert account(status(str(h)),'claude-l')=='claude-l: session_in_use since 2026-10-14 15:00:03 PDT; last ok 2026-10-14 15:00:02 PDT; usage: unknown (API not reached since 2026-10-14 15:00:02 PDT)'
+ assert account(status(str(h)),'claude-l')=='claude-l: session_in_use since 2026-10-14 15:00:03 PDT; last ok 2026-10-14 15:00:02 PDT; usage: unknown (no successful call since 2026-10-14 15:00:02 PDT)'
  assert account(status(str(h)),'codex')=='codex: unknown; last ok unknown; usage: unknown'
 print('[b13.acceptance] PASS')
