@@ -110,7 +110,7 @@ def test_status_for_any_allowlisted_sender(bridge, home, poster):
     open(os.path.join(home, "state.json"), "w").write(json.dumps({"tracks": {"t1": "building"}}))
     bridge.handle_message(msg("<@U_MANAGER> status", user="U_OPERATOR", ts="12.0", thread="1.0"))
     assert poster.posted[-1][:2] == ("C_DEV", "1.0")
-    assert "engine: claude-r2d2" in poster.posted[-1][2] and "t1: building" in poster.posted[-1][2]
+    assert "engine: configured claude-r2d2" in poster.posted[-1][2] and "t1: building" in poster.posted[-1][2]
     assert not any(e["id"] == "12.0" for e in read_queue(home)), "a command never queues a turn"
 
 
@@ -161,7 +161,7 @@ def test_engine_command_acc_and_model(bridge, home, poster):
     bridge.handle_message(msg("<@U_MANAGER> engine acc=codex model=gpt-5.6-sol", ts="14.5"))
     assert S.read_engine(home) == {"acc": "codex", "model": "gpt-5.6-sol"}
     bridge.handle_message(msg("<@U_MANAGER> status", ts="14.6"))
-    assert "engine: codex (gpt-5.6-sol)" in poster.posted[-1][2]
+    assert "engine: configured codex (gpt-5.6-sol)" in poster.posted[-1][2]
 
 
 def test_digest_now_queues_a_timer_event(bridge, home, poster):

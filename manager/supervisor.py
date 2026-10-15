@@ -1459,6 +1459,123 @@ def last_turn(home):
     return turns[-1] if turns else None
 
 
+def _status_timestamp(value):
+    """Accept finite epoch or timezone-qualified log timestamp, never guess local time."""
+    import datetime
+    import math
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value) if math.isfinite(value) else None
+        if isinstance(value, str):
+            dt = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+            return dt.timestamp() if dt.tzinfo else None
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+def _status_pdt(value):
+    import datetime
+    at = _status_timestamp(value)
+    if at is None:
+        return 'unknown'
+    try:
+        return datetime.datetime.fromtimestamp(at, datetime.timezone(datetime.timedelta(hours=-7))).strftime('%Y-%m-%d %H:%M:%S PDT')
+    except (ValueError, OverflowError, OSError):
+        return 'unknown'
+
+
+def _status_classification(row):
+    reason = str(row.get('reason') or '')
+    recorded = row.get('classification') or 'other'
+    if recorded in ('credits', 'usage_limit') or classify_engine_error(reason) in ('credits', 'usage_limit'):
+        return 'usage_limit'
+    if re.search(r'session\s+id.*already\s+in\s+use', reason, re.I):
+        return 'session_in_use'
+    return str(recorded)
+
+
+def _status_reset(reason):
+    match = re.search(r'\bresets?\s*:?\s+(.+)', str(reason or ''), re.I)
+    if not match:
+        return ''
+    value = ' '.join(match.group(1).split()).strip(' .')
+    iso = re.match(r'\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d)', value)
+    if iso and _status_timestamp(iso.group()) is not None:
+        return ', reset ' + _status_pdt(iso.group())
+    # Clock-only reset messages from the CLI are local; unknown explicit zones stay literal.
+    if re.fullmatch(r'\d{1,2}(?::\d\d)?\s*(?:am|pm)?', value, re.I):
+        value += ' PDT'
+    return ', reset ' + value
+
+
+def _status_engine_lines(home, pair):
+    """Read-only diagnostics from completed turns and all recorded account attempts."""
+    import math
+    from collections import Counter
+    raw_turns = read_jsonl(os.path.join(home, 'logs', 'turns.jsonl'))
+    turns = [r for r in raw_turns if isinstance(r, dict) and r.get('kind') != 'compaction'
+             and isinstance(r.get('at'), (float, int)) and not isinstance(r.get('at'), bool)
+             and _status_timestamp(r.get('at')) is not None
+             and isinstance(r.get('duration_s'), (float, int)) and not isinstance(r.get('duration_s'), bool)
+             and _status_timestamp(r.get('duration_s')) is not None and r['duration_s'] >= 0]
+    attempts = [r for r in read_jsonl(os.path.join(home, 'logs', 'attempts.jsonl'))
+                if isinstance(r, dict) and _status_timestamp(r.get('at')) is not None]
+    def runner(row):
+        return (row.get('engine') or 'unknown', row.get('model') or 'unknown')
+    configured = (pair['acc'], pair['model'])
+    latest = turns[-1] if turns else None
+    actual = runner(latest) if latest else ('unknown', 'unknown')
+    engine = f'engine: configured {engine_label(pair)}{mode_suffix(pair)} | last turn ran on {actual[0]} ({actual[1]})'
+    if latest and actual != configured:
+        engine += ' | MISMATCH'
+    timed_attempts = [(a, _status_timestamp(a['at'])) for a in attempts]
+    associated = []
+    for i, turn in enumerate(turns):
+        start = math.floor(turn['at'])
+        end = math.floor(turn['at'] + turn['duration_s'])
+        next_start = math.floor(turns[i+1]['at']) if i+1 < len(turns) else None
+        associated.append([a for a, at in timed_attempts if start <= at <= end
+                           and (next_start is None or at < next_start)])
+    parts = []
+    for a in associated[-1] if associated else []:
+        account, model = runner(a)
+        if a.get('success') is True:
+            parts.append(f'{account}/{model} ok')
+        else:
+            reason = ' '.join(str(a.get('reason') or '').split())[:80]
+            parts.append(f'{account}/{model} {_status_classification(a)}: {reason}')
+    lines = [engine, 'last turn attempts: ' + ('; '.join(parts) if parts else 'none recorded')]
+    first = len(turns)
+    while first:
+        actual = runner(turns[first-1])
+        if 'unknown' in actual or actual == configured:
+            break
+        first -= 1
+    if first < len(turns):
+        failures = [_status_classification(a) for group in associated[first:] for a in group
+                    if a.get('engine') == pair['acc'] and a.get('success') is not True]
+        common = Counter(failures).most_common(1)[0][0] if failures else 'unknown'
+        lines.append(f'off configured engine: {len(turns)-first} turns since {_status_pdt(turns[first]["at"])}, reason: {common}')
+    accounts = []
+    for account in ENGINE_ORDER:
+        rows = [a for a in attempts if a.get('engine') == account]
+        if not rows:
+            accounts.append(f'{account}: unknown')
+        elif rows[-1].get('success') is True:
+            accounts.append(f'{account}: ok')
+        else:
+            first = len(rows)-1
+            while first and rows[first-1].get('success') is not True:
+                first -= 1
+            accounts.append(f'{account}: {_status_classification(rows[-1])} since {_status_pdt(rows[first]["at"])}'
+                            + _status_reset(rows[-1].get('reason')))
+    lines.append('accounts: ' + '; '.join(accounts))
+    return lines
+
+
 def status_text(home, repo=None):
     cfg = load_config(home)
     repo = repo or cfg.get("repo")
@@ -1471,9 +1588,9 @@ def status_text(home, repo=None):
         lines.append(f"manager in console session ({ws[1]})")
     cur_engines = default_engines(home, cfg)
     cur_pair = read_engine(home, cur_engines)
-    lines.append(f"engine: {engine_label(cur_pair)}{mode_suffix(cur_pair)}")
+    lines.extend(_status_engine_lines(home, cur_pair))
     cur_spec = cur_engines.get(cur_pair["acc"]) or {}
-    attempts_tail = read_jsonl(os.path.join(home, "logs", "attempts.jsonl"))
+    attempts_tail = [a for a in read_jsonl(os.path.join(home, "logs", "attempts.jsonl")) if isinstance(a, dict)]
     mismatched = next((a for a in reversed(attempts_tail) if a.get("engine") == cur_pair["acc"]
                        and "mismatch" in (a.get("reason") or "").lower()), None)
     if mismatched:
@@ -1498,7 +1615,8 @@ def status_text(home, repo=None):
             mode_runtime.get("mode") != runtime.get("effective", {}).get("mode"):
         lines.append(f"persistent fallback: configured {mode_runtime['mode']}, "
                      f"effective {runtime['effective']['mode']} ({(runtime.get('reason') or '').strip()[:200]})")
-    lt = last_turn(home)
+    lt = next((r for r in reversed(read_jsonl(os.path.join(home, "logs", "turns.jsonl")))
+               if isinstance(r, dict) and _status_timestamp(r.get("at")) is not None), None)
     if lt:
         when = now_iso(lt.get("at")) if isinstance(lt.get("at"), (int, float)) else str(lt.get("at"))
         extra = f", error: {lt['error']}" if lt.get("error") else ""
@@ -1513,7 +1631,10 @@ def status_text(home, repo=None):
     if st["failed"]:
         direct += f", {st['failed']} set aside"
     lines.append(direct)
-    lines.append(compaction_status_line(home))
+    try:
+        lines.append(compaction_status_line(home))
+    except (AttributeError, TypeError, ValueError):
+        lines.append("compaction: unavailable (malformed turn log)")
     lines.append(timer_status_line(home))  # requirement 10, loops/b11.md
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
