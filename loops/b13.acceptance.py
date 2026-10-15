@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory() as d:
  print('PASS usage and credit limit diagnostics')
  t+=300;turns.append(dict(n=1713,at=t,duration_s=10,engine='claude-r2d2',model='claude-fable-5-1',events=[]));attempts.append(attempt(t+10,'claude-r2d2',True))
  write(h,turns,attempts);out=status(str(h));assert 'MISMATCH' not in out;assert 'off configured engine:' not in out;assert 'claude-r2d2: ok' in out
- turns[-1]['model']='another-model';write(h,turns,attempts);assert 'MISMATCH' in status(str(h));assert 'off configured engine: 1 turns' in status(str(h))
+ turns.append(dict(turns[-1],at=t+300,model='another-model'));write(h,turns,attempts);assert 'MISMATCH' in status(str(h));assert 'off configured engine: 1 turns' in status(str(h))
  print('PASS recovery and model mismatch')
  write(h,[],[]);out=status(str(h));assert 'last turn ran on unknown (unknown)' in out;assert 'last turn attempts: none recorded' in out;assert 'claude-r2d2: unknown' in out
  # Exact order, normalization, Unicode cap, multiple successes and majority/tie.
