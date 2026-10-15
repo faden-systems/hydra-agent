@@ -3007,18 +3007,26 @@ class Supervisor:
                 primary = conf
         started_pair = dict(pair)
         order = self._ladder_rotation(primary, ladder_steps(ladder, self.engines))
-        probed_tiers = None  # founder rule 3: tiers above the effective one are tried only when the probe is due
-        if runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict) and configured.get("acc"):
+        eff_tier = None  # the effective tier while an episode runs below the configured tier (founder rule 3)
+        episode = bool(runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict) and configured.get("acc"))
+        if episode:
             conf_tier = ladder_position({"acc": configured.get("acc"), "model": configured.get("model")}, ladder)
-            eff_tier = ladder_position(pair, ladder)
-            if conf_tier is not None and eff_tier is not None and eff_tier > conf_tier:
-                if self._tier_probe_due(runtime):
-                    probed_tiers = {s[0] for s in order if s[0] < eff_tier}
-                else:
-                    order = self._ladder_rotation(pair, [s for s in ladder_steps(ladder, self.engines) if s[0] >= eff_tier])
-        current = order[0][1] if order else pair["acc"]
+            tier_now = ladder_position(pair, ladder)
+            if conf_tier is not None and tier_now is not None and tier_now > conf_tier:
+                eff_tier = tier_now
+                if not self._tier_probe_due(runtime):
+                    # inside the hour the turn starts at the effective pair and walks toward the floor; the tiers
+                    # above come last, reached only when every step at or below the effective tier failed (so a
+                    # dead floor never posts "all allowed engines failed" while a higher tier was merely on hold)
+                    order = self._ladder_rotation(pair, ladder_steps(ladder, self.engines))
+        # requirement 11, loops/b8.md: the account that served (the engine file) runs without a verified sidecar;
+        # during an episode the operator's configured account was selected too. Only switching TO any other
+        # credential requires it to be verified first.
+        current = {pair["acc"]} | ({configured.get("acc")} if episode else set())
+        stale = ladder_position(pair, ladder) is None  # a pre-b12 or hand-edited engine file outside the ladder
         errors, reasons = [], []
         failed_steps = []  # (tier, error) of every failed invocation this turn
+        tried_tiers = []
         persist_switch = False  # a quota, auth or budget move is persisted; a plain or session-level failure is not
         skip_claude = False
         last_reason = None
@@ -3050,7 +3058,7 @@ class Supervisor:
                     errors.append((name, reason))
                     reasons.append(step + "skipped: identity mismatch")
                     continue
-                if name != current and not identity.get("automatic_allowed"):
+                if name not in current and not identity.get("automatic_allowed"):
                     # requirement 11, loops/b8.md: run_engines checks automatic_allowed before invoking a
                     # fallback credential; the originally selected account still runs (production relies on
                     # that today), only switching TO another credential requires it to be verified first.
@@ -3072,6 +3080,7 @@ class Supervisor:
                 preamble += "\n\n" + block
             if family == "codex" and self.codex_flush_due():
                 preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
+            tried_tiers.append(tier)
             rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
             if rc == 0:
                 record_attempt(self.home, name, model, rc, None, "", True)
@@ -3083,15 +3092,16 @@ class Supervisor:
                     notes.append(f"engine: {engine_label({'acc': name, 'model': model})}")
                 restored = bool(runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict)
                                 and (name, model) == (configured.get("acc"), configured.get("model")))
-                if (persist_switch or restored) and (name != pair["acc"] or model != pair["model"]):
-                    # a persist-worthy move, or the configured pair serving again during an episode (the return
-                    # must land in the engine file too, or the next turn would stay on the lower tier)
+                moved_up = eff_tier is not None and tier < eff_tier  # founder rule 2: a success above moves up at once
+                if (persist_switch or restored or moved_up or stale) and (name != pair["acc"] or model != pair["model"]):
+                    # a persist-worthy move, a move up (even after skips only), the configured pair serving again
+                    # during an episode (the return must land in the engine file too), or a stale file normalised
+                    # to the step that actually served
                     set_engine(self.home, name, model, self.engines, explicit=False)
-                probe_errors = None
-                if probed_tiers is not None or any(t < tier for t, _ in failed_steps):
-                    probe_errors = [e for t, e in failed_steps if t < tier]
-                self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch,
-                                               probe_errors=probe_errors)
+                probe_errors = [e for t, e in failed_steps if t < tier]  # errors of the tiers above the winner
+                probed = eff_tier is not None and any(t < eff_tier for t in tried_tiers)
+                self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch or moved_up,
+                                               probe_errors=probe_errors, probed=probed)
                 return name, model, out, usage, transition
             classification = classify_engine_error(err)
             record_attempt(self.home, name, model, rc, classification, err, False)
@@ -3945,11 +3955,14 @@ class Supervisor:
         save_engine_runtime(self.home, runtime)
 
     def _note_fallback_transition(self, winning_acc, winning_model, started_pair, reason, persist_worthy,
-                                  probe_errors=None):
+                                  probe_errors=None, probed=False):
         """After a turn resolves successfully: start, update or close the fallback episode. Deliberately
-        selecting a different engine (no failure at all) is never itself a fallback episode. `probe_errors` is
-        the list of errors of the higher-tier steps tried this turn (None when none was tried): landing on a tier
-        below the configured one schedules the next re-probe of the tiers above (founder rule 3, 2026-10-15)."""
+        selecting a different engine (no failure at all) is never itself a fallback episode. `probe_errors` are the
+        errors of the steps above the winning tier tried this turn; `probed` says whether a tier above the
+        effective one was tried. Landing on a tier below the configured one schedules the next re-probe of the
+        tiers above (founder rule 3, 2026-10-15): a probe sets it afresh; a turn that did not probe keeps the
+        pending instant and can only bring it forward (a failing tier between the old and the new effective tier
+        never postpones the configured tier's probe)."""
         runtime = read_engine_runtime(self.home)
         configured = runtime.get("configured") or started_pair
         winning = {"acc": winning_acc, "model": winning_model}
@@ -3994,9 +4007,15 @@ class Supervisor:
                 runtime["reason"] = reason
                 save_engine_runtime(self.home, runtime)
         runtime = read_engine_runtime(self.home)
-        if below and (probe_errors is not None or not runtime.get("probe_after")):
-            runtime["probe_after"] = self._next_tier_probe(probe_errors or [])
-            save_engine_runtime(self.home, runtime)
+        if below:
+            existing = parse_iso(runtime.get("probe_after"))
+            nxt = self._next_tier_probe(probe_errors or [])
+            if probed or existing is None or existing <= self.clock_dt():
+                runtime["probe_after"] = nxt
+                save_engine_runtime(self.home, runtime)
+            elif probe_errors and parse_iso(nxt) < existing:
+                runtime["probe_after"] = nxt
+                save_engine_runtime(self.home, runtime)
         elif not below and runtime.get("probe_after"):
             runtime.pop("probe_after", None)
             save_engine_runtime(self.home, runtime)
@@ -4012,7 +4031,7 @@ class Supervisor:
         now = self.clock_dt()
         resets = []
         for text in errors:
-            m = re.search(r'\bresets?\s*:?\s+(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d))', str(text or ''), re.I)
+            m = re.search(r'\bresets?\b\s*:?\s*(?:at\s+)?(\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d))', str(text or ''), re.I)
             if m:
                 try:
                     at = _dt.datetime.fromisoformat(m.group(1).replace(' ', 'T').replace('Z', '+00:00'))

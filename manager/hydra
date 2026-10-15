@@ -230,14 +230,22 @@ def cmd_attach(home, args):
     cfg = S.load_config(home)
     engines = S.default_engines(home, cfg)
     engine = S.current_engine(home)
-    if engine not in engines or engine == "codex":
-        engine = next((n for n in S.ENGINE_ORDER if n in engines and n != "codex"), engine)
-    spec = engines[engine]
+    ladder = S.manager_ladder(cfg, S.load_models(home), engines)
     try:  # loops/b12.md requirement 2: never attach to a pair outside the engine_policy ladder
-        S.enforce_engine_policy(S.read_engine(home, engines), S.manager_ladder(cfg, S.load_models(home), engines))
+        S.enforce_engine_policy(S.read_engine(home, engines), ladder)
     except S.BadEngine as e:
         print(f"cannot attach: {e}", file=sys.stderr)
         return 2
+    attach_model = None
+    if engine not in engines or engine == "codex":
+        # the interactive session is a Claude one: the first Claude step of the ladder in force, never a pair
+        # outside it (a narrowed engine_policy may exclude an account or the family default model)
+        step = next((s for s in S.ladder_steps(ladder, engines) if S.family_of(s[1], engines) == "claude"), None)
+        if step is None:
+            print("cannot attach: the manager ladder in force has no Claude step", file=sys.stderr)
+            return 2
+        engine, attach_model = step[1], step[2]
+    spec = engines[engine]
     sup = S.Supervisor(home=home, engines=engines, poster=lambda *a: None, config=cfg)
     me = who()
     started = time.time()
@@ -253,7 +261,7 @@ def cmd_attach(home, args):
         # joins the conversation the supervisor was really running, never one read before it existed.
         sid = sup.session_id()
         pair = S.read_engine(home, engines)
-        model = pair["model"] if pair["acc"] == engine else S.family_default_model("claude", sup.models)
+        model = pair["model"] if pair["acc"] == engine else (attach_model or S.family_default_model("claude", sup.models))
         argv = [spec["bin"]] + (["--resume", sid] if sid else []) + ["--model", model] + list(args)
         _park_persistent(home)
         child = subprocess.Popen(argv, env=sup.engine_env(spec), cwd=home)

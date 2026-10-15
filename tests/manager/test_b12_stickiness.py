@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -252,3 +253,156 @@ def test_preserve_populated_runtime_with_policy_line(tmp_path, monkeypatch, acti
     if active:
         assert 'since 2026-10-14 15:00:00 PDT' in S.status_text(home)
         assert S.status_text(home).splitlines()[0].startswith('engine: configured claude-r2d2 (claude-fable-5-1)')
+
+
+# ---- review of build PR #77 (manager, 2026-10-15): six fixes, each with its regression
+
+
+def test_probe_hold_reaches_the_tiers_above_only_after_everything_below_failed(home, tmp_path):
+    """#77 F3: inside the hour the turn starts at the effective pair and walks toward the floor; when every step at
+    or below the effective tier fails, the tiers above are tried before 'all allowed engines failed' is posted."""
+    fk, sup = setup(home, tmp_path, table={f"claude-r2d2|{FABLE}": "credits", f"claude-l|{FABLE}": "credits", f"codex|{ASTRA}": "usage_limit"})
+    queue_event(home, "A")
+    assert sup.run_once() is True and json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-r2d2", "model": OPUS}
+    # the floor dies inside the hour while tier 1 has recovered: the walk reaches it last and moves up
+    fk.table({f"claude-r2d2|{OPUS}": "credits", f"claude-l|{OPUS}": "credits", f"codex|{ASTRA}": "usage_limit"})
+    queue_event(home, "B")
+    assert sup.run_once() is True
+    assert fk.invoked()[4:] == [("claude-r2d2", OPUS), ("claude-l", OPUS), ("claude-r2d2", FABLE)], fk.invoked()[4:]
+    assert not runtime(home).get("active") and len(outbox(home, "fallback ended")) == 1
+    assert not outbox(home, "all allowed engines failed")
+    no_downgrade(home)
+
+
+def test_a_failing_effective_tier_never_postpones_the_configured_tiers_probe(home, tmp_path):
+    """#77 F2: a usage failure of the effective tier (with a far reset time) while moving down to the floor keeps
+    the pending probe of the configured tier; a stated reset can only bring the probe forward."""
+    fk, sup = setup(home, tmp_path, table={f"claude-r2d2|{FABLE}": "credits", f"claude-l|{FABLE}": "credits"})
+    queue_event(home, "A")
+    assert sup.run_once() is True and json.load(open(os.path.join(home, "engine"))) == {"acc": "codex", "model": ASTRA}
+    rt = runtime(home)
+    pending = rt["probe_after"]
+    rt["probe_after"] = S._iso(sup.clock.clock[0] + dt.timedelta(minutes=20))
+    Path(S.engine_runtime_path(home)).write_text(json.dumps(rt))
+    far = S._iso(sup.clock.clock[0] + dt.timedelta(hours=12))
+    original = sup.invoke
+    def invoke(name, spec, message, model, preamble=""):
+        if name == "codex":
+            return 1, "", f"usage limit reached; resets {far}", {}
+        return original(name, spec, message, model, preamble=preamble)
+    sup.invoke = invoke
+    queue_event(home, "B")
+    assert sup.run_once() is True
+    assert fk.invoked()[3:] == [("claude-r2d2", OPUS)], fk.invoked()
+    assert runtime(home)["probe_after"] == S._iso(sup.clock.clock[0] - dt.timedelta(seconds=1) + dt.timedelta(minutes=20)) or \
+        S.parse_iso(runtime(home)["probe_after"]) <= sup.clock.clock[0] + dt.timedelta(minutes=20), runtime(home)
+    assert S.parse_iso(runtime(home)["probe_after"]) < S.parse_iso(far)
+    # a nearer stated reset of a tier above brings the probe forward
+    soon = S._iso(sup.clock.clock[0] + dt.timedelta(minutes=5))
+    fk.table({f"claude-r2d2|{OPUS}": "credits"})
+    def invoke2(name, spec, message, model, preamble=""):
+        if name == "codex":
+            return 1, "", f"usage limit reached; resets {soon}", {}
+        return original(name, spec, message, model, preamble=preamble)
+    sup.invoke = invoke2
+    rt = runtime(home); rt["probe_after"] = S._iso(sup.clock.clock[0] + dt.timedelta(minutes=50)); rt["effective"] = {"acc": "codex", "model": ASTRA}
+    Path(S.engine_runtime_path(home)).write_text(json.dumps(rt))
+    with open(os.path.join(home, "engine"), "w") as f:
+        f.write(json.dumps({"acc": "codex", "model": ASTRA}) + "\n")
+    queue_event(home, "C")
+    assert sup.run_once() is True
+    assert S.parse_iso(runtime(home)["probe_after"]) <= S.parse_iso(soon) + dt.timedelta(seconds=5), runtime(home)
+    no_downgrade(home)
+
+
+def test_the_serving_account_needs_no_verified_sidecar_on_a_probe_turn(home, tmp_path, monkeypatch):
+    """#77 F4: on a probe-due turn the rotation starts at the configured tier, but the account that served (the
+    engine file) and the operator's configured account still run without a verified identity sidecar."""
+    fk, sup = setup(home, tmp_path, engine={"acc": "claude-l", "model": FABLE}, table={f"claude-r2d2|{FABLE}": "credits"})
+    rt = dict(STICKY_RUNTIME, effective={"acc": "claude-l", "model": OPUS}, probe_after="2026-10-11T18:30:00Z")
+    Path(S.engine_runtime_path(home)).write_text(json.dumps(rt))
+    with open(os.path.join(home, "engine"), "w") as f:
+        f.write(json.dumps({"acc": "claude-l", "model": OPUS}) + "\n")
+    monkeypatch.setattr(S, "credential_identity", lambda h, name, spec, observed=None: {"automatic_allowed": False, "mismatch": False})
+    queue_event(home, "A")
+    assert sup.run_once() is True
+    # r2d2 (configured) probed and out; l/fable is the other account of tier 1: unverified -> skipped; codex... no:
+    # the serving account l runs when its own step comes (tier 3 l/opus after codex)
+    # r2d2 (configured, unverified) is probed and out; l (the account that served, unverified) still runs: the
+    # gate is per account, so its tier-1 step serves and the manager moves up
+    assert fk.invoked() == [("claude-r2d2", FABLE), ("claude-l", FABLE)], fk.invoked()
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": FABLE}
+    no_downgrade(home)
+
+
+def test_a_move_up_after_skips_only_persists_and_announces(home, tmp_path, monkeypatch):
+    """#77 F6 (a): a probe that wins on a higher tier after only skipped steps is a move up: engine file, move
+    notice and probe bookkeeping all follow (founder rule 2), even though no persist-worthy failure happened."""
+    fk, sup = setup(home, tmp_path, engine={"acc": "codex", "model": ASTRA})
+    rt = dict(STICKY_RUNTIME, effective={"acc": "codex", "model": ASTRA}, probe_after="2026-10-11T18:30:00Z")
+    Path(S.engine_runtime_path(home)).write_text(json.dumps(rt))
+    real = S.credential_identity
+    monkeypatch.setattr(S, "credential_identity", lambda h, name, spec, observed=None:
+                        {"automatic_allowed": False, "mismatch": True} if name == "claude-r2d2" else real(h, name, spec, observed=observed))
+    queue_event(home, "A")
+    assert sup.run_once() is True
+    assert fk.invoked() == [("claude-l", FABLE)]
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": FABLE}
+    rt = runtime(home)
+    assert rt["active"] and rt["effective"] == {"acc": "claude-l", "model": FABLE} and "probe_after" not in rt
+    assert len(outbox(home, "fallback moved")) == 1 and "MISMATCH" not in engine_line(home)
+    no_downgrade(home)
+
+
+def test_a_stale_engine_file_is_normalised_by_the_turn_that_serves(home, tmp_path):
+    """#77 F6 (b): a pre-b12 engine file outside the ladder is never invoked (frozen) and, once the first ladder
+    step on that account has served, the file names that step, so the status stops reading 'outside the ladder'."""
+    fk, sup = setup(home, tmp_path, engine={"acc": "claude-l", "model": "claude-sonnet-5"})
+    assert "outside the ladder" in policy_line(home)
+    queue_event(home, "A")
+    assert sup.run_once() is True
+    assert fk.invoked() == [("claude-l", FABLE)]
+    assert json.load(open(os.path.join(home, "engine"))) == {"acc": "claude-l", "model": FABLE}
+    assert "outside the ladder" not in policy_line(home) and "MISMATCH" not in engine_line(home)
+    assert not S.read_engine_runtime(home).get("active"), "a normalisation is not a fallback episode"
+    no_downgrade(home)
+
+
+def test_attach_on_a_codex_engine_file_picks_a_claude_step_of_the_ladder_in_force(home, tmp_path):
+    """#77 F5: `hydra attach` with a codex engine file attaches the first Claude step of the ladder in force, never
+    a pair a narrowed engine_policy excludes; with no Claude step it refuses."""
+    d = tmp_path / "att"; d.mkdir()
+    script = d / "claude"
+    script.write_text("#!/usr/bin/env python3\nimport sys, os, json\n"
+                      f"open({str(d / 'calls.jsonl')!r}, 'a').write(json.dumps({{'argv': sys.argv[1:], 'tok': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '')}}) + '\\n')\n")
+    script.chmod(0o755)
+    tokens = {line.split("=", 1)[0]: line.split("=", 1)[1].strip() for name in ("claude-r2d2", "claude-l")
+              for line in open(os.path.join(home, "credentials", f"{name}.env")) if line.startswith("CLAUDE_CODE_OAUTH_TOKEN=")}
+    l_token = open(os.path.join(home, "credentials", "claude-l.env")).read().split("=", 1)[1].strip()
+    cfg = {"dev_channel": "C_DEV", "engines": {"claude-r2d2": {"bin": str(script)}, "claude-l": {"bin": str(script)}},
+           "engine_policy": {"ladder": [{"model": "gpt6", "accounts": ["codex"]}, {"model": "opus5.5", "accounts": ["claude-l"]}]}}
+    with open(os.path.join(home, "config.json"), "w") as f:
+        f.write(json.dumps(cfg))
+    with open(os.path.join(home, "engine"), "w") as f:
+        f.write(json.dumps({"acc": "codex", "model": ASTRA}) + "\n")
+    hydra = os.path.join(os.path.dirname(S.__file__), "hydra")
+    r = subprocess.run([sys.executable, hydra, "attach"], env={**os.environ, "HYDRA_HOME": home}, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    call = json.loads((d / "calls.jsonl").read_text().strip().splitlines()[-1])
+    assert call["argv"][call["argv"].index("--model") + 1] == OPUS and call["tok"] == l_token, call
+    cfg["engine_policy"] = {"ladder": [{"model": "gpt6", "accounts": ["codex"]}]}
+    with open(os.path.join(home, "config.json"), "w") as f:
+        f.write(json.dumps(cfg))
+    r = subprocess.run([sys.executable, hydra, "attach"], env={**os.environ, "HYDRA_HOME": home}, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "no Claude step" in r.stderr, (r.stdout, r.stderr)
+    assert len((d / "calls.jsonl").read_text().strip().splitlines()) == 1, "no process on a refused attach"
+
+
+def test_a_stated_reset_time_may_say_at(home, tmp_path):
+    """#77 F8: `resets at <ISO instant>` and `reset: <ISO instant>` are read like `resets <ISO instant>`."""
+    fk, sup = setup(home, tmp_path)
+    now = sup.clock.clock[0]
+    at = S._iso(now + dt.timedelta(minutes=25))
+    assert sup._next_tier_probe([f"usage limit reached; resets at {at}"]) == at
+    assert sup._next_tier_probe([f"limit reset: {at}"]) == at
+    assert sup._next_tier_probe(["resets 2026-10-11T19:30:00"]) == S._iso(sup.clock.clock[0] + dt.timedelta(seconds=S.TIER_PROBE_S)), "a zone-less instant is ignored"
