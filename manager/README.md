@@ -142,11 +142,37 @@ problem ignores the whole override: the default ladder is in force, one log line
 `engine_policy ignored: <reason>; the default ladder is in force`, and the status line carries the reason.
 `engine_fallback.claude_models` (b7's same-account model retry) is ignored since b12, with one log line.
 
-A turn walks the ladder from the configured primary (the engine file, or the configured pair while a fallback episode
-is active): that step, the other accounts of its tier in listed order, every lower tier toward the floor, then the
-tiers above it from the top, so a deliberately selected lower tier still falls back and still recovers upward. Each
-step runs exactly its model on its account. An engine file outside the ladder (from before b12, or a hand edit) is
-never invoked: the turn starts at the first step on that account, else at tier 1, with a log line.
+A turn walks the ladder from the configured primary (the engine file): that step, the other accounts of its tier in
+listed order, every lower tier toward the floor, then the tiers above it from the top, so a deliberately selected
+lower tier still falls back and still recovers upward. Each step runs exactly its model on its account. An engine
+file outside the ladder (from before b12, or a hand edit) is never invoked: the turn starts at the first step on that
+account, else at tier 1, with a log line.
+
+Five founder rules (2026-10-15) govern a fallback episode:
+
+1. **Stickiness inside the tier.** The account that last worked (the engine file) serves first; a usage failure
+   (`credits`, `usage_limit`, `auth`) on it moves to the other account of the same tier before any lower tier.
+   Only when every account of tier 1 is out does a turn reach Astra, and only when Astra is out does it reach the
+   floor. The operator's pair (`configured` in `engine-runtime.json`) is never rewritten by the fallback.
+2. **Recovery is a move up, not a rewrite.** A success on a higher tier moves the manager back up at once; the
+   configured pair closes the episode (`fallback ended`) and is written back to the engine file; another account of
+   the configured tier becomes the effective pair.
+3. **Hourly re-probe.** While the effective tier is lower than the configured one, the tiers above are tried only
+   when `engine-runtime.json` `probe_after` has passed (the earliest future reset time a failing higher-tier error
+   stated as `resets <ISO instant>`, else one hour, `TIER_PROBE_S` = 3600 s); otherwise the turn starts at the
+   effective pair and walks toward the floor. A missing or unparsable `probe_after` makes the tiers above eligible at
+   once. Any success at or above the configured tier removes `probe_after`.
+4. **Faults never move the manager.** `rate_limit`, `other`, a crash (rc 17) or a timeout (rc 124) stops the walk at
+   that step: nothing is persisted, no tier or account changes, no episode starts; the turn keeps the failed-turn
+   bookkeeping (`logs/retry-after`, failed reaction, events pending) and the retry runs the same engine first. One
+   top-level line per fault episode, `engine fault: tier <k> <acc> (<model>): <what>`, is durable in
+   `logs/fault.json` before it is queued (id `fault-<episode_id>`); the episode ends silently at the next served turn.
+   A CLI or self event gets the same text in its reply file or `logs/self-replies.jsonl`.
+5. **Every switch is announced with its tier.** Besides `fallback started` and `fallback ended`, a change of the
+   effective pair inside an episode queues `fallback moved (episode <id>): tier <k> <acc> (<model>) unavailable
+   (<reason>); now running tier <k> <acc> (<model>)` (id `fallback-<episode_id>-move-<n>`, durable in the runtime
+   file as `pending_notice`/`move_from` until queued). While an episode is active, the first `hydra status` line
+   reads `engine: configured <operator pair>[mode] | effective <engine-file pair> | last turn ran on <runner>`.
 
 `hydra status` shows, right after `engine:`, one line (at most 400 characters):
 `engine policy: floor claude-opus-5-5; active tier 1/3 claude-r2d2 (claude-fable-5-1); ladder claude-fable-5-1
@@ -159,8 +185,9 @@ fallback notices name the tiers: `fallback started (episode <id>): tier 1/3 clau
 When every allowed step fails, nothing is downgraded: the manager posts ONE top-level dev-channel line per
 unavailability episode, `manager unavailable: all allowed engines failed (tier 1 claude-r2d2 (claude-fable-5-1):
 credits; tier 1 claude-l (claude-fable-5-1): credits; tier 2 codex (gpt-6-astra): usage_limit; …)`, each step as
-`credits`, `usage_limit`, `auth`, `rate_limit`, `prompt_too_long`, `crash`/`timeout`, `other: <error>` or
-`skipped: <unverified credential|over budget|identity mismatch|skipped Claude family>`, and retries on the normal
+`credits`, `usage_limit`, `auth`, `prompt_too_long` or
+`skipped: <unverified credential|over budget|identity mismatch|skipped Claude family>` (a `rate_limit`, `other`,
+`crash` or `timeout` step ends the walk with the `engine fault:` line instead, rule 4), and retries on the normal
 five-minute back-off. The episode (`logs/unavailable.json`) ends with the next served turn; a failing retry inside it
 posts nothing more.
 
@@ -176,14 +203,13 @@ untouched. `mode=…` alone is allowed only while the current pair is on the lad
 on an engine file outside it. `status` shows `engine: <acc> (<model>)` and the `engine policy:` line.
 
 Each turn walks the ladder as described above. A budget limit
-or a nonzero exit whose stderr matches quota, usage limit, rate, 401, or 403 causes fallback and persists
-the next successful engine. Other classifiable nonzero exits (including launch failures) also try the next
-engine, but do not persist a switch by themselves. A crash or a turn timeout is different: its disposition is
-uncertain (the request may already have had a real side effect), so the turn stops there instead of trying
-another account, and the triggering event is marked handled with a truthful failure rather than left pending
-for a retry. A successful fallback adds `engine: <name>` to the reply; `hydra logs 3` records the actual engine
-per turn even when no switch occurred. If every engine fails with a classifiable error, events remain pending
-and the supervisor waits five minutes before retrying.
+or a nonzero exit whose stderr matches quota, usage limit, 401, or 403 causes fallback and persists
+the next successful engine. A rate limit, any other nonzero exit (including launch failures), a crash or a turn
+timeout is a fault (rule 4): the turn stops at that step, nothing is persisted, the retry runs the same engine. A
+crash or a timeout keeps its uncertain disposition (the request may already have had a real side effect), so the
+triggering event is marked handled with a truthful failure rather than left pending. A successful fallback adds
+`engine: <name>` to the reply; `hydra logs 3` records the actual engine per turn even when no switch occurred. If
+every engine fails with a usage error, events remain pending and the supervisor waits five minutes before retrying.
 
 A fallback to a different Claude account is refused unless that account's credential carries a verified
 identity sidecar (`<credential.env>.identity.json`; see "Credential identity" below) — the originally selected

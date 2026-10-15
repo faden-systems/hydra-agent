@@ -57,12 +57,16 @@ def test_quota_rotates_persists_and_notes(home, quota_engine, ok_engine, poster)
 
 
 def test_non_quota_failure_tries_next_without_persisting(home, ok_engine, poster, tmp_path):
+    """Rewritten under loops/b12.md requirement 12 (founder rule 4, 2026-10-15): a non-usage failure is a fault.
+    The walk stops at that step, nothing else is tried, nothing is persisted, the event stays pending."""
     d = tmp_path / "crash"; d.mkdir()
     crash = fake_engine(str(d), "crash")
-    queue_event(home, "hello")
+    eid = queue_event(home, "hello")
     assert S.Supervisor(home=home, engines=engines(crash, ok_engine), poster=poster).run_once() is True
-    assert "handled 1 events" in poster.texts and "engine: claude-l" in poster.texts
-    assert engine_acc(home) == "claude-r2d2", "a crash is not a quota switch"
+    assert "handled 1 events" not in poster.texts and "engine: claude-l" not in poster.texts, "the next engine is never tried"
+    assert eid not in S.handled_ids(home), "the event waits for the retry on the same engine"
+    assert engine_acc(home) == "claude-r2d2", "a fault is not a switch"
+    assert any("engine fault: tier 1 claude-r2d2" in it.get("text", "") for it in S.read_outbox(home)), "one top-level fault line"
 
 
 def test_codex_fallback_gets_handoff_and_state_on_stdin(home, quota_engine, poster, tmp_path):
