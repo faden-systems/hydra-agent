@@ -19,6 +19,12 @@ assert changed <= {'manager/supervisor.py','manager/README.md','tests/manager/te
 old=ast.parse(show(base,'manager/supervisor.py'));new=ast.parse(Path('manager/supervisor.py').read_text())
 names=[x.name for x in new.body if isinstance(x,(ast.FunctionDef,ast.ClassDef))]
 assert len(names)==len(set(names)),'duplicate definition'
+for node in new.body:
+ if isinstance(node,ast.FunctionDef) and (node.name=='status_text' or node.name.startswith('_status_')):
+  assert not node.decorator_list,'status decorators execute at import'
+  for default in node.args.defaults+node.args.kw_defaults:
+   if default is not None: ast.literal_eval(default)
+assert ast.dump(next(n for n in old.body if isinstance(n,ast.FunctionDef) and n.name=='status_text').args)==ast.dump(next(n for n in new.body if isinstance(n,ast.FunctionDef) and n.name=='status_text').args),'status signature changed'
 def filtered(tree):
  return [ast.dump(x) for x in tree.body if not (isinstance(x,ast.FunctionDef) and (x.name=='status_text' or x.name.startswith('_status_')))]
 assert filtered(old)==filtered(new),'runtime AST changed or executable statement added'
