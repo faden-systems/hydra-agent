@@ -1481,7 +1481,7 @@ def current_engine(home):
     return read_engine(home)["acc"]
 
 
-def set_engine(home, name, model=None, engines=None, explicit=True, mode=None):
+def set_engine(home, name, model=None, engines=None, explicit=True, mode=None, close_fault=True):
     """Write the JSON engine file; `model` defaults to the family default. Returns the pair written. `explicit`
     (default True) means this is an operator selection: it updates engine-runtime.json's `configured` pair
     (requirement 12, loops/b7.md). Automatic fallback persistence calls this with `explicit=False` so it never
@@ -1498,7 +1498,8 @@ def set_engine(home, name, model=None, engines=None, explicit=True, mode=None):
         runtime = read_engine_runtime(home)
         runtime["configured"] = pair
         save_engine_runtime(home, runtime)
-        _close_fault_episode_file(home)  # loops/b14.md requirement 4: an explicit selection ends a fault episode
+        if close_fault:
+            _close_fault_episode_file(home)  # loops/b14.md requirement 4: an operator's selection ends a fault episode
     return pair
 
 
@@ -1779,10 +1780,21 @@ def _read_fault_file(home):
 
 
 def _close_fault_episode_file(home):
+    """Close an open fault episode from outside a Supervisor (an operator's engine selection, loops/b14.md
+    requirement 4); a line made durable but not yet queued is queued first, never lost."""
     data = _read_fault_file(home)
-    if data.get("episode_id"):
-        data.update({"episode_id": None, "closed_at": now_iso(), "closed_by": "explicit selection"})
-        write_text(os.path.join(home, "logs", "fault.json"), json.dumps(data, indent=1) + "\n")
+    if not data.get("episode_id"):
+        return
+    channel = load_config(home).get("dev_channel") or DEFAULT_DEV_CHANNEL
+    if not data.get("queued"):
+        _queue_notice_once(home, channel, data.get("text") or "", f"fault-{data['episode_id']}")
+        data["queued"] = True
+    if data.get("escalated") and not data.get("escalated_queued"):
+        text = (data.get("text") or "").replace("engine fault: ", "engine fault escalated: ", 1)
+        _queue_notice_once(home, channel, text, f"fault-{data['episode_id']}-escalated")
+        data["escalated_queued"] = True
+    data.update({"episode_id": None, "closed_at": now_iso(), "closed_by": "explicit selection"})
+    write_text(os.path.join(home, "logs", "fault.json"), json.dumps(data, indent=1) + "\n")
 
 
 def _fault_episode_line(home):
@@ -3030,7 +3042,7 @@ class Supervisor:
         AllEnginesFailed carries `reasons`, one `tier <k> <acc> (<model>): <what>` per step in the order tried."""
         if engine_file_is_legacy(self.home):
             pair = read_engine(self.home, self.engines)
-            set_engine(self.home, pair["acc"], pair["model"], self.engines)  # upgrade the one-word file to JSON
+            set_engine(self.home, pair["acc"], pair["model"], self.engines, close_fault=False)  # upgrade the one-word file to JSON
         if "claude_models" in (self.config.get("engine_fallback") or {}):
             _log_once("engine_fallback.claude_models", "engine_fallback.claude_models is ignored since b12; "
                                                        "the manager ladder decides every fallback")
@@ -3070,7 +3082,7 @@ class Supervisor:
         last_reason = None
         fault_state = self._read_fault()
         fault_step = None
-        fault_hold = False  # the faulted step is kept out of this walk: whoever serves is a persisted move
+        fault_hold = False  # the faulted step is kept out of this walk until its probe is due
         if fault_state.get("episode_id") and fault_state.get("escalated") and isinstance(fault_state.get("step"), dict):
             fs = fault_state["step"]
             fault_step = (fs.get("acc"), fs.get("model"))
@@ -3084,12 +3096,13 @@ class Supervisor:
             else:
                 order = rest
                 fault_step = None  # not probed this turn: a fault elsewhere is an ordinary fault
-                fault_hold = True
-                last_reason = fault_state.get("text")
+                fault_hold = True  # whoever serves is a persisted move (the faulted step is on hold)
+                if not episode:
+                    last_reason = fault_state.get("text")  # the reason of the fallback episode this hold opens
         errors, reasons = [], []
         failed_steps = []  # (tier, error) of every failed invocation this turn
         tried_tiers = []
-        persist_switch = False  # a quota, auth or budget move is persisted; a plain or session-level failure is not
+        persist_switch = fault_hold  # a quota, auth or budget move (or a hold) is persisted; a plain or session-level failure is not
         escalating = False  # loops/b14.md requirement 3: the valve is open for this walk (later faults go on too)
         skip_claude = False
 
@@ -3158,18 +3171,20 @@ class Supervisor:
                 restored = bool(runtime.get("episode_id") and runtime.get("active") and isinstance(configured, dict)
                                 and (name, model) == (configured.get("acc"), configured.get("model")))
                 moved_up = eff_tier is not None and tier < eff_tier  # founder rule 2: a success above moves up at once
-                if (persist_switch or restored or moved_up or stale or fault_hold) and (name != pair["acc"] or model != pair["model"]):
+                if (persist_switch or restored or moved_up or stale) and (name != pair["acc"] or model != pair["model"]):
                     # a persist-worthy move, a move up (even after skips only), the configured pair serving again
                     # during an episode (the return must land in the engine file too), or a stale file normalised
                     # to the step that actually served
                     set_engine(self.home, name, model, self.engines, explicit=False)
                 probe_errors = [e for t, e in failed_steps if t < tier]  # errors of the tiers above the winner
                 probed = eff_tier is not None and any(t < eff_tier for t in tried_tiers)
-                self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch or moved_up or fault_hold,
+                self._note_fallback_transition(name, model, started_pair, last_reason, persist_switch or moved_up,
                                                probe_errors=probe_errors, probed=probed)
                 return name, model, out, usage, transition
             classification = classify_engine_error(err)
             record_attempt(self.home, name, model, rc, classification, err, False, retried_resume=self._last_retried_resume)
+            if (name, model) == fault_step and rc not in (17, 124) and classification not in ("other", "rate_limit"):
+                self._fault_probe_consumed()  # loops/b14.md requirement 4: a usage failure on the probe is a probe
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
             failed_steps.append((tier, err or ""))
             log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
@@ -3372,9 +3387,7 @@ class Supervisor:
                         os.waitpid(orphan, 0)  # reap directly: no Popen object survived to do it (same OS
                         # process as a real restart would be a different one; ECHILD there is expected/safe)
                     _bump_restart(self.home, "orphan", "orphan persistent process retired")
-            argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
-                   ["--model", model, "--dangerously-skip-permissions",
-                    "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+            argv = self._claude_argv(spec, model, sid, resume, persistent=True)
             child, last_reason = None, ""
             for _ in range(2):
                 try:
@@ -3387,8 +3400,7 @@ class Supervisor:
                         # loops/b14.md requirement 2 on the persistent path: the id exists, start it with --resume
                         self._mark_session_started(sid)
                         resume, self._last_retried_resume = True, True
-                        argv = [spec["bin"], "-p", "--resume", sid, "--model", model, "--dangerously-skip-permissions",
-                                "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+                        argv = self._claude_argv(spec, model, sid, True, persistent=True)
             if child is None:
                 self._last_startup_failure = last_reason or "persistent start failed twice"
                 return None
@@ -3437,6 +3449,16 @@ class Supervisor:
             runtime["reason"] = ""
             save_engine_runtime(self.home, runtime)
 
+    @staticmethod
+    def _claude_argv(spec, model, sid, resume, persistent=False):
+        """The Claude CLI argv for one start: `--resume <sid>` or `--session-id <sid>`, the model, and the per-turn
+        or persistent (stream-json input) framing. Every start and every retry is built here (loops/b14.md)."""
+        argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
+               ["--model", model, "--dangerously-skip-permissions"]
+        if persistent:
+            argv += ["--input-format", "stream-json"]
+        return argv + ["--output-format", "stream-json", "--verbose"]
+
     def _invoke_per_turn(self, name, spec, message, model):
         """The default, always-available path (requirement 7, loops/b8.md): one process per turn. Unchanged
         from before persistent mode existed, aside from its name."""
@@ -3444,28 +3466,34 @@ class Supervisor:
         resume = bool(sid) and self._session_resumable(sid)
         if not sid:
             sid = str(uuid.uuid4())
-        argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
-               ["--model", model, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
+        argv = self._claude_argv(spec, model, sid, resume)
         rc, out, err = self._run(argv, message, self.engine_env(spec))
-        if rc not in (0, 17, 124) and not resume and SESSION_IN_USE_RE.search((err or "") + "\n" + (out or "")):
+        if rc not in (0, 17, 124) and not resume and self._refused_in_use(out, err):
             # loops/b14.md requirement 2: the id exists after all (the CLI says so): mark it started and retry the
             # same message once with --resume, in this turn; a refused --resume is a fault like any other
             self._mark_session_started(sid)
             self._last_retried_resume = True
-            argv = [spec["bin"], "-p", "--resume", sid, "--model", model, "--dangerously-skip-permissions",
-                    "--output-format", "stream-json", "--verbose"]
-            rc, out, err = self._run(argv, message, self.engine_env(spec))
+            rc, out, err = self._run(self._claude_argv(spec, model, sid, True), message, self.engine_env(spec))
         elif rc != 0 and resume and NO_SESSION_RE.search(err or ""):
             sid = str(uuid.uuid4())
-            argv = [spec["bin"], "-p", "--session-id", sid, "--model", model, "--dangerously-skip-permissions",
-                    "--output-format", "stream-json", "--verbose"]
-            rc, out, err = self._run(argv, message, self.engine_env(spec))
+            rc, out, err = self._run(self._claude_argv(spec, model, sid, False), message, self.engine_env(spec))
         reply, usage, error_text, new_sid = self._parse_claude_output(out)
         if rc != 0 or error_text:
             return (rc or 1), "", self._failure_reason(error_text, out, err), None
         self._mark_session_started(sid)
         write_text(self.path("session-id"), (new_sid or sid) + "\n")
         return rc, reply, err, usage
+
+    def _refused_in_use(self, out, err):
+        """loops/b14.md requirement 2, b8 requirement 8: a `--session-id` start was refused "already in use" when
+        stderr says so, or when stdout says so without any reply having been produced (a refusal, never a turn that
+        ran and merely quoted the message: that one is not replayed)."""
+        if SESSION_IN_USE_RE.search(err or ""):
+            return True
+        if not SESSION_IN_USE_RE.search(out or ""):
+            return False
+        # a turn that ran produces stream-json assistant/result records; a refusal is plain text without them
+        return not re.search(r'"type"\s*:\s*"(assistant|result)"', out or "")
 
     @staticmethod
     def _failure_reason(message, stdout, stderr):
@@ -4696,11 +4724,7 @@ class Supervisor:
         return self.path("logs", "fault.json")
 
     def _read_fault(self):
-        try:
-            data = json.loads(read_text(self.fault_path(), "{}") or "{}")
-        except json.JSONDecodeError:
-            return {}
-        return data if isinstance(data, dict) else {}
+        return _read_fault_file(self.home)
 
     @staticmethod
     def _fault_text(reasons):
@@ -4775,6 +4799,14 @@ class Supervisor:
         log(f"engine fault escalated on tier {tier} {name} ({model}) after {count} faults: {reason}")
         return True
 
+    def _fault_probe_consumed(self):
+        """The faulted step was probed and failed for a usage reason (not a fault): the next probe moves one
+        TIER_PROBE_S out so the step is not re-invoked on every turn while its quota is out."""
+        data = self._read_fault()
+        if data.get("episode_id") and data.get("escalated"):
+            data["probe_after"] = _iso(self.clock_dt() + _dt.timedelta(seconds=TIER_PROBE_S))
+            write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+
     def _fault_probe_due(self, data):
         after = parse_iso(data.get("probe_after"))
         return after is None or self.clock_dt() >= after
@@ -4789,7 +4821,7 @@ class Supervisor:
         if data.get("escalated") and served is not None and (step.get("acc"), step.get("model")) != tuple(served):
             conf = read_engine_runtime(self.home).get("configured")
             conf = (conf.get("acc"), conf.get("model")) if isinstance(conf, dict) else None
-            if conf is not None and tuple(served) != conf:
+            if conf is None or tuple(served) != conf:
                 return  # served by the fallback step: the episode and its probe of the faulted step stay
         if not data.get("queued"):
             self._queue_fault(data)

@@ -317,3 +317,44 @@ def test_the_oct16_episode_line_from_the_real_timeline(home, tmp_path):
     line = S._fault_episode_line(home)
     assert line == f"fault episode: tier 1 claude-l ({FABLE}) since {S._status_pdt(real['since'])}, 235 faults over 1206 min"
     assert line in S.status_text(home)
+
+
+# ---- review of build PR #79 (manager, 2026-10-16)
+
+def test_a_turn_that_ran_and_quoted_the_message_is_not_replayed(home, tmp_path, monkeypatch):
+    """#79 F1: the refusal is recognised on stderr, or on stdout only without assistant/result records; a turn that
+    ran (stream-json records) and merely quoted the message is never retried (b8 requirement 8)."""
+    fk, sup = setup(home, tmp_path)
+    quoted = json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": f"Error: Session ID {SID} is already in use."}]}})
+    assert sup._refused_in_use(quoted, "") is False
+    assert sup._refused_in_use(f"error: session id {SID} IS ALREADY IN USE.\n", "") is True
+    assert sup._refused_in_use("", f"Error: Session ID {SID} is already in use.") is True
+    assert sup._refused_in_use("nothing here", "") is False
+
+
+def test_the_legacy_engine_file_upgrade_keeps_an_escalated_episode(home, tmp_path):
+    """#79 F2: upgrading a one-word engine file is not an operator selection; an open escalated episode and its
+    hold survive it. An operator's selection still closes it, queuing a pending line first (#79 F3)."""
+    fk, sup = _escalate(home, tmp_path)
+    episode = fault(home)["episode_id"]
+    S.set_engine(home, "claude-l", FABLE, fk.engines(), close_fault=False)
+    assert fault(home)["episode_id"] == episode, "the upgrade path keeps the episode"
+    f = fault(home); f["escalated_queued"] = False
+    Path(home, "logs", "fault.json").write_text(json.dumps(f))
+    S.set_engine(home, "claude-l", FABLE, fk.engines())
+    assert fault(home)["episode_id"] is None and fault(home)["escalated_queued"] is True
+    assert len(outbox(home, "engine fault escalated: ")) == 1, "the pending line is queued before the close, never lost"
+
+
+def test_a_probe_that_fails_on_usage_is_consumed(home, tmp_path):
+    """#79 F5: at the hour the faulted step answers 'out of credits': the walk goes on and the next probe moves an
+    hour out, so the step is not re-invoked on every following turn."""
+    fk, sup = _escalate(home, tmp_path)
+    fk.table({f"claude-r2d2|{FABLE}": "credits"})
+    n = len(fk.calls())
+    turn(sup, home, 96)
+    assert fk.invoked()[n:] == [("claude-r2d2", FABLE), ("claude-l", FABLE)]
+    assert S.parse_iso(fault(home)["probe_after"]) > sup.clock.now + dt.timedelta(seconds=3500) and fault(home)["episode_id"]
+    n = len(fk.calls())
+    turn(sup, home, 100)
+    assert fk.invoked()[n:] == [("claude-l", FABLE)], "no re-invocation inside the hour"
