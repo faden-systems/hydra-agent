@@ -60,6 +60,7 @@ for h in ('What changed','Evidence','Open questions'):
 ev=text.split('## Evidence',1)[1].split('\n## ',1)[0]
 assert re.search(r'\b\d+ passed\b',ev),'Evidence lacks a pytest count'
 assert '[b12.acceptance] PASS' in ev and '[b14.acceptance] PASS' in ev,'Evidence lacks the acceptance PASS lines'
+assert '[b14] PASS' in ev or 'exit: first run pending' in ev,'Evidence lacks the exit last line (or the first-run marker)'
 for label,pat in (('Slack id',r'\b[CUW]0[A-Z0-9]{8,}\b'),('token',r'xox[a-z]-|ghp_[A-Za-z0-9]|sk-ant-|CLAUDE_CODE_OAUTH_TOKEN='),('tailnet address',r'\b100\.\d+\.\d+\.\d+\b'),('hostname',r'\b[a-z0-9-]+\.local\b')):
     assert not re.search(pat,text),f'notes contain a {label}'
 print('[b14] notes ok')

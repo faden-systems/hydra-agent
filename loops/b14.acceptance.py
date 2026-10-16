@@ -113,6 +113,8 @@ if behaviour == 'timeout':
     time.sleep(30)                                   # past the harness's engine timeout: rc 124 for the supervisor
 if behaviour == 'crash':
     sys.exit(17)                                     # a process crash after the start: rc 17, uncertain (b8)
+if behaviour == 'crash_in_use':
+    print(in_use); sys.exit(17)                      # the diagnostic on stdout, but an uncertain return code
 if behaviour in ERRORS:
     refuse(ERRORS[behaviour])
 REPLY = 'REPLY: ok\n---HANDOFF---\ntracks: t1\nwaiting on: nobody\nlast decision: none\nnext action: none\nopen question: none'
@@ -821,6 +823,49 @@ def crashes_keep_b8_precedence_inside_the_valve_too():
         no_downgrade(h)
 
 
+PRE_B14_FAULT = {'episode_id': 'f791c1b2-82a7-4bb1-a954-f7c3b8a465d5', 'since': '2026-10-16T00:00:16Z', 'turn': 1773,
+                 'text': f'engine fault: tier 1 claude-r2d2 ({FABLE}): other: {IN_USE}', 'queued': True}  # the appendix shape, no count/last_at/step
+
+
+def a_pre_b14_fault_file_is_adopted_and_escalates():
+    """(v) Review r4 B1: the deployed outage's fault file (no count, last_at or step) is adopted by the next fault on
+    the step it names: the episode id and `since` are kept, the original line is not queued again, the count starts
+    at 1, and the third fault, once the span from the old `since` reaches 1800 s, escalates once."""
+    h, d = home(intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
+    Path(h, 'logs', 'fault.json').write_text(json.dumps(PRE_B14_FAULT, indent=1) + '\n')
+    sup = make(h, d)  # the start-up reconcile must not crash on the old shape nor re-queue the already-queued line
+    check(not notices(h, 'engine fault: ') and fault(h) == PRE_B14_FAULT, f'nothing re-queued, nothing rewritten at start: {fault(h)}')
+    check(not status_lines(h, 'fault episode:'), 'the old shape shows no episode line (no last_at)')
+    turn(sup, h, 0)
+    f = fault(h)
+    check(f.get('episode_id') == PRE_B14_FAULT['episode_id'] and f.get('since') == PRE_B14_FAULT['since'] and f.get('count') == 1
+          and f.get('step') == {'tier': 1, 'acc': 'claude-r2d2', 'model': FABLE} and f.get('last_at'), f'adopted: {f}')
+    check(not notices(h, 'engine fault: ') and engine_file(h)['acc'] == 'claude-r2d2', 'no second fault line, nothing moved')
+    turn(sup, h, 5)
+    check(fault(h).get('count') == 2 and not fault(h).get('escalated'), f'count 2: {fault(h)}')
+    eid = turn(sup, h, 35)
+    check(invoked(d)[-2:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)] and eid in S.handled_ids(h), f'the third fault escalates (the span counts from the old since): {invoked(d)}')
+    f = fault(h)
+    check(f.get('episode_id') == PRE_B14_FAULT['episode_id'] and f.get('escalated') and f.get('count') == 3, f'same episode, escalated: {f}')
+    check(len(notices(h, 'engine fault escalated: ')) == 1 and not notices(h, 'engine fault: ') and engine_file(h)['acc'] == 'claude-l', 'one escalated line, moved')
+    line = status_lines(h, 'fault episode:')
+    check(len(line) == 1 and line[0].startswith(f'fault episode: tier 1 claude-r2d2 ({FABLE}) since {S._status_pdt(PRE_B14_FAULT["since"])}, 3 faults over '), f'status from the adopted episode: {line}')
+    no_downgrade(h)
+
+
+def uncertain_return_codes_never_trigger_the_resume_retry():
+    """(w) Review r4 5.1: rc 17 with the "already in use" diagnostic on stdout, and rc 124, are uncertain failures:
+    no same-turn --resume retry, the walk stops, the request gets its durable disposition."""
+    for behaviour in ('crash_in_use', 'timeout'):
+        h, d = home(intent_started=False), fakes({f'claude-r2d2|{FABLE}': behaviour})
+        sup = make(h, d)
+        eid = turn(sup, h, 0)
+        check(claude_calls(d) == [('claude-r2d2', 'session-id')] and eid in S.handled_ids(h), f'{behaviour}: one call, no retry, disposed: {claude_calls(d)}')
+        check(intent(h)['started'] is False and 'retried_resume' not in attempts(h)[-1], f'{behaviour}: no marker, no retry flag: {attempts(h)[-1]}')
+        check(attempts(h)[-1]['rc'] in (17, 124) and len(notices(h, 'engine fault: ')) == 1, f'{behaviour}: an uncertain fault with one line')
+        no_downgrade(h)
+
+
 SCENARIOS = [incident_2026_10_15_timeout_then_resume, incident_2026_10_14_in_use_retries_resume_in_the_same_turn,
              resume_refusal_is_a_fault_without_a_second_retry, stuck_session_escalates_after_three_faults_over_thirty_minutes,
              escalated_episode_returns_at_the_hourly_probe, a_faulting_probe_keeps_the_effective_pair,
@@ -831,7 +876,8 @@ SCENARIOS = [incident_2026_10_15_timeout_then_resume, incident_2026_10_14_in_use
              a_second_faulting_step_replaces_the_episode, exact_boundary_three_faults_spanning_1800_seconds,
              uncertain_failures_keep_b8_precedence_inside_the_valve, persistent_start_refused_resumes_once_and_stdout_diagnostics_count,
              a_later_step_faulting_inside_the_escalated_walk_is_skipped, transcript_resume_marks_started_before_a_failing_process_on_both_paths,
-             crashes_keep_b8_precedence_inside_the_valve_too]
+             crashes_keep_b8_precedence_inside_the_valve_too, a_pre_b14_fault_file_is_adopted_and_escalates,
+             uncertain_return_codes_never_trigger_the_resume_retry]
 
 
 def main(argv):
