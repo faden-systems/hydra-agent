@@ -98,6 +98,9 @@ LOOP_SLEEP_S = 5
 DEADMAN_S = 1800
 NOTE_EVERY_S = 3600
 RETRY_AFTER_S = 300
+SESSION_IN_USE_RE = re.compile(r"Session ID .* is already in use", re.IGNORECASE)  # loops/b14.md requirement 2
+FAULT_ESCALATE_COUNT = 3  # loops/b14.md requirement 3: faults on the effective engine before the valve opens
+FAULT_ESCALATE_S = 1800  # ... spanning at least this long (seconds, from the episode's `since` to the fault)
 TIER_PROBE_S = 3600  # loops/b12.md (founder rule 3, 2026-10-15): from a lower tier, re-probe the tiers above at most hourly
 ENGINE_TIMEOUT_S = 1800
 DEFAULT_HOME = "/srv/hydra/manager"
@@ -1478,7 +1481,7 @@ def current_engine(home):
     return read_engine(home)["acc"]
 
 
-def set_engine(home, name, model=None, engines=None, explicit=True, mode=None):
+def set_engine(home, name, model=None, engines=None, explicit=True, mode=None, close_fault=True):
     """Write the JSON engine file; `model` defaults to the family default. Returns the pair written. `explicit`
     (default True) means this is an operator selection: it updates engine-runtime.json's `configured` pair
     (requirement 12, loops/b7.md). Automatic fallback persistence calls this with `explicit=False` so it never
@@ -1495,6 +1498,8 @@ def set_engine(home, name, model=None, engines=None, explicit=True, mode=None):
         runtime = read_engine_runtime(home)
         runtime["configured"] = pair
         save_engine_runtime(home, runtime)
+        if close_fault:
+            _close_fault_episode_file(home)  # loops/b14.md requirement 4: an operator's selection ends a fault episode
     return pair
 
 
@@ -1766,6 +1771,49 @@ def _status_context_suffix(home):
     return f' (stale: last Claude turn {when}; {len(subsequent)} turns since on {runner})'
 
 
+def _read_fault_file(home):
+    try:
+        data = json.loads(read_text(os.path.join(home, "logs", "fault.json"), "{}") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _close_fault_episode_file(home):
+    """Close an open fault episode from outside a Supervisor (an operator's engine selection, loops/b14.md
+    requirement 4); a line made durable but not yet queued is queued first, never lost."""
+    data = _read_fault_file(home)
+    if not data.get("episode_id"):
+        return
+    channel = load_config(home).get("dev_channel") or DEFAULT_DEV_CHANNEL
+    if not data.get("queued"):
+        _queue_notice_once(home, channel, data.get("text") or "", f"fault-{data['episode_id']}")
+        data["queued"] = True
+    if data.get("escalated") and not data.get("escalated_queued"):
+        text = (data.get("text") or "").replace("engine fault: ", "engine fault escalated: ", 1)
+        _queue_notice_once(home, channel, text, f"fault-{data['episode_id']}-escalated")
+        data["escalated_queued"] = True
+    data.update({"episode_id": None, "closed_at": now_iso(), "closed_by": "explicit selection"})
+    write_text(os.path.join(home, "logs", "fault.json"), json.dumps(data, indent=1) + "\n")
+
+
+def _fault_episode_line(home):
+    """loops/b14.md requirement 5: `fault episode: tier k acc (model) since <PDT>, N faults over M min[, escalated at
+    <PDT>]` for an open episode whose latest fault is at least FAULT_ESCALATE_S after its start; None otherwise."""
+    data = _read_fault_file(home)
+    if not data.get("episode_id"):
+        return None
+    since, last = _status_timestamp(data.get("since")), _status_timestamp(data.get("last_at"))
+    if since is None or last is None or last - since < FAULT_ESCALATE_S:
+        return None
+    step = data.get("step") if isinstance(data.get("step"), dict) else {}
+    line = (f"fault episode: tier {step.get('tier', '?')} {step.get('acc', '?')} ({step.get('model', '?')}) since "
+            f"{_status_pdt(data.get('since'))}, {int(data.get('count') or 0)} faults over {int((last - since) // 60)} min")
+    if data.get("escalated"):
+        line += f", escalated at {_status_pdt(data.get('escalated_at'))}"
+    return line
+
+
 def status_text(home, repo=None):
     cfg = load_config(home)
     repo = repo or cfg.get("repo")
@@ -1799,6 +1847,9 @@ def status_text(home, repo=None):
         lines.append(f"engine fallback: configured {engine_label(runtime.get('configured') or {})}, "
                      f"effective {engine_label(runtime.get('effective') or {})} (since {_status_pdt(runtime.get('since'))}, "
                      f"{(runtime.get('reason') or '').strip()[:200]})")
+    fault_line = _fault_episode_line(home)
+    if fault_line:
+        lines.append(fault_line)
     pstat = persistent_status(home)
     if cur_pair["mode"] == "persistent" or pstat.get("pid") or pstat.get("state") != "stopped":
         lines.append(f"persistent: {pstat['state']} pid={pstat.get('pid')} "
@@ -2457,12 +2508,16 @@ def _file_digest_or_none(path):
         return None
 
 
-def record_attempt(home, engine, model, rc, classification, reason, success):
+def record_attempt(home, engine, model, rc, classification, reason, success, retried_resume=False):
     """Append one line to `logs/attempts.jsonl` (requirement 11/12, loops/b7.md): every engine attempt, success or
-    failure; only successful turns enter the family-turn ledger. Historical ledger files are never rewritten."""
-    append_jsonl(os.path.join(home, "logs", "attempts.jsonl"),
-                 {"at": now_iso(), "engine": engine, "model": model, "rc": rc, "classification": classification,
-                  "reason": (reason or "")[:FAILURE_REASON_MAX], "success": bool(success)})
+    failure; only successful turns enter the family-turn ledger. Historical ledger files are never rewritten.
+    `retried_resume` (loops/b14.md requirement 2) marks an attempt whose refused `--session-id` start was retried
+    once with `--resume` inside the same turn."""
+    row = {"at": now_iso(), "engine": engine, "model": model, "rc": rc, "classification": classification,
+           "reason": (reason or "")[:FAILURE_REASON_MAX], "success": bool(success)}
+    if retried_resume:
+        row["retried_resume"] = True
+    append_jsonl(os.path.join(home, "logs", "attempts.jsonl"), row)
 
 
 # ----------------------------------------------------------------------------------------------- the supervisor
@@ -2750,7 +2805,7 @@ class Supervisor:
             if getattr(e, "fault", False):
                 text = self._fault_text(getattr(e, "reasons", None))
                 self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
-                self._note_fault(n, text)  # founder rule 4 (2026-10-15): one top-level line per fault episode
+                self._note_fault(n, text, step=getattr(e, "step", None), counted=getattr(e, "counted", False))  # founder rule 4
             else:
                 text = self._unavailable_text(getattr(e, "reasons", None))
                 self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
@@ -2764,7 +2819,7 @@ class Supervisor:
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("logs", "retry-after"))
         self._close_unavailable_episode()  # a turn served by any ladder step ends the unavailability episode
-        self._close_fault_episode()  # and the fault episode (founder rule 4, 2026-10-15)
+        self._close_fault_episode(served=(engine, model))  # and the fault episode (founder rule 4; loops/b14.md req. 4)
         reply, handoff = split_handoff(stdout)
         reply = sanitize_reply(reply)
         if handoff:
@@ -2987,7 +3042,7 @@ class Supervisor:
         AllEnginesFailed carries `reasons`, one `tier <k> <acc> (<model>): <what>` per step in the order tried."""
         if engine_file_is_legacy(self.home):
             pair = read_engine(self.home, self.engines)
-            set_engine(self.home, pair["acc"], pair["model"], self.engines)  # upgrade the one-word file to JSON
+            set_engine(self.home, pair["acc"], pair["model"], self.engines, close_fault=False)  # upgrade the one-word file to JSON
         if "claude_models" in (self.config.get("engine_fallback") or {}):
             _log_once("engine_fallback.claude_models", "engine_fallback.claude_models is ignored since b12; "
                                                        "the manager ladder decides every fallback")
@@ -3022,21 +3077,45 @@ class Supervisor:
         # credential requires it to be verified first.
         current = {pair["acc"]} | ({configured.get("acc")} if episode else set())
         stale = ladder_position(pair, ladder) is None  # a pre-b12 or hand-edited engine file outside the ladder
+        # loops/b14.md requirement 4: an escalated fault episode keeps its faulted step out of the walk until the
+        # hourly probe is due; then that step goes first and the ordinary rotation follows
+        last_reason = None
+        fault_state = self._read_fault()
+        fault_step = None
+        fault_hold = False  # the faulted step is kept out of this walk until its probe is due
+        if fault_state.get("episode_id") and fault_state.get("escalated") and isinstance(fault_state.get("step"), dict):
+            fs = fault_state["step"]
+            fault_step = (fs.get("acc"), fs.get("model"))
+            faulted = [st for st in order if (st[1], st[2]) == fault_step]
+            rest = [st for st in order if (st[1], st[2]) != fault_step]
+            if self._fault_probe_due(fault_state):
+                if not faulted:
+                    faulted = [st for st in ladder_steps(ladder, self.engines) if (st[1], st[2]) == fault_step]
+                order = faulted + rest
+                current = current | {fault_step[0]}
+            else:
+                order = rest
+                fault_step = None  # not probed this turn: a fault elsewhere is an ordinary fault
+                fault_hold = True  # whoever serves is a persisted move (the faulted step is on hold)
+                if not episode:
+                    last_reason = fault_state.get("text")  # the reason of the fallback episode this hold opens
         errors, reasons = [], []
         failed_steps = []  # (tier, error) of every failed invocation this turn
         tried_tiers = []
-        persist_switch = False  # a quota, auth or budget move is persisted; a plain or session-level failure is not
+        persist_switch = fault_hold  # a quota, auth or budget move (or a hold) is persisted; a plain or session-level failure is not
+        escalating = False  # loops/b14.md requirement 3: the valve is open for this walk (later faults go on too)
         skip_claude = False
-        last_reason = None
 
         def failed(uncertain=False):
             exc = AllEnginesFailed(errors, uncertain=uncertain)
             exc.reasons = list(reasons)
             return exc
 
-        def fault(uncertain=False):
+        def fault(uncertain=False, step=None, counted=False):
             exc = EngineFault(errors[-1:], uncertain=uncertain)
             exc.reasons = reasons[-1:]
+            exc.step = step
+            exc.counted = counted  # the valve already counted this fault in the episode
             return exc
         for tier, name, model in order:
             spec = self.engines.get(name) or {}
@@ -3079,9 +3158,10 @@ class Supervisor:
             if family == "codex" and self.codex_flush_due():
                 preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
             tried_tiers.append(tier)
+            self._last_retried_resume = False
             rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
             if rc == 0:
-                record_attempt(self.home, name, model, rc, None, "", True)
+                record_attempt(self.home, name, model, rc, None, "", True, retried_resume=self._last_retried_resume)
                 if family == "claude":
                     self._mark_working(name, model, spec)
                 if transition and transition.get("source_path"):
@@ -3102,7 +3182,9 @@ class Supervisor:
                                                probe_errors=probe_errors, probed=probed)
                 return name, model, out, usage, transition
             classification = classify_engine_error(err)
-            record_attempt(self.home, name, model, rc, classification, err, False)
+            record_attempt(self.home, name, model, rc, classification, err, False, retried_resume=self._last_retried_resume)
+            if (name, model) == fault_step and rc not in (17, 124) and classification not in ("other", "rate_limit"):
+                self._fault_probe_consumed()  # loops/b14.md requirement 4: a usage failure on the probe is a probe
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
             failed_steps.append((tier, err or ""))
             log(f"engine {name} failed rc={rc}: {(err or '').strip()[-200:]}")
@@ -3113,15 +3195,26 @@ class Supervisor:
                 # must never be silently replayed on a different engine within the same turn; the event
                 # layer (turn()/post_unavailable) gives it a durable, truthful failure outcome instead.
                 reasons.append(step + ("crash" if rc == 17 else "timeout"))
-                raise fault(uncertain=True)
+                # loops/b14.md requirement 3: an uncertain failure keeps b8's precedence everywhere -- the walk
+                # stops here without replay or fallback even inside an escalated walk or on a probe; the valve's
+                # bookkeeping (count, escalation, the probe) only changes eligibility for a later turn
+                if escalating:  # a later step inside the escalated walk: the open episode is left untouched
+                    raise fault(uncertain=True, step=None, counted=True)
+                counted = self._fault_valve(tier, name, model, reasons[-1], probe=(name, model) == fault_step)
+                raise fault(uncertain=True, step={"tier": tier, "acc": name, "model": model}, counted=counted)
             if classification == "other":
                 reasons.append(step + "other: " + ((err or "").strip() or f"exit {rc}")[:80])
             else:
                 reasons.append(step + classification)
             if classification in ("other", "rate_limit"):
                 # founder rule 4 (2026-10-15): a non-usage failure never moves the manager down a tier or to
-                # the other account; the same engine is retried on the back-off and the fault is posted.
-                raise fault()
+                # the other account; the same engine is retried on the back-off and the fault is posted --
+                # unless the safety valve of loops/b14.md (requirement 3) is open for this step, or this was
+                # the hourly probe of an escalated episode (requirement 4)
+                if escalating or self._fault_valve(tier, name, model, reasons[-1], probe=(name, model) == fault_step):
+                    persist_switch = escalating = True
+                    continue
+                raise fault(step={"tier": tier, "acc": name, "model": model})
             if classification == "prompt_too_long":
                 skip_claude = True
                 if family == "claude" and self._is_working(name, model, spec):
@@ -3265,7 +3358,7 @@ class Supervisor:
         to the caller. A started child's send() failure (crash/timeout) is reported to the caller directly;
         it is never retried here, so a submitted request can never be silently duplicated (requirement 8)."""
         sid = self.session_id()
-        resume = bool(sid) and self._resume_allowed(sid)
+        resume = bool(sid) and self._session_resumable(sid)
         if not sid:
             sid = str(uuid.uuid4())
         child = self._persistent_child()
@@ -3294,9 +3387,7 @@ class Supervisor:
                         os.waitpid(orphan, 0)  # reap directly: no Popen object survived to do it (same OS
                         # process as a real restart would be a different one; ECHILD there is expected/safe)
                     _bump_restart(self.home, "orphan", "orphan persistent process retired")
-            argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
-                   ["--model", model, "--dangerously-skip-permissions",
-                    "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+            argv = self._claude_argv(spec, model, sid, resume, persistent=True)
             child, last_reason = None, ""
             for _ in range(2):
                 try:
@@ -3305,6 +3396,11 @@ class Supervisor:
                 except _persistent.StartupFailed as e:
                     last_reason = str(e)
                     record_attempt(self.home, name, model, 23, "other", last_reason, False)
+                    if not resume and SESSION_IN_USE_RE.search(last_reason):
+                        # loops/b14.md requirement 2 on the persistent path: the id exists, start it with --resume
+                        self._mark_session_started(sid)
+                        resume, self._last_retried_resume = True, True
+                        argv = self._claude_argv(spec, model, sid, True, persistent=True)
             if child is None:
                 self._last_startup_failure = last_reason or "persistent start failed twice"
                 return None
@@ -3353,27 +3449,51 @@ class Supervisor:
             runtime["reason"] = ""
             save_engine_runtime(self.home, runtime)
 
+    @staticmethod
+    def _claude_argv(spec, model, sid, resume, persistent=False):
+        """The Claude CLI argv for one start: `--resume <sid>` or `--session-id <sid>`, the model, and the per-turn
+        or persistent (stream-json input) framing. Every start and every retry is built here (loops/b14.md)."""
+        argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
+               ["--model", model, "--dangerously-skip-permissions"]
+        if persistent:
+            argv += ["--input-format", "stream-json"]
+        return argv + ["--output-format", "stream-json", "--verbose"]
+
     def _invoke_per_turn(self, name, spec, message, model):
         """The default, always-available path (requirement 7, loops/b8.md): one process per turn. Unchanged
         from before persistent mode existed, aside from its name."""
         sid = self.session_id()
-        resume = bool(sid) and self._resume_allowed(sid)
+        resume = bool(sid) and self._session_resumable(sid)
         if not sid:
             sid = str(uuid.uuid4())
-        argv = [spec["bin"], "-p"] + (["--resume", sid] if resume else ["--session-id", sid]) + \
-               ["--model", model, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"]
+        argv = self._claude_argv(spec, model, sid, resume)
         rc, out, err = self._run(argv, message, self.engine_env(spec))
-        if rc != 0 and resume and NO_SESSION_RE.search(err or ""):
+        if rc not in (0, 17, 124) and not resume and self._refused_in_use(out, err):
+            # loops/b14.md requirement 2: the id exists after all (the CLI says so): mark it started and retry the
+            # same message once with --resume, in this turn; a refused --resume is a fault like any other
+            self._mark_session_started(sid)
+            self._last_retried_resume = True
+            rc, out, err = self._run(self._claude_argv(spec, model, sid, True), message, self.engine_env(spec))
+        elif rc != 0 and resume and NO_SESSION_RE.search(err or ""):
             sid = str(uuid.uuid4())
-            argv = [spec["bin"], "-p", "--session-id", sid, "--model", model, "--dangerously-skip-permissions",
-                    "--output-format", "stream-json", "--verbose"]
-            rc, out, err = self._run(argv, message, self.engine_env(spec))
+            rc, out, err = self._run(self._claude_argv(spec, model, sid, False), message, self.engine_env(spec))
         reply, usage, error_text, new_sid = self._parse_claude_output(out)
         if rc != 0 or error_text:
             return (rc or 1), "", self._failure_reason(error_text, out, err), None
         self._mark_session_started(sid)
         write_text(self.path("session-id"), (new_sid or sid) + "\n")
         return rc, reply, err, usage
+
+    def _refused_in_use(self, out, err):
+        """loops/b14.md requirement 2, b8 requirement 8: a `--session-id` start was refused "already in use" when
+        stderr says so, or when stdout says so without any reply having been produced (a refusal, never a turn that
+        ran and merely quoted the message: that one is not replayed)."""
+        if SESSION_IN_USE_RE.search(err or ""):
+            return True
+        if not SESSION_IN_USE_RE.search(out or ""):
+            return False
+        # a turn that ran produces stream-json assistant/result records; a refusal is plain text without them
+        return not re.search(r'"type"\s*:\s*"(assistant|result)"', out or "")
 
     @staticmethod
     def _failure_reason(message, stdout, stderr):
@@ -3817,6 +3937,17 @@ class Supervisor:
         `--session-id`, never `--resume` (requirement 13)."""
         intent = self._read_rollover_intent()
         return not (intent.get("new_id") == sid and not intent.get("started"))
+
+    def _session_resumable(self, sid):
+        """loops/b14.md requirement 1: a rolled-over id that never started successfully is still resumed when the
+        CLI already created its transcript (a first turn that timed out or died after starting); the marker is
+        set at that moment. Otherwise `_resume_allowed` decides as before (b7 requirement 13)."""
+        if self._resume_allowed(sid):
+            return True
+        if find_claude_transcript(self.path(".claude"), self.home, sid):
+            self._mark_session_started(sid)
+            return True
+        return False
 
     def _mark_session_started(self, sid):
         intent = self._read_rollover_intent()
@@ -4593,11 +4724,7 @@ class Supervisor:
         return self.path("logs", "fault.json")
 
     def _read_fault(self):
-        try:
-            data = json.loads(read_text(self.fault_path(), "{}") or "{}")
-        except json.JSONDecodeError:
-            return {}
-        return data if isinstance(data, dict) else {}
+        return _read_fault_file(self.home)
 
     @staticmethod
     def _fault_text(reasons):
@@ -4608,27 +4735,98 @@ class Supervisor:
         data["queued"] = True
         write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
 
+    def _queue_fault_escalated(self, data):
+        """loops/b14.md requirement 3: the one `engine fault escalated:` line of an episode, durable in the episode
+        (`escalated`) before it is queued and reconciled at start like the fault line."""
+        text = (data.get("text") or "").replace("engine fault: ", "engine fault escalated: ", 1)
+        _queue_notice_once(self.home, self.dev_channel, text, f"fault-{data['episode_id']}-escalated")
+        data["escalated_queued"] = True
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+
     def _reconcile_fault_notice(self):
         data = self._read_fault()
         if data.get("episode_id") and not data.get("queued"):
             self._queue_fault(data)
+        if data.get("episode_id") and data.get("escalated") and not data.get("escalated_queued"):
+            self._queue_fault_escalated(data)
 
-    def _note_fault(self, n, text):
+    def _note_fault(self, n, text, step=None, counted=False):
         data = self._read_fault()
-        if data.get("episode_id"):
+        same = not step or not isinstance(data.get("step"), dict) or \
+            (data["step"].get("acc"), data["step"].get("model")) == (step.get("acc"), step.get("model"))
+        if data.get("episode_id") and same:
+            if not counted:
+                data["count"] = int(data.get("count") or 0) + 1  # loops/b14.md requirement 3: consecutive faults on the step
+                data["last_at"] = self.now()
+                if step and not isinstance(data.get("step"), dict):
+                    data["step"] = step  # a pre-b14 episode (no step/count) is adopted by this fault; `since` is kept
+                write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
             if not data.get("queued"):
                 self._queue_fault(data)
             return  # the same fault repeating inside the episode posts nothing more
-        data = {"episode_id": str(uuid.uuid4()), "since": self.now(), "turn": n, "text": text, "queued": False}
+        now = self.now()
+        data = {"episode_id": str(uuid.uuid4()), "since": now, "last_at": now, "count": 1, "turn": n, "text": text,
+                "step": step, "queued": False}
         write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
         self._queue_fault(data)
 
-    def _close_fault_episode(self):
+    def _fault_valve(self, tier, name, model, reason, probe=False):
+        """loops/b14.md requirements 3 and 4, called at a fault on (name, model). True when the walk must go on
+        instead of stopping: the hourly probe of an escalated episode faulted again (count grows, the next probe
+        moves an hour out, nothing is posted), or this fault opens the valve (the episode on this step already
+        spans FAULT_ESCALATE_S and this fault makes FAULT_ESCALATE_COUNT): the episode is marked escalated, its
+        probe scheduled, and the one `engine fault escalated:` line queued. False keeps founder rule 4."""
+        data = self._read_fault()
+        step = data.get("step") if isinstance(data.get("step"), dict) else {}
+        same = bool(data.get("episode_id")) and (step.get("acc"), step.get("model")) == (name, model)
+        now = self.clock_dt()
+        if probe and same and data.get("escalated"):
+            data.update({"count": int(data.get("count") or 0) + 1, "last_at": self.now(),
+                         "probe_after": _iso(now + _dt.timedelta(seconds=TIER_PROBE_S))})
+            write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+            return True
+        if not same or data.get("escalated"):
+            return False
+        since = parse_iso(data.get("since"))
+        count = int(data.get("count") or 0) + 1
+        if since is None or count < FAULT_ESCALATE_COUNT or (now - since).total_seconds() < FAULT_ESCALATE_S:
+            return False
+        data.update({"count": count, "last_at": self.now(), "escalated": True, "escalated_at": self.now(),
+                     "escalated_queued": False, "probe_after": _iso(now + _dt.timedelta(seconds=TIER_PROBE_S)),
+                     "step": {"tier": tier, "acc": name, "model": model}})
+        write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+        self._queue_fault_escalated(data)
+        log(f"engine fault escalated on tier {tier} {name} ({model}) after {count} faults: {reason}")
+        return True
+
+    def _fault_probe_consumed(self):
+        """The faulted step was probed and failed for a usage reason (not a fault): the next probe moves one
+        TIER_PROBE_S out so the step is not re-invoked on every turn while its quota is out."""
+        data = self._read_fault()
+        if data.get("episode_id") and data.get("escalated"):
+            data["probe_after"] = _iso(self.clock_dt() + _dt.timedelta(seconds=TIER_PROBE_S))
+            write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+
+    def _fault_probe_due(self, data):
+        after = parse_iso(data.get("probe_after"))
+        return after is None or self.clock_dt() >= after
+
+    def _close_fault_episode(self, served=None):
+        """A served turn closes the fault episode -- unless the episode is escalated and the turn was served by
+        another step (loops/b14.md requirement 4: the episode stays open until the faulted step serves again)."""
         data = self._read_fault()
         if not data.get("episode_id"):
             return
+        step = data.get("step") if isinstance(data.get("step"), dict) else {}
+        if data.get("escalated") and served is not None and (step.get("acc"), step.get("model")) != tuple(served):
+            conf = read_engine_runtime(self.home).get("configured")
+            conf = (conf.get("acc"), conf.get("model")) if isinstance(conf, dict) else None
+            if conf is None or tuple(served) != conf:
+                return  # served by the fallback step: the episode and its probe of the faulted step stay
         if not data.get("queued"):
             self._queue_fault(data)
+        if data.get("escalated") and not data.get("escalated_queued"):
+            self._queue_fault_escalated(data)
         data.update({"episode_id": None, "closed_at": self.now()})
         write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
 
@@ -5207,6 +5405,9 @@ class Supervisor:
         payload = {"text": text or ("timer: " + TIMER_BARE_REASON), "instructs": False}
         if digest:
             payload["digest"] = True
+            fault_line = _fault_episode_line(self.home)  # loops/b14.md requirement 5: the digest names it
+            if fault_line:
+                payload["text"] = payload["text"] + "\n" + fault_line
             payload["channel"] = load_config(self.home).get("dev_channel") or self.dev_channel
         return append_event(self.home, new_event("timer", payload, event_id=eid))
 

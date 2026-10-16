@@ -174,6 +174,28 @@ Five founder rules (2026-10-15) govern a fallback episode:
    file as `pending_notice`/`move_from` until queued). While an episode is active, the first `hydra status` line
    reads `engine: configured <operator pair>[mode] | effective <engine-file pair> | last turn ran on <runner>`.
 
+The session-in-use repair and the safety valve (loops/b14.md, founder 2026-10-16). Two outages came from the same
+place: after a context rollover the first turn on the new id timed out after the CLI had created the transcript,
+`rollover-intent.json` kept `started: false`, and every later call used `--session-id` on an id that already
+existed. Now: (1) before a `--session-id` start the supervisor looks for the transcript
+`$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<id>.jsonl`; when it exists the id is marked started and `--resume` is
+used, on both invocation paths; (2) a `--session-id` start refused with `Session ID ... is already in use` is
+retried once in the same turn with `--resume` (the attempt row carries `retried_resume: true`); a refused
+`--resume` is a fault like any other. (3) The valve on rule 4: `logs/fault.json` counts the consecutive faults on
+its step (`count`, `last_at`, `step`); when a fault arrives with the episode at least 30 minutes old
+(`FAULT_ESCALATE_S`) and this fault making three (`FAULT_ESCALATE_COUNT`), the walk goes on as for a quota failure
+(the other account of the tier, Astra, Opus 5.5 at the floor, never below), the move is persisted like any
+fallback, one top-level line `engine fault escalated: tier <k> <acc> (<model>): <what>` is posted (durable in the
+episode before it is queued), and the episode stays open with `probe_after` one hour out. (4) While it is open the
+faulted step is left out of the walk until `probe_after` passes; then it goes first: a success there, a success on
+the configured pair, or an explicit `engine` selection closes the episode; a fault on the probe keeps the
+effective pair and moves the probe another hour. A fault on a different step while an escalated episode is open
+replaces the episode (count 1 under rule 4). (5) `hydra status` prints `fault episode: tier <k> <acc> (<model>)
+since <PDT>, <count> faults over <minutes> min[, escalated at <PDT>]` for an open episode whose latest fault is at
+least 30 minutes after its start, and the daily digest timer event carries the same line as its second line: the
+manager's daily digest must name any such episode.
+The daily digest must name every open fault episode spanning at least 30 minutes.
+
 `hydra status` shows, right after `engine:`, one line (at most 400 characters):
 `engine policy: floor claude-opus-5-5; active tier 1/3 claude-r2d2 (claude-fable-5-1); ladder claude-fable-5-1
 [claude-r2d2, claude-l] > gpt-6-astra [codex] > claude-opus-5-5 [claude-r2d2, claude-l]`. The active pair is the
