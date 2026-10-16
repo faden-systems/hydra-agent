@@ -70,7 +70,7 @@ cfg = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude'))
 project = cfg / 'projects' / os.getcwd().replace('/', '-')   # where Claude Code keeps this cwd's sessions
 transcript = project / (sid + '.jsonl')
 existed = transcript.exists()
-msg = sys.stdin.read() if not sys.stdin.isatty() else ''
+msg = '<persistent start>' if '--input-format' in argv else (sys.stdin.read() if not sys.stdin.isatty() else '')
 with open(D / 'calls.jsonl', 'a') as f:
     f.write(json.dumps({'acc': acc, 'model': model, 'argv': argv, 'resume': resume, 'sid': sid, 'transcript_existed': existed,
                         'behaviour': behaviour, 'stdin': msg[:200]}) + '\n')
@@ -92,7 +92,25 @@ if behaviour == 'timeout':
     time.sleep(30)                                   # past the harness's engine timeout: rc 124 for the supervisor
 if behaviour in ERRORS:
     refuse(ERRORS[behaviour])
-print('REPLY: ok\n---HANDOFF---\ntracks: t1\nwaiting on: nobody\nlast decision: none\nnext action: none\nopen question: none')
+REPLY = 'REPLY: ok\n---HANDOFF---\ntracks: t1\nwaiting on: nobody\nlast decision: none\nnext action: none\nopen question: none'
+if '--input-format' not in argv:
+    print(REPLY)
+    sys.exit(0)
+print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': sid}), flush=True)   # the persistent child
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    env = json.loads(line)
+    content = env.get('message', {}).get('content')
+    text = content if isinstance(content, str) else ''.join(c.get('text', '') for c in content or [])
+    with open(D / 'calls.jsonl', 'a') as f:
+        f.write(json.dumps({'acc': acc, 'model': model, 'argv': argv, 'resume': resume, 'sid': sid, 'transcript_existed': existed,
+                            'behaviour': behaviour, 'stdin': text[:200], 'persistent_turn': True}) + '\n')
+    usage = {'input_tokens': 100, 'cache_creation_input_tokens': 1000, 'cache_read_input_tokens': 5000, 'output_tokens': 50}
+    print(json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'usage': usage, 'content': [{'type': 'text', 'text': REPLY}]}}), flush=True)
+    print(json.dumps({'type': 'result', 'subtype': 'success', 'result': REPLY, 'session_id': sid,
+                      'usage': {'input_tokens': 300, 'cache_creation_input_tokens': 3000, 'cache_read_input_tokens': 15000, 'output_tokens': 150}}), flush=True)
 '''
 
 FAKE_CODEX = r'''#!/usr/bin/env python3
@@ -141,11 +159,19 @@ def calls(d):
 
 
 def invoked(d):
-    return [(c['acc'], c['model']) for c in calls(d)]
+    return [(c['acc'], c['model']) for c in calls(d) if not c.get('persistent_turn')]
+
+
+def transcript_path(h, sid=SID):
+    return Path(h, '.claude', 'projects', os.path.abspath(h).replace('/', '-'), f'{sid}.jsonl')
+
+
+class SimulatedCrash(BaseException):
+    pass
 
 
 def claude_calls(d):
-    return [(c['acc'], 'resume' if c['resume'] else 'session-id') for c in calls(d) if c['acc'] != 'codex']
+    return [(c['acc'], 'resume' if c['resume'] else 'session-id') for c in calls(d) if c['acc'] != 'codex' and not c.get('persistent_turn')]
 
 
 class Poster:
@@ -242,6 +268,7 @@ def incident_2026_10_15_timeout_then_resume():
     check(intent(h)['started'] is False, 'a timed-out start proves nothing by itself: the marker stays false')
     check(S.find_claude_transcript(os.path.join(h, '.claude'), h, SID), 'the fake must have created the transcript (as the CLI does)')
     check(len(notices(h, 'engine fault: ')) == 1, 'the timeout is a fault with one line')
+    check(eid in S.handled_ids(h), 'b8 unchanged: the timed-out request keeps its durable disposition and is never replayed')
     set_table(d, {})
     eid2 = turn(sup, h, 5)
     check(claude_calls(d)[1:] == [('claude-r2d2', 'resume')], f'the next turn must resume the existing transcript: {claude_calls(d)}')
@@ -285,17 +312,21 @@ def resume_refusal_is_a_fault_without_a_second_retry():
     no_downgrade(h)
 
 
-def _stuck_r2d2():
-    """A home whose configured r2d2 session nothing can enter (the 2026-10-16 shape)."""
-    h, d = home(intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
+def _stuck_r2d2(mode=None):
+    """A home whose configured r2d2 session nothing can enter (the 2026-10-16 shape); `mode` adds the explicitly
+    set mode key of b8 requirement 7 to the engine file."""
+    engine = {'acc': 'claude-r2d2', 'model': FABLE}
+    if mode:
+        engine['mode'] = mode
+    h, d = home(engine=engine, intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
     return h, d, make(h, d)
 
 
-def stuck_session_escalates_after_three_faults_over_thirty_minutes():
+def stuck_session_escalates_after_three_faults_over_thirty_minutes(mode=None):
     """(d) Faults at 0, 5 and 10 minutes change nothing; the fault at 35 minutes (count 4, span 35 min) escalates:
     the walk continues to the other Fable account, one `engine fault escalated` line, the move persisted, the
     fault episode open with a probe one hour out."""
-    h, d, sup = _stuck_r2d2()
+    h, d, sup = _stuck_r2d2(mode)
     before = Path(h, 'engine').read_bytes()
     for m in (0, 5, 10):
         turn(sup, h, m)
@@ -307,9 +338,10 @@ def stuck_session_escalates_after_three_faults_over_thirty_minutes():
     eid = turn(sup, h, 35)
     check(invoked(d)[-2:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'the escalated walk continues to the other Fable account: {invoked(d)[-3:]}')
     check(eid in S.handled_ids(h), 'the escalated walk serves the event')
-    check(engine_file(h) == {'acc': 'claude-l', 'model': FABLE}, f'the move is persisted: {engine_file(h)}')
+    check(engine_file(h) == dict({'acc': 'claude-l', 'model': FABLE}, **({'mode': mode} if mode else {})), f'the move is persisted (mode kept): {engine_file(h)}')
     rt = S.read_engine_runtime(h)
-    check(rt.get('active') and rt.get('configured') == {'acc': 'claude-r2d2', 'model': FABLE} and rt.get('effective') == {'acc': 'claude-l', 'model': FABLE}, f'fallback episode: {rt}')
+    check(rt.get('active') and {k: rt.get('configured', {}).get(k) for k in ('acc', 'model')} == {'acc': 'claude-r2d2', 'model': FABLE}
+          and {k: rt.get('effective', {}).get(k) for k in ('acc', 'model')} == {'acc': 'claude-l', 'model': FABLE}, f'fallback episode: {rt}')
     check(len(notices(h, 'fallback started')) == 1, 'one fallback started line')
     esc = notices(h, 'engine fault escalated: ')
     check(len(esc) == 1 and esc[0].get('thread_ts') is None and esc[0].get('channel') == 'C_DEV'
@@ -324,10 +356,10 @@ def stuck_session_escalates_after_three_faults_over_thirty_minutes():
     return h, d, sup
 
 
-def escalated_episode_returns_at_the_hourly_probe():
+def escalated_episode_returns_at_the_hourly_probe(mode=None):
     """(e) Inside the hour the faulted step is never called; at the hour the probe serves on the configured pair:
     fallback ended, engine file restored, fault episode closed."""
-    h, d, sup = stuck_session_escalates_after_three_faults_over_thirty_minutes()
+    h, d, sup = stuck_session_escalates_after_three_faults_over_thirty_minutes(mode)
     n = len(calls(d))
     turn(sup, h, 40)
     turn(sup, h, 80)
@@ -337,7 +369,7 @@ def escalated_episode_returns_at_the_hourly_probe():
     eid = turn(sup, h, 96)
     check(invoked(d)[n:] == [('claude-r2d2', FABLE)], f'at the hour the faulted step is probed first and serves: {invoked(d)[n:]}')
     check(claude_calls(d)[-1] == ('claude-r2d2', 'resume'), 'the probe resumes the existing session')
-    check(eid in S.handled_ids(h) and engine_file(h) == {'acc': 'claude-r2d2', 'model': FABLE}, f'the return lands in the engine file: {engine_file(h)}')
+    check(eid in S.handled_ids(h) and engine_file(h) == dict({'acc': 'claude-r2d2', 'model': FABLE}, **({'mode': mode} if mode else {})), f'the return lands in the engine file: {engine_file(h)}')
     check(not S.read_engine_runtime(h).get('active') and len(notices(h, 'fallback ended')) == 1, 'fallback ended once')
     check(fault(h).get('episode_id') is None and fault(h).get('closed_at'), f'fault episode closed: {fault(h)}')
     check(len(notices(h, 'engine fault escalated: ')) == 1, 'no second escalated line')
@@ -392,13 +424,16 @@ def escalation_walks_the_ladder_never_below_the_floor():
 def long_episode_shows_in_status_and_the_digest_event():
     """(h) Two faults 35 minutes apart (count 2: no escalation) show the status line and the digest event line;
     29 minutes apart show nothing; a served turn removes it."""
+    h0, d0, sup0 = _stuck_r2d2()
+    turn(sup0, h0, 0)
+    turn(sup0, h0, 29)
+    check(not status_lines(h0, 'fault episode:'), 'nothing before thirty minutes')
+    sup0.add_timer_event(now=time.time(), text='timer: daily digest', digest=True)
+    ev = [e for e in S.pending_events(h0) if (e.get('payload') or {}).get('digest')]
+    check(ev and 'fault episode' not in (ev[-1]['payload'].get('text') or ''), f'digest event without a short episode: {ev[-1]["payload"] if ev else None}')
+    no_downgrade(h0)
     h, d, sup = _stuck_r2d2()
     turn(sup, h, 0)
-    turn(sup, h, 29)
-    check(not status_lines(h, 'fault episode:'), 'nothing before thirty minutes')
-    sup.add_timer_event(now=time.time(), text='timer: daily digest', digest=True)
-    ev = [e for e in S.pending_events(h) if (e.get('payload') or {}).get('digest')]
-    check(ev and 'fault episode' not in (ev[-1]['payload'].get('text') or ''), f'digest event without a short episode: {ev[-1]["payload"] if ev else None}')
     turn(sup, h, 35)
     f = fault(h)
     check(f.get('count') == 2 and not f.get('escalated') and f.get('episode_id'), f'two faults, not escalated: {f}')
@@ -435,15 +470,135 @@ def below_the_threshold_never_escalates():
     no_downgrade(h2)
 
 
-def explicit_selection_closes_an_escalated_episode():
+def explicit_selection_closes_an_escalated_episode(mode=None):
     """(j) An operator's explicit engine selection during an escalated episode closes it: the next turn runs the
     selected pair and the faulted step is not probed."""
-    h, d, sup = stuck_session_escalates_after_three_faults_over_thirty_minutes()
+    h, d, sup = stuck_session_escalates_after_three_faults_over_thirty_minutes(mode)
     S.set_engine(h, 'claude-l', FABLE, engines(d))
     check(fault(h).get('episode_id') is None, f'the explicit selection closes the fault episode: {fault(h)}')
+    check(engine_file(h) == dict({'acc': 'claude-l', 'model': FABLE}, **({'mode': mode} if mode else {})), f'mode kept: {engine_file(h)}')
     n = len(calls(d))
     turn(sup, h, 100)
     check(invoked(d)[n:] == [('claude-l', FABLE)], f'the selected pair runs, no probe: {invoked(d)[n:]}')
+    no_downgrade(h)
+
+
+def explicit_mode_key_keeps_the_return_and_the_selection_honest():
+    """(k) Review 8.1: with an explicitly set mode key in the engine file (b8 requirement 7), the escalation, the
+    configured pair's return (exactly one `fallback ended`) and the explicit selection behave the same and keep
+    the mode."""
+    escalated_episode_returns_at_the_hourly_probe(mode='per-turn')
+    explicit_selection_closes_an_escalated_episode(mode='per-turn')
+
+
+def escalated_notice_survives_a_crash_before_the_enqueue():
+    """(l) Review 1.1: the process dies after the episode was marked escalated but before its line was queued; the
+    next supervisor's start-up reconcile queues exactly one line with the durable id."""
+    h, d, sup = _stuck_r2d2()
+    for m in (0, 5, 10):
+        turn(sup, h, m)
+    original = S._queue_notice_once
+    reached = []
+    def crash_queue(home_arg, channel, text, note_id):
+        if not note_id.endswith('-escalated'):
+            return original(home_arg, channel, text, note_id)
+        f = fault(h)
+        check(f.get('escalated') is True and f.get('escalated_queued') is False and note_id == f"fault-{f['episode_id']}-escalated",
+              f'the escalation must be durable and unqueued before the enqueue: {f}')
+        reached.append(note_id)
+        raise SimulatedCrash()
+    S._queue_notice_once = crash_queue
+    try:
+        sup.clock.now = T0 + 35 * MIN
+        Path(h, 'logs', 'retry-after').unlink(missing_ok=True)
+        event(h, 'crash')
+        try:
+            sup.run_once()
+        except SimulatedCrash:
+            pass
+    finally:
+        S._queue_notice_once = original
+    check(len(reached) == 1 and not notices(h, 'engine fault escalated'), f'crashed before the enqueue: {reached}')
+    restarted = make(h, d)  # the start-up reconcile finishes the durable, not-yet-queued line
+    esc = notices(h, 'engine fault escalated: ')
+    check(len(esc) == 1 and esc[0].get('id') == reached[0] and fault(h).get('escalated_queued') is True, f'exactly one line after the restart: {esc}')
+    restarted.clock.now = T0 + 36 * MIN
+    eid = turn(restarted, h, 36)
+    check(eid in S.handled_ids(h) and engine_file(h)['acc'] == 'claude-l' and len(notices(h, 'engine fault escalated: ')) == 1,
+          'the restarted supervisor serves on the other account with no second line')
+    no_downgrade(h)
+
+
+def both_probes_due_return_to_a_non_configured_step():
+    """(m) Review 1.2: L serves (r2d2 out of credits) and then gets stuck: the escalation lands on Astra (both the
+    fault probe and rule 3's tier probe are scheduled); at the hour the faulted step L goes first, serves, and the
+    move back is a `fallback moved`; the fault episode closes while the fallback episode stays active."""
+    h, d = home(engine={'acc': 'claude-l', 'model': FABLE}, intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'credits', f'claude-l|{FABLE}': 'stuck'})
+    Path(h, 'engine-runtime.json').write_text(json.dumps({'configured': {'acc': 'claude-r2d2', 'model': FABLE}, 'effective': {'acc': 'claude-l', 'model': FABLE},
+                                                          'episode_id': 'sticky-b14', 'since': '2026-10-15T19:52:43Z', 'reason': 'credits', 'active': True}))
+    sup = make(h, d)
+    for m in (0, 5, 10):
+        turn(sup, h, m)
+    check(all(acc == 'claude-l' for acc, _ in claude_calls(d)), f'only the effective pair before the threshold: {claude_calls(d)}')
+    n = len(calls(d))
+    turn(sup, h, 35)
+    check(invoked(d)[n:] == [('claude-l', FABLE), ('claude-r2d2', FABLE), ('codex', ASTRA)], f'the escalated walk: {invoked(d)[n:]}')
+    check(engine_file(h) == {'acc': 'codex', 'model': ASTRA} and len(notices(h, 'fallback moved')) == 1, f'moved to Astra: {engine_file(h)}')
+    rt, f = S.read_engine_runtime(h), fault(h)
+    check(rt.get('probe_after') and f.get('probe_after') and f.get('escalated'), f'both probes scheduled: {rt} {f}')
+    n = len(calls(d))
+    turn(sup, h, 60)
+    check(invoked(d)[n:] == [('codex', ASTRA)], f'inside the hour only Astra: {invoked(d)[n:]}')
+    set_table(d, {f'claude-r2d2|{FABLE}': 'credits'})  # L recovers, r2d2 still out
+    n = len(calls(d))
+    eid = turn(sup, h, 96)
+    check(invoked(d)[n:] == [('claude-l', FABLE)], f'both probes due: the faulted step goes first and serves: {invoked(d)[n:]}')
+    check(eid in S.handled_ids(h) and engine_file(h) == {'acc': 'claude-l', 'model': FABLE}, f'back on L: {engine_file(h)}')
+    check(len(notices(h, 'fallback moved')) == 2 and notices(h, 'fallback moved')[-1]['text'].endswith(f'now running tier 1/3 claude-l ({FABLE})'), f'the move back: {notices(h, "fallback moved")}')
+    check(fault(h).get('episode_id') is None and S.read_engine_runtime(h).get('active'), 'fault episode closed, fallback episode still active (configured pair out)')
+    no_downgrade(h)
+
+
+def persistent_mode_resumes_an_existing_transcript():
+    """(n) Review 2.2: in persistent mode a not-yet-started id whose transcript exists is started with `--resume`
+    (requirement 1 on the second invocation path); the request is sent to that child and served."""
+    h, d = home(engine={'acc': 'claude-r2d2', 'model': FABLE, 'mode': 'persistent'}, intent_started=False), fakes()
+    tp = transcript_path(h)
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text(json.dumps({'type': 'user', 'sessionId': SID}) + '\n')
+    sup = make(h, d)
+    try:
+        eid = turn(sup, h, 0)
+        starts = [c for c in calls(d) if '--input-format' in c['argv'] and not c.get('persistent_turn')]
+        check(len(starts) == 1 and starts[0]['resume'] is True and starts[0]['sid'] == SID, f'the persistent child resumes the existing transcript: {starts}')
+        check(eid in S.handled_ids(h) and intent(h)['started'] is True, 'served; the marker is set')
+        check(claude_calls(d) == [('claude-r2d2', 'resume')], f'no --session-id start at all: {claude_calls(d)}')
+    finally:
+        sup._retire_persistent('planned', 'harness end')
+    no_downgrade(h)
+
+
+def a_second_faulting_step_replaces_the_episode():
+    """(o) Review 5.1: while an escalated episode (r2d2) is open and L serves, L gets stuck too: its fault opens a
+    new episode on L (count 1, not escalated; the r2d2 probe is dropped and r2d2 rejoins the ordinary rotation);
+    three more faults over thirty minutes escalate L, and the walk reaches r2d2, which has recovered: the configured
+    pair serves, `fallback ended` once, the fault episode closes."""
+    h, d, sup = stuck_session_escalates_after_three_faults_over_thirty_minutes()
+    set_table(d, {f'claude-r2d2|{FABLE}': 'stuck', f'claude-l|{FABLE}': 'stuck'})
+    turn(sup, h, 50)
+    f = fault(h)
+    check(f.get('step', {}).get('acc') == 'claude-l' and f.get('count') == 1 and not f.get('escalated'), f'a new episode on L: {f}')
+    check(engine_file(h)['acc'] == 'claude-l' and len(notices(h, 'engine fault: ')) == 2, 'one new fault line, nothing moved')
+    turn(sup, h, 55)
+    turn(sup, h, 60)
+    check(all(acc == 'claude-l' for acc, _ in claude_calls(d)[-3:]), f'rule 4 on L below the threshold: {claude_calls(d)[-3:]}')
+    set_table(d, {f'claude-l|{FABLE}': 'stuck'})  # r2d2 recovered meanwhile
+    n = len(calls(d))
+    eid = turn(sup, h, 85)
+    check(invoked(d)[n:] == [('claude-l', FABLE), ('claude-r2d2', FABLE)], f'L escalates, the walk reaches r2d2: {invoked(d)[n:]}')
+    check(eid in S.handled_ids(h) and engine_file(h) == {'acc': 'claude-r2d2', 'model': FABLE}, f'home again: {engine_file(h)}')
+    check(len(notices(h, 'fallback ended')) == 1 and not S.read_engine_runtime(h).get('active'), 'fallback ended once')
+    check(fault(h).get('episode_id') is None and len(notices(h, 'engine fault escalated: ')) == 2, f'closed; one escalated line per episode: {fault(h)}')
     no_downgrade(h)
 
 
@@ -451,7 +606,10 @@ SCENARIOS = [incident_2026_10_15_timeout_then_resume, incident_2026_10_14_in_use
              resume_refusal_is_a_fault_without_a_second_retry, stuck_session_escalates_after_three_faults_over_thirty_minutes,
              escalated_episode_returns_at_the_hourly_probe, a_faulting_probe_keeps_the_effective_pair,
              escalation_walks_the_ladder_never_below_the_floor, long_episode_shows_in_status_and_the_digest_event,
-             below_the_threshold_never_escalates, explicit_selection_closes_an_escalated_episode]
+             below_the_threshold_never_escalates, explicit_selection_closes_an_escalated_episode,
+             explicit_mode_key_keeps_the_return_and_the_selection_honest, escalated_notice_survives_a_crash_before_the_enqueue,
+             both_probes_due_return_to_a_non_configured_step, persistent_mode_resumes_an_existing_transcript,
+             a_second_faulting_step_replaces_the_episode]
 
 
 def main(argv):
