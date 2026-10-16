@@ -84,9 +84,15 @@ project = cfg / 'projects' / os.getcwd().replace('/', '-')   # where Claude Code
 transcript = project / (sid + '.jsonl')
 existed = transcript.exists()
 msg = '<persistent start>' if '--input-format' in argv else (sys.stdin.read() if not sys.stdin.isatty() else '')
+try:
+    intent_started = json.loads(Path('rollover-intent.json').read_text()).get('started')   # cwd is the home
+except Exception:
+    intent_started = None
+import hashlib
 with open(D / 'calls.jsonl', 'a') as f:
     f.write(json.dumps({'acc': acc, 'model': model, 'argv': argv, 'resume': resume, 'sid': sid, 'transcript_existed': existed,
-                        'behaviour': behaviour, 'stdin': msg[:200]}) + '\n')
+                        'behaviour': behaviour, 'stdin': msg[:200], 'stdin_sha': hashlib.sha256(msg.encode()).hexdigest(),
+                        'intent_started': intent_started}) + '\n')
 ERRORS = {'credits': "You're out of usage credits. Switch to another model to continue.",
           'usage_limit': 'usage limit reached for this account', 'other': 'a plain runtime crash'}
 def refuse(text):
@@ -105,6 +111,8 @@ with open(transcript, 'a') as f:                     # the CLI creates the trans
     f.write(json.dumps({'type': 'user', 'sessionId': sid, 'cwd': os.getcwd()}) + '\n')
 if behaviour == 'timeout':
     time.sleep(30)                                   # past the harness's engine timeout: rc 124 for the supervisor
+if behaviour == 'crash':
+    sys.exit(17)                                     # a process crash after the start: rc 17, uncertain (b8)
 if behaviour in ERRORS:
     refuse(ERRORS[behaviour])
 REPLY = 'REPLY: ok\n---HANDOFF---\ntracks: t1\nwaiting on: nobody\nlast decision: none\nnext action: none\nopen question: none'
@@ -121,7 +129,8 @@ for line in sys.stdin:
     text = content if isinstance(content, str) else ''.join(c.get('text', '') for c in content or [])
     with open(D / 'calls.jsonl', 'a') as f:
         f.write(json.dumps({'acc': acc, 'model': model, 'argv': argv, 'resume': resume, 'sid': sid, 'transcript_existed': existed,
-                            'behaviour': behaviour, 'stdin': text[:200], 'persistent_turn': True}) + '\n')
+                            'behaviour': behaviour, 'stdin': text[:200], 'stdin_sha': hashlib.sha256(text.encode()).hexdigest(),
+                            'persistent_turn': True, 'intent_started': intent_started}) + '\n')
     usage = {'input_tokens': 100, 'cache_creation_input_tokens': 1000, 'cache_read_input_tokens': 5000, 'output_tokens': 50}
     print(json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'usage': usage, 'content': [{'type': 'text', 'text': REPLY}]}}), flush=True)
     print(json.dumps({'type': 'result', 'subtype': 'success', 'result': REPLY, 'session_id': sid,
@@ -293,6 +302,7 @@ def incident_2026_10_15_timeout_then_resume():
     set_table(d, {})
     eid2 = turn(sup, h, 5)
     check(claude_calls(d)[1:] == [('claude-r2d2', 'resume')], f'the next turn must resume the existing transcript: {claude_calls(d)}')
+    check(calls(d)[1]['intent_started'] is True, 'the marker is set before the resumed process starts, not after its success')
     check(eid2 in S.handled_ids(h), 'the resumed turn serves the event')
     check(intent(h)['started'] is True, 'a served turn marks the session started')
     check(attempts(h)[-1]['success'] is True and attempts(h)[-1]['engine'] == 'claude-r2d2', f'success on the same engine: {attempts(h)[-1]}')
@@ -312,6 +322,8 @@ def incident_2026_10_14_in_use_retries_resume_in_the_same_turn():
     check(claude_calls(d) == [('claude-r2d2', 'session-id'), ('claude-r2d2', 'resume')], f'exactly one in-turn retry: {claude_calls(d)}')
     check(calls(d)[0]['transcript_existed'] is False and calls(d)[0]['sid'] == SID_14 == ROWS_OCT14[1]['reason'].split('Session ID ')[1].split(' ')[0],
           'the refusal came without a transcript on disk, on the 2026-10-14 id')
+    check(calls(d)[0]['stdin_sha'] == calls(d)[1]['stdin_sha'] and len(calls(d)[1]['stdin']) > 0, 'the retry carries the identical input')
+    check(calls(d)[1]['intent_started'] is True and calls(d)[0]['intent_started'] is False, 'the marker is set between the refusal and the retry')
     check(eid in S.handled_ids(h), 'the retried turn serves the event')
     rows = attempts(h)
     check(len(rows) == 1 and rows[0]['success'] is True and rows[0].get('retried_resume') is True, f'one attempt row with retried_resume: {rows}')
@@ -377,6 +389,14 @@ def stuck_session_escalates_after_three_faults_over_thirty_minutes(mode=None):
     due = S.parse_iso(f.get('probe_after')) - sup.clock.now
     check(dt.timedelta(seconds=3590) <= due <= dt.timedelta(seconds=3600), f'probe one hour out: {f}')
     check(fault(h).get('probe_after') and 'probe_after' not in rt, 'the same-tier move schedules no tier probe (rule 3 unchanged)')
+    text = S.status_text(h).splitlines()
+    expected = (f"fault episode: tier 1 claude-r2d2 ({FABLE}) since {S._status_pdt(f['since'])}, 4 faults over 35 min, "
+                f"escalated at {S._status_pdt(f['escalated_at'])}")
+    idx = text.index(expected) if expected in text else -1
+    check(idx > 0 and text[idx - 1].startswith('engine fallback: configured claude-r2d2'), f'the complete escalated line right after the fallback line: {text}')
+    sup.add_timer_event(now=time.time(), text='timer: daily digest', digest=True)
+    ev = [e for e in S.pending_events(h) if (e.get('payload') or {}).get('digest')]
+    check(ev and (ev[-1]['payload'].get('text') or '').splitlines() == ['timer: daily digest', expected], f'the digest event carries the escalated line: {ev[-1]["payload"]}')
     no_downgrade(h)
     return h, d, sup
 
@@ -466,10 +486,10 @@ def long_episode_shows_in_status_and_the_digest_event():
     lines = status_lines(h, 'fault episode:')
     since = S._status_pdt(f['since']) if hasattr(S, '_status_pdt') else None
     check(len(lines) == 1 and lines[0] == f'fault episode: tier 1 claude-r2d2 ({FABLE}) since {since}, 2 faults over 35 min', f'status line: {lines} (since {since})')
-    text = S.status_text(h)
-    idx = text.splitlines().index(lines[0])
-    check(idx > 0 and text.splitlines()[idx - 1].startswith(('engine:', 'engine policy:', 'identity:', 'engine fallback:', 'last turn attempts:', 'off configured engine:', 'accounts:')),
-          f'the line sits with the engine diagnostics: {text.splitlines()[max(0, idx - 1)]!r}')
+    text = S.status_text(h).splitlines()
+    idx = text.index(lines[0])
+    check(not any(l.startswith('engine fallback:') for l in text) and text[idx - 1].startswith('identity:'),
+          f'without a fallback episode the line follows the identity line, where the fallback line would be: {text[idx - 1]!r}')
     sup.add_timer_event(now=time.time() + 600, text='timer: daily digest', digest=True)
     ev = [e for e in S.pending_events(h) if (e.get('payload') or {}).get('digest')]
     check(ev and (ev[-1]['payload'].get('text') or '').splitlines()[1:] == [lines[0]], f'the digest event carries the line: {ev[-1]["payload"]}')
@@ -689,6 +709,7 @@ def persistent_start_refused_resumes_once_and_stdout_diagnostics_count():
         check([c['resume'] for c in starts] == [False, True], f'one refused --session-id start, one --resume start: {starts}')
         served = [c for c in calls(d) if c.get('persistent_turn')]
         check(len(served) == 1 and served[0]['resume'] is True and eid in S.handled_ids(h), f'the message is served once, by the resumed child: {served}')
+        check(len(served[0]['stdin']) > 0 and served[0]['intent_started'] is True, 'a real message, after the marker was set')
         rows = attempts(h)
         check(rows[-1]['success'] is True and rows[-1].get('retried_resume') is True and intent(h)['started'] is True, f'success row with retried_resume: {rows}')
     finally:
@@ -698,8 +719,10 @@ def persistent_start_refused_resumes_once_and_stdout_diagnostics_count():
     sup2 = make(h2, d2)
     try:
         eid = turn(sup2, h2, 0)
-        starts = [c for c in calls(d2) if not c.get('persistent_turn')]
-        check(all(c['resume'] for c in starts) and eid not in S.handled_ids(h2), f'a refused --resume start is never retried with --resume again: {starts}')
+        starts = [c for c in calls(d2) if not c.get('persistent_turn') and '--input-format' in c['argv']]
+        check(len(starts) == 2 and all(c['resume'] for c in starts), f"b8's two start attempts, both --resume, none with --session-id: {starts}")
+        per_turn = [c for c in calls(d2) if '--input-format' not in c['argv']]
+        check([c['resume'] for c in per_turn] == [True] and eid not in S.handled_ids(h2), f'the per-turn fallback resumes once and faults; no --resume retry after a refused --resume: {per_turn}')
     finally:
         sup2._retire_persistent('planned', 'harness end')
     no_downgrade(h2)
@@ -707,6 +730,7 @@ def persistent_start_refused_resumes_once_and_stdout_diagnostics_count():
     sup3 = make(h3, d3)
     eid = turn(sup3, h3, 0)
     check(claude_calls(d3) == [('claude-r2d2', 'session-id'), ('claude-r2d2', 'resume')] and eid in S.handled_ids(h3), f'a mixed-case stdout refusal is retried too: {claude_calls(d3)}')
+    check(calls(d3)[0]['stdin_sha'] == calls(d3)[1]['stdin_sha'], 'identical input on the retry')
     no_downgrade(h3)
 
 
@@ -731,6 +755,72 @@ def a_later_step_faulting_inside_the_escalated_walk_is_skipped():
     no_downgrade(h)
 
 
+def transcript_resume_marks_started_before_a_failing_process_on_both_paths():
+    """(t) Review 1.1: with the transcript present the marker is already true when the resumed process starts,
+    even when that process then fails (per-turn: an ordinary fault; persistent: a refused start)."""
+    h, d = home(intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'other'})
+    tp = transcript_path(h)
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text('{}\n')
+    sup = make(h, d)
+    eid = turn(sup, h, 0)
+    check(claude_calls(d) == [('claude-r2d2', 'resume')] and calls(d)[0]['intent_started'] is True and eid not in S.handled_ids(h),
+          f'per-turn: resumed with the marker already set, then faulted: {calls(d)}')
+    no_downgrade(h)
+    h2, d2 = home(engine={'acc': 'claude-r2d2', 'model': FABLE, 'mode': 'persistent'}, intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'other'})
+    tp = transcript_path(h2)
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text('{}\n')
+    sup2 = make(h2, d2)
+    try:
+        turn(sup2, h2, 0)
+        starts = [c for c in calls(d2) if '--input-format' in c['argv']]
+        check(starts and all(c['resume'] and c['intent_started'] is True for c in starts), f'persistent: every start resumes with the marker set: {starts}')
+    finally:
+        sup2._retire_persistent('planned', 'harness end')
+    no_downgrade(h2)
+
+
+def crashes_keep_b8_precedence_inside_the_valve_too():
+    """(u) Review 8.1: rc 17 on the threshold step opens the valve but stops the walk; rc 17 and rc 124 on a later
+    step inside the escalated walk stop it at once (no Astra call, durable disposition, episode untouched); rc 17
+    on the probe stops, counts and reschedules."""
+    h, d = home(intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'crash'})
+    sup = make(h, d)
+    for m in (0, 5, 10):
+        eid = turn(sup, h, m)
+        check(eid in S.handled_ids(h), 'each crashed request is disposed')
+    eid = turn(sup, h, 35)
+    check(len(invoked(d)) == 4 and eid in S.handled_ids(h) and engine_file(h)['acc'] == 'claude-r2d2', f'the crash at the threshold stops the walk: {invoked(d)}')
+    check(fault(h).get('escalated') is True and fault(h).get('count') == 4, f'but opens the valve: {fault(h)}')
+    n = len(calls(d))
+    turn(sup, h, 40)
+    check(invoked(d)[n:] == [('claude-l', FABLE)] and engine_file(h)['acc'] == 'claude-l', 'the next turn moves')
+    n = len(calls(d))
+    eid = turn(sup, h, 100)  # the probe crashes
+    check(invoked(d)[n:] == [('claude-r2d2', FABLE)] and eid in S.handled_ids(h) and fault(h).get('count') == 5
+          and S.parse_iso(fault(h).get('probe_after')) > sup.clock.now + dt.timedelta(seconds=3500), f'probe crash: stop, count, reschedule: {invoked(d)[n:]} {fault(h)}')
+    no_downgrade(h)
+    for later in ('crash', 'timeout'):
+        h, d = home(intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
+        sup = make(h, d)
+        for m in (0, 5, 10):
+            turn(sup, h, m)
+        episode = fault(h)['episode_id']
+        set_table(d, {f'claude-r2d2|{FABLE}': 'stuck', f'claude-l|{FABLE}': later})
+        n = len(calls(d))
+        eid = turn(sup, h, 35)
+        check(invoked(d)[n:] == [('claude-r2d2', FABLE), ('claude-l', FABLE)], f'{later} on the later step stops the walk, no Astra: {invoked(d)[n:]}')
+        check(eid in S.handled_ids(h) and engine_file(h)['acc'] == 'claude-r2d2', f'{later}: durable disposition, nothing persisted')
+        f = fault(h)
+        check(f.get('episode_id') == episode and f.get('step', {}).get('acc') == 'claude-r2d2' and f.get('escalated') and f.get('count') == 4, f'{later}: the episode is untouched: {f}')
+        set_table(d, {f'claude-r2d2|{FABLE}': 'stuck'})  # L works again; r2d2 is on hold until the probe
+        n = len(calls(d))
+        eid = turn(sup, h, 40)
+        check(invoked(d)[n:] == [('claude-l', FABLE)] and eid in S.handled_ids(h) and engine_file(h)['acc'] == 'claude-l', f'{later}: the next turn moves with no replay of the disposed request: {invoked(d)[n:]}')
+        no_downgrade(h)
+
+
 SCENARIOS = [incident_2026_10_15_timeout_then_resume, incident_2026_10_14_in_use_retries_resume_in_the_same_turn,
              resume_refusal_is_a_fault_without_a_second_retry, stuck_session_escalates_after_three_faults_over_thirty_minutes,
              escalated_episode_returns_at_the_hourly_probe, a_faulting_probe_keeps_the_effective_pair,
@@ -740,7 +830,8 @@ SCENARIOS = [incident_2026_10_15_timeout_then_resume, incident_2026_10_14_in_use
              both_probes_due_return_to_a_non_configured_step, persistent_mode_resumes_an_existing_transcript,
              a_second_faulting_step_replaces_the_episode, exact_boundary_three_faults_spanning_1800_seconds,
              uncertain_failures_keep_b8_precedence_inside_the_valve, persistent_start_refused_resumes_once_and_stdout_diagnostics_count,
-             a_later_step_faulting_inside_the_escalated_walk_is_skipped]
+             a_later_step_faulting_inside_the_escalated_walk_is_skipped, transcript_resume_marks_started_before_a_failing_process_on_both_paths,
+             crashes_keep_b8_precedence_inside_the_valve_too]
 
 
 def main(argv):
