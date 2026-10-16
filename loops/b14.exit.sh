@@ -38,8 +38,15 @@ assert ast.literal_eval(consts['TIER_PROBE_S'])==3600,'TIER_PROBE_S changed'
 assert re.search(r'engine fault escalated: ',src),'the escalated line wording is missing (requirement 3)'
 assert re.search(r'fault episode: tier ',src),'the status line wording is missing (requirement 5)'
 readme=Path('manager/README.md').read_text()
-for needle in ('--resume','escalated','fault episode','digest'):
+for needle in ('--resume','engine fault escalated','fault episode:'):
     assert needle in readme,f'README lacks {needle!r}'
+assert 'The daily digest must name every open fault episode spanning at least 30 minutes.' in readme,'README lacks the digest rule (requirement 5)'
+tests=Path('tests/manager/test_b14_session.py')
+assert tests.is_file(),'tests/manager/test_b14_session.py missing (requirement 7)'
+names=[n.name for n in ast.parse(tests.read_text()).body if isinstance(n,ast.FunctionDef) and n.name.startswith('test_')]
+assert len(names)>=12,f'requirement 7 expects the obligations covered; {len(names)} tests found'
+for needle in ('resume','retr','threshold','escalat','probe','status','explicit','floor','oct14','oct16'):
+    assert any(needle in n for n in names),f'no candidate test names {needle!r} (requirement 7)'
 print('[b14] seams present')
 PY
 "$PYTHON" - <<'PY' || fail 'notes gate'

@@ -20,7 +20,20 @@ FABLE, ASTRA, OPUS = 'claude-fable-5-1', 'gpt-6-astra', 'claude-opus-5-5'
 LADDER_PAIRS = {('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA), ('claude-r2d2', OPUS), ('claude-l', OPUS)}
 BELOW = ('claude-sonnet-5', 'claude-haiku-4-5-20251001', 'claude-opus-5', 'gpt-5.6-sol', 'gpt-6.1-sol')
 OLD_ID, SID = '79ef53fc-ccf9-4a02-a47f-9560830630d5', '8a4e6f56-1164-4a91-b014-728c29e353dd'  # the 2026-10-15 incident's ids
+OLD_ID_14, SID_14 = '4e43204c-0000-4000-8000-000000000000', 'ccfd78e6-d585-4715-a07e-dd1b829ed236'  # the 2026-10-14 incident's ids
 IN_USE = f'Error: Session ID {SID} is already in use.'  # the real row text (logs/attempts.jsonl, 2026-10-16)
+# the sanitized rows of both incidents (loops/b14.md appendix): the replays are driven from them
+ROWS_OCT14 = [
+    {'at': '2026-10-14T17:49:23Z', 'engine': 'claude-r2d2', 'model': FABLE, 'rc': 124, 'classification': 'other', 'reason': 'timeout after 1800s', 'success': False},
+    {'at': '2026-10-14T17:54:25Z', 'engine': 'claude-r2d2', 'model': FABLE, 'rc': 1, 'classification': 'other', 'reason': f'Error: Session ID {SID_14} is already in use.', 'success': False},
+    {'at': '2026-10-14T17:54:26Z', 'engine': 'claude-l', 'model': FABLE, 'rc': 1, 'classification': 'other', 'reason': f'Error: Session ID {SID_14} is already in use.', 'success': False},
+    {'at': '2026-10-14T18:07:26Z', 'engine': 'codex', 'model': ASTRA, 'rc': 0, 'classification': None, 'reason': '', 'success': True},
+]
+ROWS_OCT16 = [
+    {'at': '2026-10-16T19:30:26Z', 'engine': 'claude-l', 'model': FABLE, 'rc': 1, 'classification': 'other', 'reason': IN_USE, 'success': False},
+    {'at': '2026-10-16T19:35:35Z', 'engine': 'claude-l', 'model': FABLE, 'rc': 1, 'classification': 'other', 'reason': IN_USE, 'success': False},
+    {'at': '2026-10-16T19:40:44Z', 'engine': 'claude-l', 'model': FABLE, 'rc': 1, 'classification': 'other', 'reason': IN_USE, 'success': False},
+]
 MIN = dt.timedelta(minutes=1)
 HOME_FAKES = {}
 
@@ -34,7 +47,7 @@ def check(cond, msg):
         raise Fail(msg)
 
 
-def home(engine=None, intent_started=False, config=None):
+def home(engine=None, intent_started=False, config=None, sid=SID, old_id=OLD_ID):
     h = tempfile.mkdtemp(prefix='b14-home-')
     for d in ('inbox', 'inbox/files', 'logs', 'credentials', '.claude', 'mirror'):
         os.makedirs(os.path.join(h, d), exist_ok=True)
@@ -46,9 +59,9 @@ def home(engine=None, intent_started=False, config=None):
              'token_sha256': hashlib.sha256(token.encode()).hexdigest(), 'verified_at': '2026-10-04T20:00:00Z',
              'method': 'private-window-and-usage-bar', 'evidence': 'https://example.test/evidence'}))
     Path(h, 'engine').write_text(json.dumps(engine or {'acc': 'claude-r2d2', 'model': FABLE}) + '\n')
-    Path(h, 'session-id').write_text(SID + '\n')
+    Path(h, 'session-id').write_text(sid + '\n')
     # the state both incidents left behind: a rolled-over id whose first turn never succeeded
-    Path(h, 'rollover-intent.json').write_text(json.dumps({'old_id': OLD_ID, 'new_id': SID, 'started': intent_started}) + '\n')
+    Path(h, 'rollover-intent.json').write_text(json.dumps({'old_id': old_id, 'new_id': sid, 'started': intent_started}) + '\n')
     cfg = {'dev_channel': 'C_DEV'}
     cfg.update(config or {})
     Path(h, 'config.json').write_text(json.dumps(cfg))
@@ -83,6 +96,8 @@ if behaviour == 'stuck':
     refuse(in_use)                                   # a session nothing can enter: --session-id and --resume both fail
 if behaviour == 'session_in_use' and not resume:
     refuse(in_use)                                   # refused although no transcript is visible here (2026-10-14 shape)
+if behaviour == 'session_in_use_stdout' and not resume:
+    print('error: session id ' + sid + ' IS ALREADY IN USE.'); sys.exit(1)   # the diagnostic on stdout, mixed case
 if not resume and existed and behaviour not in ERRORS:
     refuse(in_use)                                   # the real collision: --session-id on an id that already exists
 project.mkdir(parents=True, exist_ok=True)
@@ -183,21 +198,23 @@ class Poster:
 
 
 class Clock:
-    def __init__(self, start):
+    def __init__(self, start, frozen=False):
         self.now = start
+        self.frozen = frozen
 
     def __call__(self):
-        self.now = self.now + dt.timedelta(seconds=1)
+        if not self.frozen:
+            self.now = self.now + dt.timedelta(seconds=1)
         return self.now
 
 
 T0 = dt.datetime(2026, 10, 16, 0, 0, 0, tzinfo=dt.timezone.utc)
 
 
-def make(h, d, poster=None):
+def make(h, d, poster=None, frozen=False):
     HOME_FAKES[h] = d
     return S.Supervisor(home=h, engines=engines(d), poster=poster or Poster(), buildlog_poster=Poster(),
-                        clock=Clock(T0), engine_timeout=3)
+                        clock=Clock(T0, frozen=frozen), engine_timeout=3)
 
 
 def event(h, text, thread='1.0', ts=None, instructs=True):
@@ -207,10 +224,12 @@ def event(h, text, thread='1.0', ts=None, instructs=True):
     return ev['id']
 
 
-def turn(sup, h, at_minutes=None, text='go'):
-    """One supervisor turn at the controlled time (minutes after T0); the back-off file is removed first as the
-    scheduler would wait it out."""
-    if at_minutes is not None:
+def turn(sup, h, at_minutes=None, text='go', at_seconds=None):
+    """One supervisor turn at the controlled time (minutes or seconds after T0); the back-off file is removed first
+    as the scheduler would wait it out."""
+    if at_seconds is not None:
+        sup.clock.now = T0 + dt.timedelta(seconds=at_seconds)
+    elif at_minutes is not None:
         sup.clock.now = T0 + at_minutes * MIN
     with_retry = Path(h, 'logs', 'retry-after')
     if with_retry.exists():
@@ -264,7 +283,9 @@ def incident_2026_10_15_timeout_then_resume():
     sup = make(h, d)
     eid = turn(sup, h, 0)
     check(claude_calls(d) == [('claude-r2d2', 'session-id')], f'the first call starts the fresh id: {claude_calls(d)}')
-    check(attempts(h)[-1]['rc'] == 124 and not attempts(h)[-1]['success'], f'the timeout is recorded as rc 124: {attempts(h)}')
+    row = attempts(h)[-1]
+    check((row['rc'], row['classification'], row['success'], row['engine'], row['model']) == (124, 'other', False, 'claude-r2d2', FABLE)
+          and row['reason'].startswith('timeout after '), f'the timeout row has the real row shape {ROWS_OCT14[0]}: {row}')
     check(intent(h)['started'] is False, 'a timed-out start proves nothing by itself: the marker stays false')
     check(S.find_claude_transcript(os.path.join(h, '.claude'), h, SID), 'the fake must have created the transcript (as the CLI does)')
     check(len(notices(h, 'engine fault: ')) == 1, 'the timeout is a fault with one line')
@@ -285,16 +306,17 @@ def incident_2026_10_15_timeout_then_resume():
 def incident_2026_10_14_in_use_retries_resume_in_the_same_turn():
     """(b) `--session-id` refused "already in use" with no transcript visible: the same turn retries once with
     `--resume` and serves; one attempt row, success, retried_resume true; no fault line."""
-    h, d = home(intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'session_in_use'})
+    h, d = home(intent_started=False, sid=SID_14, old_id=OLD_ID_14), fakes({f'claude-r2d2|{FABLE}': 'session_in_use'})
     sup = make(h, d)
     eid = turn(sup, h, 0)
     check(claude_calls(d) == [('claude-r2d2', 'session-id'), ('claude-r2d2', 'resume')], f'exactly one in-turn retry: {claude_calls(d)}')
-    check(calls(d)[0]['transcript_existed'] is False, 'the refusal came without a transcript on disk')
+    check(calls(d)[0]['transcript_existed'] is False and calls(d)[0]['sid'] == SID_14 == ROWS_OCT14[1]['reason'].split('Session ID ')[1].split(' ')[0],
+          'the refusal came without a transcript on disk, on the 2026-10-14 id')
     check(eid in S.handled_ids(h), 'the retried turn serves the event')
     rows = attempts(h)
     check(len(rows) == 1 and rows[0]['success'] is True and rows[0].get('retried_resume') is True, f'one attempt row with retried_resume: {rows}')
     check(intent(h)['started'] is True, 'the retry marks the session started')
-    check(not notices(h, 'engine fault: ') and not Path(h, 'logs', 'fault.json').exists() or fault(h).get('episode_id') is None, 'no fault')
+    check(not notices(h, 'engine fault: ') and (not Path(h, 'logs', 'fault.json').exists() or fault(h).get('episode_id') is None), 'no fault')
     turn(sup, h, 5)
     check(claude_calls(d)[2:] == [('claude-r2d2', 'resume')], 'the next turn resumes directly')
     no_downgrade(h)
@@ -306,6 +328,9 @@ def resume_refusal_is_a_fault_without_a_second_retry():
     sup = make(h, d)
     eid = turn(sup, h, 0)
     check(claude_calls(d) == [('claude-r2d2', 'resume')], f'one call only: {claude_calls(d)}')
+    row = attempts(h)[-1]
+    check((row['rc'], row['classification'], row['reason'], row['success']) == (1, 'other', IN_USE, False) and 'retried_resume' not in row,
+          f'the row reads like the real 2026-10-16 rows {ROWS_OCT16[0]}: {row}')
     check(eid not in S.handled_ids(h) and Path(h, 'logs', 'retry-after').exists(), 'the event waits for the back-off')
     check(len(notices(h, 'engine fault: ')) == 1 and fault(h).get('count') == 1 and fault(h).get('episode_id'), f'fault episode with count 1: {fault(h)}')
     check(engine_file(h)['acc'] == 'claude-r2d2' and not S.read_engine_runtime(h).get('active'), 'nothing moved')
@@ -602,6 +627,110 @@ def a_second_faulting_step_replaces_the_episode():
     no_downgrade(h)
 
 
+def exact_boundary_three_faults_spanning_1800_seconds():
+    """(q) Review 8.1, with a non-advancing clock: three faults spanning exactly 1800 s escalate; three spanning
+    1799 s do not; the third fault alone (count) is not enough at 1800 s with only two faults."""
+    for span, expect in ((1799, False), (1800, True)):
+        h, d = home(intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
+        sup = make(h, d, frozen=True)
+        turn(sup, h, at_seconds=0)
+        turn(sup, h, at_seconds=900)
+        check(fault(h).get('since') == S._iso(T0) and fault(h).get('count') == 2, f'frozen clock: since is exactly T0: {fault(h)}')
+        turn(sup, h, at_seconds=span)
+        check(bool(fault(h).get('escalated')) is expect and (engine_file(h)['acc'] == 'claude-l') is expect,
+              f'span {span}: escalated={fault(h).get("escalated")} engine={engine_file(h)}')
+        no_downgrade(h)
+    h, d = home(intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
+    sup = make(h, d, frozen=True)
+    turn(sup, h, at_seconds=0)
+    turn(sup, h, at_seconds=1800)
+    check(not fault(h).get('escalated') and fault(h).get('count') == 2, 'two faults at 1800 s: the count is short')
+    no_downgrade(h)
+
+
+def uncertain_failures_keep_b8_precedence_inside_the_valve():
+    """(p) Review B1: a timeout on the step whose episode reaches the threshold opens the valve (escalation durable,
+    its line queued) but the walk stops there without replay: the event gets its durable disposition, nothing is
+    persisted this turn; the next turn serves on the other account and persists the move. A timeout on the probe
+    stops the walk the same way, counts, and reschedules the probe."""
+    h, d = home(intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'timeout'})
+    sup = make(h, d)
+    for m in (0, 5, 10):
+        eid = turn(sup, h, m)
+        check(eid in S.handled_ids(h) and claude_calls(d)[-1] == ('claude-r2d2', 'resume'), f'each timed-out request is disposed, never replayed: {claude_calls(d)}')
+    before = Path(h, 'engine').read_bytes()
+    eid = turn(sup, h, 35)
+    check(invoked(d)[-1] == ('claude-r2d2', FABLE) and len(invoked(d)) == 4, f'the walk stops at the uncertain failure even though the valve opened: {invoked(d)}')
+    check(eid in S.handled_ids(h) and Path(h, 'engine').read_bytes() == before, 'durable disposition, nothing persisted this turn')
+    f = fault(h)
+    check(f.get('escalated') is True and f.get('count') == 4 and len(notices(h, 'engine fault escalated: ')) == 1, f'the escalation is durable and announced: {f}')
+    n = len(calls(d))
+    eid = turn(sup, h, 40)
+    check(invoked(d)[n:] == [('claude-l', FABLE)] and eid in S.handled_ids(h) and engine_file(h)['acc'] == 'claude-l', f'the next turn serves on the other account: {invoked(d)[n:]}')
+    check(len(notices(h, 'fallback started')) == 1, 'the move is persisted as a fallback episode')
+    n = len(calls(d))
+    eid = turn(sup, h, 100)  # the probe: r2d2 still times out
+    check(invoked(d)[n:] == [('claude-r2d2', FABLE)] and eid in S.handled_ids(h), f'the probe timeout stops the walk, no replay on L: {invoked(d)[n:]}')
+    f = fault(h)
+    check(f.get('count') == 5 and f.get('escalated') and S.parse_iso(f.get('probe_after')) > sup.clock.now + dt.timedelta(seconds=3500), f'counted and rescheduled: {f}')
+    check(engine_file(h)['acc'] == 'claude-l' and len(notices(h, 'engine fault escalated: ')) == 1, 'effective pair kept, no second line')
+    no_downgrade(h)
+
+
+def persistent_start_refused_resumes_once_and_stdout_diagnostics_count():
+    """(r) Review 8.2: a persistent start refused "already in use" is followed by exactly one --resume start that
+    serves the same message (success row with retried_resume); a refused --resume start is not retried; a
+    per-turn refusal written to stdout in mixed case is recognised too."""
+    h, d = home(engine={'acc': 'claude-r2d2', 'model': FABLE, 'mode': 'persistent'}, intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'session_in_use'})
+    sup = make(h, d)
+    try:
+        eid = turn(sup, h, 0)
+        starts = [c for c in calls(d) if '--input-format' in c['argv'] and not c.get('persistent_turn')]
+        check([c['resume'] for c in starts] == [False, True], f'one refused --session-id start, one --resume start: {starts}')
+        served = [c for c in calls(d) if c.get('persistent_turn')]
+        check(len(served) == 1 and served[0]['resume'] is True and eid in S.handled_ids(h), f'the message is served once, by the resumed child: {served}')
+        rows = attempts(h)
+        check(rows[-1]['success'] is True and rows[-1].get('retried_resume') is True and intent(h)['started'] is True, f'success row with retried_resume: {rows}')
+    finally:
+        sup._retire_persistent('planned', 'harness end')
+    no_downgrade(h)
+    h2, d2 = home(engine={'acc': 'claude-r2d2', 'model': FABLE, 'mode': 'persistent'}, intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
+    sup2 = make(h2, d2)
+    try:
+        eid = turn(sup2, h2, 0)
+        starts = [c for c in calls(d2) if not c.get('persistent_turn')]
+        check(all(c['resume'] for c in starts) and eid not in S.handled_ids(h2), f'a refused --resume start is never retried with --resume again: {starts}')
+    finally:
+        sup2._retire_persistent('planned', 'harness end')
+    no_downgrade(h2)
+    h3, d3 = home(intent_started=False), fakes({f'claude-r2d2|{FABLE}': 'session_in_use_stdout'})
+    sup3 = make(h3, d3)
+    eid = turn(sup3, h3, 0)
+    check(claude_calls(d3) == [('claude-r2d2', 'session-id'), ('claude-r2d2', 'resume')] and eid in S.handled_ids(h3), f'a mixed-case stdout refusal is retried too: {claude_calls(d3)}')
+    no_downgrade(h3)
+
+
+def a_later_step_faulting_inside_the_escalated_walk_is_skipped():
+    """(s) Review 8.3: r2d2 escalates, L returns an ordinary runtime fault inside the same walk, Astra serves; the
+    episode (id and step) is unchanged and both failed attempts are recorded."""
+    h, d = home(intent_started=True), fakes({f'claude-r2d2|{FABLE}': 'stuck'})
+    sup = make(h, d)
+    for m in (0, 5, 10):
+        turn(sup, h, m)
+    episode = fault(h)['episode_id']
+    set_table(d, {f'claude-r2d2|{FABLE}': 'stuck', f'claude-l|{FABLE}': 'other'})
+    n, rows = len(calls(d)), len(attempts(h))
+    eid = turn(sup, h, 35)
+    check(invoked(d)[n:] == [('claude-r2d2', FABLE), ('claude-l', FABLE), ('codex', ASTRA)], f'the walk goes past the later fault: {invoked(d)[n:]}')
+    check(eid in S.handled_ids(h) and engine_file(h) == {'acc': 'codex', 'model': ASTRA}, f'Astra serves and is persisted: {engine_file(h)}')
+    f = fault(h)
+    check(f.get('episode_id') == episode and f.get('step', {}).get('acc') == 'claude-r2d2' and f.get('escalated'), f'the episode is unchanged: {f}')
+    new = attempts(h)[rows:]
+    check([(a['engine'], a['success'], a['classification']) for a in new] == [('claude-r2d2', False, 'other'), ('claude-l', False, 'other'), ('codex', True, None)], f'both failed attempts recorded: {new}')
+    check(len(notices(h, 'engine fault: ')) == 1 and len(notices(h, 'engine fault escalated: ')) == 1, 'no extra fault lines for the later step')
+    no_downgrade(h)
+
+
 SCENARIOS = [incident_2026_10_15_timeout_then_resume, incident_2026_10_14_in_use_retries_resume_in_the_same_turn,
              resume_refusal_is_a_fault_without_a_second_retry, stuck_session_escalates_after_three_faults_over_thirty_minutes,
              escalated_episode_returns_at_the_hourly_probe, a_faulting_probe_keeps_the_effective_pair,
@@ -609,7 +738,9 @@ SCENARIOS = [incident_2026_10_15_timeout_then_resume, incident_2026_10_14_in_use
              below_the_threshold_never_escalates, explicit_selection_closes_an_escalated_episode,
              explicit_mode_key_keeps_the_return_and_the_selection_honest, escalated_notice_survives_a_crash_before_the_enqueue,
              both_probes_due_return_to_a_non_configured_step, persistent_mode_resumes_an_existing_transcript,
-             a_second_faulting_step_replaces_the_episode]
+             a_second_faulting_step_replaces_the_episode, exact_boundary_three_faults_spanning_1800_seconds,
+             uncertain_failures_keep_b8_precedence_inside_the_valve, persistent_start_refused_resumes_once_and_stdout_diagnostics_count,
+             a_later_step_faulting_inside_the_escalated_walk_is_skipped]
 
 
 def main(argv):
