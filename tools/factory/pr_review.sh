@@ -29,8 +29,8 @@ path = sys.argv[1]; pref = tuple(p.strip().rstrip("/") + "/" for p in os.environ
 text = open(path, encoding="utf-8", errors="surrogateescape").read()
 parts = re.split(r"(?m)^(?=diff --git )", text); kept = []; dropped = 0
 for part in parts:
-    m = re.match(r"diff --git a/(\S+)", part)
-    if m and m.group(1).startswith(pref): dropped += 1; continue
+    m = re.match(r"diff --git a/(\S+) b/(\S+)", part)  # both sides: a rename out of (or into) the evidence stays in
+    if m and m.group(1).startswith(pref) and m.group(2).startswith(pref): dropped += 1; continue
     kept.append(part)
 open(path, "w", encoding="utf-8", errors="surrogateescape").write("".join(kept))
 print(dropped)
