@@ -43,7 +43,7 @@ print(dropped)
 PY
 )
   # the exclusion is named only when sections were actually dropped: a claim without a drop would misreport the review
-  [ "${DROPPED:-0}" -gt 0 ] && EXCL="DIFF EXCLUDES ${PR_REVIEW_EXCLUDE} (committed run evidence, not code): ${DROPPED} file section(s) are not in this review"
+  if [ "${DROPPED:-0}" -gt 0 ]; then EXCL="DIFF EXCLUDES ${PR_REVIEW_EXCLUDE} (committed run evidence, not code): ${DROPPED} file section(s) are not in this review"; fi
 fi
 # the diff goes in whole up to DIFF_CAP bytes (the retired job capped at 60 KB; the subscription model takes more); a
 # larger diff is cut there and the cut is named in the prompt and the comment, so a partial review is never read as a full one
