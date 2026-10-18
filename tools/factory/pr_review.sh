@@ -23,6 +23,9 @@ gh pr view "$PR" --repo "$REPO" --json title,body,headRefName,baseRefName,headRe
 git -C "$DIR" fetch -q origin "pull/$PR/head"
 WT="$OUT/worktree"; git -C "$DIR" worktree add -q --detach "$WT" "$HEAD_SHA"
 trap 'git -C "$DIR" worktree remove --force "$WT" >/dev/null 2>&1 || true' EXIT
+# codex loads the checkout's own AGENTS.md (and a .codex/ config) as instructions: a PR could plant them, so the throwaway
+# worktree is stripped of them before the review; the only instructions are the prompt built below
+find "$WT" -name AGENTS.md -type f -delete; rm -rf "$WT/.codex"
 {
   cat "$HERE/pr_review_prompt.txt"
   printf '\n\n## Context\n\nRepository %s, PR #%s.\n\n' "$REPO" "$PR"
