@@ -23,19 +23,27 @@ gh pr diff "$PR" --repo "$REPO" > "$OUT/code.diff.full"
 # the comment, so a review that saw no evidence is never read as one that did.
 EXCL=""
 if [ -n "${PR_REVIEW_EXCLUDE:-}" ]; then
-  PR_REVIEW_EXCLUDE="$PR_REVIEW_EXCLUDE" python3 - "$OUT/code.diff.full" <<'PY'
+  DROPPED=$(PR_REVIEW_EXCLUDE="$PR_REVIEW_EXCLUDE" python3 - "$OUT/code.diff.full" <<'PY'
 import os, re, sys
 path = sys.argv[1]; pref = tuple(p.strip().rstrip("/") + "/" for p in os.environ["PR_REVIEW_EXCLUDE"].split() if p.strip())
 text = open(path, encoding="utf-8", errors="surrogateescape").read()
+def unquote(s):  # git quotes a path with a space, a quote or a non-ASCII byte: "a/x y", C escapes, octal bytes
+    if not (s.startswith('"') and s.endswith('"')): return s
+    return s[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape").encode("latin-1").decode("utf-8", "surrogateescape")
+PATH_RE = r'("(?:[^"\\]|\\.)*"|\S+)'
 parts = re.split(r"(?m)^(?=diff --git )", text); kept = []; dropped = 0
 for part in parts:
-    m = re.match(r"diff --git a/(\S+) b/(\S+)", part)  # both sides: a rename out of (or into) the evidence stays in
-    if m and m.group(1).startswith(pref) and m.group(2).startswith(pref): dropped += 1; continue
+    m = re.match(r"diff --git " + PATH_RE + " " + PATH_RE, part)  # both sides: a rename out of (or into) the evidence stays in
+    if m:
+        a, b = unquote(m.group(1)), unquote(m.group(2))  # "a/..." and "b/..." (the prefixes are inside the quotes)
+        if a.startswith("a/") and b.startswith("b/") and a[2:].startswith(pref) and b[2:].startswith(pref): dropped += 1; continue
     kept.append(part)
 open(path, "w", encoding="utf-8", errors="surrogateescape").write("".join(kept))
 print(dropped)
 PY
-  EXCL="DIFF EXCLUDES ${PR_REVIEW_EXCLUDE} (committed run evidence, not code): those files are not in this review"
+)
+  # the exclusion is named only when sections were actually dropped: a claim without a drop would misreport the review
+  [ "${DROPPED:-0}" -gt 0 ] && EXCL="DIFF EXCLUDES ${PR_REVIEW_EXCLUDE} (committed run evidence, not code): ${DROPPED} file section(s) are not in this review"
 fi
 # the diff goes in whole up to DIFF_CAP bytes (the retired job capped at 60 KB; the subscription model takes more); a
 # larger diff is cut there and the cut is named in the prompt and the comment, so a partial review is never read as a full one
