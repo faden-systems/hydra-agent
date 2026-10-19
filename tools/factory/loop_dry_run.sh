@@ -42,7 +42,21 @@ git fetch -q origin || { echo "fetch failed in $REPO" >&2; exit 2; }
 MAIN="$(git rev-parse origin/main)"
 SPEC_AT="$MAIN"
 if [ -n "$SPEC_REF" ]; then
-  SPEC_AT="$(git rev-parse "$SPEC_REF" 2>/dev/null)" || SPEC_AT="$(git rev-parse "origin/$SPEC_REF" 2>/dev/null)" || { echo "spec ref not found: $SPEC_REF" >&2; exit 2; }
+  # the remote's branch first (just fetched), a local ref only when no such remote branch exists: a stale local branch
+  # never stands in for the PR's head
+  SPEC_AT="$(git rev-parse "origin/$SPEC_REF" 2>/dev/null)" || SPEC_AT="$(git rev-parse "$SPEC_REF" 2>/dev/null)" || { echo "spec ref not found: $SPEC_REF" >&2; exit 2; }
+fi
+if [ -n "$PR" ]; then
+  # the record must describe the PR's head: with --spec-ref the ref must be the PR's head; without it the PR's head is the spec
+  REMOTE_EARLY="$(git remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')"
+  PR_HEAD="$(gh pr view "$PR" --repo "$REMOTE_EARLY" --json headRefOid -q .headRefOid 2>/dev/null)" || PR_HEAD=""
+  [ -n "$PR_HEAD" ] || { echo "cannot read PR #$PR's head on $REMOTE_EARLY (gh pr view failed)" >&2; exit 2; }
+  if [ -n "$SPEC_REF" ]; then
+    [ "$SPEC_AT" = "$PR_HEAD" ] || { echo "spec ref $SPEC_REF resolves to $SPEC_AT but PR #$PR's head is $PR_HEAD: fetch, or name the PR's branch" >&2; exit 2; }
+  else
+    git cat-file -e "$PR_HEAD^{commit}" 2>/dev/null || git fetch -q origin "$PR_HEAD" || { echo "cannot fetch PR #$PR's head $PR_HEAD" >&2; exit 2; }
+    SPEC_REF="pr-$PR"; SPEC_AT="$PR_HEAD"
+  fi
 fi
 for f in loops/$ID.md loops/$ID.exit.sh loops/$ID.acceptance.py; do
   git cat-file -e "$SPEC_AT:$f" 2>/dev/null || { echo "spec file missing at ${SPEC_REF:-origin/main} ($SPEC_AT): $f" >&2; exit 2; }
@@ -82,7 +96,11 @@ git add "docs/notes/$ID.md"; git commit -q -m "dry-run: no-op candidate for $ID 
 say "[dry-run] $ID on origin/main $MAIN${SPEC_REF:+ with the spec from $SPEC_REF ($SPEC_AT)}; no-op candidate $(git rev-parse --short HEAD); out $OUT"
 say "[dry-run] exit: CI=true BASE_REF=$BASE_FOR_EXIT bash loops/$ID.exit.sh"
 PY="${PYTHON:-$(command -v python3)}"
-( CI=true BASE_REF="$BASE_FOR_EXIT" PYTHON="$PY" timeout -k 10 1800 bash "loops/$ID.exit.sh" ) > "$OUT/exit.log" 2>&1; RC=$?
+# the exit of a spec under review is a branch's shell script: it runs in the replay's sandbox (every credential-looking
+# variable removed, the proxies dead, no_proxy empty) - its pre-product checks need git, python and the local tree only
+( env -u NO_PROXY -u no_proxy $(env | grep -iE '^[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=' | cut -d= -f1 | sed 's/^/-u /') \
+    HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+    CI=true DRY_RUN=1 BASE_REF="$BASE_FOR_EXIT" PYTHON="$PY" timeout -k 10 1800 bash "loops/$ID.exit.sh" ) > "$OUT/exit.log" 2>&1; RC=$?
 sed "s/^/  | /" "$OUT/exit.log" | tail -n 80 >> "$LOG"
 FAIL_LINE="$(grep -E "^\[$ID\] FAIL:" "$OUT/exit.log" | tail -n 1)"
 FAIL_COUNT="$(grep -cE "^\[$ID\] FAIL:" "$OUT/exit.log")"
