@@ -22,7 +22,12 @@ Before a coder launches or the manager starts a build, the spec's checks run onc
    review round.
 4. The launch gate: `tools/factory/dry_run_gate.sh <id> <checkout at the spec commit>` exits non-zero unless a recorded
    dry-run exists with verdict `STOPPED_AT_PRODUCT` and the three spec files' sha256 still match (an amendment after
-   the dry-run needs a new one). Every `coder/<id>-launch.sh` and every manager build calls it first.
+   the dry-run needs a new one). It is on the launch path: `tools/factory/coder_launch.sh <id> <main sha> <spec sha>`
+   (the one launcher for every loop from rs1 on; it replaces the per-loop `coder/<id>-launch.sh` copies) clones, checks
+   the frozen spec files against the spec commit, then runs the gate and removes the clone on refusal (exit 6) before
+   the account check and the coder start. The gate's output is kept at `coder/<id>-<main>-logs/dry-run-gate.txt` with
+   a copy of the dry-run record. `--dry` stops after the gate (a launch rehearsal). A manager-run build has no script;
+   the manager runs the gate by hand before its first build command.
 
 ## The `--replay` convention for acceptance scripts
 

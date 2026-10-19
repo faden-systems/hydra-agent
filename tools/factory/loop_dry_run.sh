@@ -3,6 +3,7 @@
 #
 #   tools/factory/loop_dry_run.sh <id> [--repo <checkout>] [--pr <number>] [--replay <evidence-dir>]... [--out <dir>]
 #                                      [--expect <regex>] [--replay-optional]
+# (--repo, --out and --replay paths may be relative to the caller's directory; they are resolved before the worktree switch)
 #
 # 1. A temporary worktree of the checkout's origin/main; a no-op candidate = one commit adding the notes stub
 #    docs/notes/<id>.md (every "## heading" the exit script names, nothing else); then
@@ -22,8 +23,9 @@ ID="${1:?loop id}"; shift
 REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) REPO="$2"; shift 2;; --pr) PR="$2"; shift 2;; --out) OUT="$2"; shift 2;; --expect) EXPECT="$2"; shift 2;;
-    --replay) REPLAYS+=("$2"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
+    # paths are made absolute here: the script changes into a temporary worktree before using them
+    --repo) REPO="$(realpath -m "$2")"; shift 2;; --pr) PR="$2"; shift 2;; --out) OUT="$(realpath -m "$2")"; shift 2;;
+    --expect) EXPECT="$2"; shift 2;; --replay) REPLAYS+=("$(realpath -m "$2")"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -66,9 +68,10 @@ PY="${PYTHON:-$(command -v python3)}"
 sed "s/^/  | /" "$OUT/exit.log" | tail -n 80 >> "$LOG"
 FAIL_LINE="$(grep -E "^\[$ID\] FAIL:" "$OUT/exit.log" | tail -n 1)"
 LAST_STEP="$(grep -E "^\[$ID\] " "$OUT/exit.log" | grep -vE "FAIL:|PASS" | tail -n 1)"
-if [ $RC -eq 0 ]; then VERDICT="NO_PRODUCT_GATE"; STOP="the exit passed with no product"
+# the cap is judged first: an exit that prints an expected FAIL line and then hangs is a harness defect, not a stop
+if [ $RC -eq 124 ] || [ $RC -eq 137 ]; then VERDICT="HARNESS_DEFECT"; STOP="the exit did not finish in 1800 s (rc $RC; last step: $LAST_STEP; last FAIL line: ${FAIL_LINE:-none})"
+elif [ $RC -eq 0 ]; then VERDICT="NO_PRODUCT_GATE"; STOP="the exit passed with no product"
 elif [ -n "$FAIL_LINE" ] && echo "$FAIL_LINE" | grep -Eq "$EXPECT"; then VERDICT="STOPPED_AT_PRODUCT"; STOP="$FAIL_LINE"
-elif [ $RC -eq 124 ]; then VERDICT="HARNESS_DEFECT"; STOP="the exit did not finish in 1800 s (last step: $LAST_STEP)"
 else VERDICT="HARNESS_DEFECT"; STOP="${FAIL_LINE:-exit rc $RC with no FAIL line (last step: $LAST_STEP)}"; fi
 say "[dry-run] exit rc=$RC verdict=$VERDICT"
 say "[dry-run] stopped at: $STOP"
@@ -90,10 +93,10 @@ for d in "${REPLAYS[@]:-}"; do
 done
 if [ $RFAIL -ne 0 ] && [ $OPTIONAL -eq 0 ]; then say "[dry-run] a replay failed: the acceptance driver's checks do not hold on existing evidence (or lack --replay)"; [ "$VERDICT" = STOPPED_AT_PRODUCT ] && VERDICT="REPLAY_FAILED"; fi
 SPEC_SHA="$("$PY" -c 'import hashlib,sys,json; print(json.dumps({f: hashlib.sha256(open(f,"rb").read()).hexdigest() for f in sys.argv[1:]}))' "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py")"
-"$PY" - "$OUT/dry-run.json" "$ID" "$MAIN" "$VERDICT" "$STOP" "$RC" "$REPLAY_JSON" "$SPEC_SHA" "$STAMP" "$LOG" <<'PYJ'
+"$PY" - "$OUT/dry-run.json" "$ID" "$MAIN" "$VERDICT" "$STOP" "$RC" "$REPLAY_JSON" "$SPEC_SHA" "$STAMP" "$LOG" "$PR" <<'PYJ'
 import json, sys
-o, i, m, v, s, rc, rj, ss, st, log = sys.argv[1:]
-json.dump({"id": i, "main": m, "verdict": v, "stopped_at": s, "exit_rc": int(rc), "replays": json.loads(rj), "spec_sha256": json.loads(ss), "at": st, "log": log}, open(o, "w"), indent=1)
+o, i, m, v, s, rc, rj, ss, st, log, pr = sys.argv[1:]
+json.dump({"id": i, "main": m, "verdict": v, "stopped_at": s, "exit_rc": int(rc), "replays": json.loads(rj), "spec_sha256": json.loads(ss), "at": st, "log": log, "pr": (int(pr) if pr else None)}, open(o, "w"), indent=1)
 PYJ
 mkdir -p "${HYDRA_HOME:-$HOME}/coder"; cp "$OUT/dry-run.json" "${HYDRA_HOME:-$HOME}/coder/$ID-dry-run.json"
 if [ -n "$PR" ]; then
