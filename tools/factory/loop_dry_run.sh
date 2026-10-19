@@ -73,8 +73,13 @@ cd "$WT"
 git config user.name hydra-dry-run; git config user.email dry-run@hydra.local
 if [ "$SPEC_AT" != "$MAIN" ]; then
   # the spec under review on top of main: exactly its three loops files (the rest of the PR, if any, is not the spec)
-  git checkout -q "$SPEC_AT" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py"
-  git commit -q -m "dry-run: the $ID spec from $SPEC_REF ($SPEC_AT)" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py" 2>/dev/null || true
+  git checkout -q "$SPEC_AT" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py" || { echo "cannot take the spec files from $SPEC_AT" >&2; exit 2; }
+  if git diff --cached --quiet -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py"; then
+    say "[dry-run] the spec files at $SPEC_REF equal origin/main's: the base is main itself"
+  else
+    git commit -q -m "dry-run: the $ID spec from $SPEC_REF ($SPEC_AT)" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py" || { echo "the spec commit failed" >&2; exit 2; }
+  fi
+  git diff --cached --quiet && git diff --quiet || { echo "the worktree is not clean after the spec commit" >&2; exit 2; }
   BASE_FOR_EXIT="$(git rev-parse HEAD)"
 else
   BASE_FOR_EXIT="$MAIN"
@@ -92,7 +97,10 @@ HEADS="$(grep -o '"## [A-Za-z][A-Za-z -]*"' "loops/$ID.exit.sh" | tr -d '"' | aw
     echo "$h"; echo; echo "dry-run: no product."; echo
   done
 } > "docs/notes/$ID.md"
-git add "docs/notes/$ID.md"; git commit -q -m "dry-run: no-op candidate for $ID (notes stub only)"
+git add "docs/notes/$ID.md"; git commit -q -m "dry-run: no-op candidate for $ID (notes stub only)" || { echo "the notes-stub commit failed" >&2; exit 2; }
+# the candidate is exactly the notes stub on top of the spec base, nothing else
+ONLY="$(git diff --name-only "$BASE_FOR_EXIT" HEAD)"
+[ "$ONLY" = "docs/notes/$ID.md" ] || { echo "the no-op candidate is not notes-only (changed: $(echo "$ONLY" | tr '\n' ' '))" >&2; exit 2; }
 say "[dry-run] $ID on origin/main $MAIN${SPEC_REF:+ with the spec from $SPEC_REF ($SPEC_AT)}; no-op candidate $(git rev-parse --short HEAD); out $OUT"
 say "[dry-run] exit: CI=true BASE_REF=$BASE_FOR_EXIT bash loops/$ID.exit.sh"
 PY="${PYTHON:-$(command -v python3)}"
