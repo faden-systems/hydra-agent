@@ -97,7 +97,7 @@ else
   BASE_FOR_EXIT="$MAIN"
 fi
 # the notes stub: every "## heading" the exit script names, in the order it names them, plus the standard four
-HEADS="$(grep -o '"## [A-Za-z][^"]*"' "loops/$ID.exit.sh" | tr -d '"' | awk '!seen[$0]++')"  # any heading text (digits, parentheses: "## Carries over to rs2")
+HEADS="$(grep -o '"## [^"]+"' "loops/$ID.exit.sh" | tr -d '"' | awk '!seen[$0]++')"  # any heading text (digits, parentheses: "## Carries over to rs2")
 {
   echo "# $ID notes (dry-run stub, no product)"; echo
   for h in "## What changed" "## Measured" "## Open questions" "## Pre-existing tests amended"; do
