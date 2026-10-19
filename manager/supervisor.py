@@ -116,8 +116,18 @@ COMPACTION_DEFAULTS = {"threshold_tokens": 300000, "max_bytes": 50 * 1000 * 1000
                        "quiet_hours": [2, 5], "quiet_hours_tz": "local", "retry_after_s": 6 * 3600,
                        "rollover_enabled": True}
 COMPACTION_MESSAGE = ("[compaction] Compact: write everything from this session that must survive into MEMORY.md "
-                      "(facts, decisions, open questions, with dates), update MANAGER-HANDOFF.md, then reply only "
-                      "`compacted`.")
+                      "(facts, decisions, open questions, with dates), update MANAGER-HANDOFF.md, then reply "
+                      "`compacted` followed by the `---HANDOFF---` block with its five lines (tracks:, waiting on:, "
+                      "last decision:, next action:, open question:).")
+# loops/b15.md requirement 2b: the retry after the first shape failure of a streak names the miss, after the message
+COMPACTION_MISS_SENTENCES = {
+    "handoff": "Your previous compaction reply carried no valid five-line handoff; end it with the `---HANDOFF---` block.",
+    "memory": "Your previous compaction reply left MEMORY.md unchanged; write the durable facts to MEMORY.md before replying.",
+}
+TIMEOUT_STATUS_WINDOW_S = 24 * 3600  # loops/b15.md requirement 3: how long `hydra status` names the last turn timeout
+_UNSET = object()
+_STATUS_CLOCKS = {}  # home -> epoch callable: a Supervisor built with a controlled clock lends it to status_text's "now"
+_ASSISTANT_RECORD_RE = re.compile(rb'"type"\s*:\s*"assistant"')
 FLUSH_LINE = ("[flush] every {n} Codex turns: before handling the events below, write everything durable since your "
               "last flush to MEMORY.md and codex/NOTES.md (dated, tagged codex).")
 USAGE_LINE_RE = re.compile(r"^\[usage\][ \t]+(.*)\n?", re.MULTILINE)
@@ -1879,6 +1889,9 @@ def status_text(home, repo=None):
         lines.append(_status_pacific_line(compaction_status_line(home)) + _status_context_suffix(home))
     except (AttributeError, TypeError, ValueError):
         lines.append("compaction: unavailable (malformed turn log)")
+    timeout_line = _timeout_status_line(home)  # loops/b15.md requirement 3: right after the compaction line
+    if timeout_line:
+        lines.append(timeout_line)
     lines.append(_status_pacific_line(timer_status_line(home)))  # requirement 10, loops/b11.md
     hb = os.path.join(home, "logs", "heartbeat")
     if os.path.exists(hb):
@@ -2207,6 +2220,106 @@ def _held_outcome(rec):
     return isinstance(rec, dict) and str(rec.get("error") or "").startswith("held:")
 
 
+def _measurement_since_rollover(home, engines=None):
+    """The last measured Claude context unless it predates the last rollover (loops/b15.md requirement 1: once a
+    verification settles from the new transcript, the old session's size never makes the new one due; the first
+    measured turn on the new id decides). None when there is no usable measurement."""
+    rows = [r for r in read_jsonl(os.path.join(home, "logs", "turns.jsonl")) if isinstance(r, dict)]
+    ctx, turn_n = _last_measured_claude_turn(home, engines)
+    rollovers = [int(r["n"]) for r in rows if r.get("kind") == "compaction" and isinstance(r.get("n"), int)]
+    if ctx is not None and rollovers and isinstance(turn_n, int) and turn_n < max(rollovers):
+        return None
+    return ctx
+
+
+def _transcript_first_context(path):
+    """loops/b15.md requirement 1: the first `assistant` record's context (input + cache creation + cache read, each
+    once) of a Claude transcript; None when the file is missing, unreadable, or has no assistant record yet (the b11
+    scan's tolerance: an unparsable line is skipped)."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if not _ASSISTANT_RECORD_RE.search(raw):
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "assistant":
+                    msg = obj.get("message")
+                    return Supervisor._context_tokens_from(msg.get("usage") if isinstance(msg, dict) else None)
+    except OSError:
+        return None
+    return None
+
+
+def _count_assistant_records(path):
+    """loops/b15.md requirement 3: the number of `assistant` records in a Claude transcript (0 when the file is
+    missing or unreadable; an unparsable line counts nothing)."""
+    if not path:
+        return 0
+    n = 0
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if not _ASSISTANT_RECORD_RE.search(raw):
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "assistant":
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def _session_start_tokens(home):
+    """The current session transcript's first assistant usage (`session start:` in `hydra status`); None when the
+    home has no session, no transcript, or no assistant record yet."""
+    sid = read_text(os.path.join(home, "session-id")).strip() or None
+    if not sid:
+        return None
+    return _transcript_first_context(find_claude_transcript(os.path.join(home, ".claude"), home, sid))
+
+
+def _status_now(home):
+    """status_text's "now": the controlled clock of a Supervisor built for this home when there is one, else the wall
+    clock (production)."""
+    clock = _STATUS_CLOCKS.get(os.path.abspath(home))
+    if clock is not None:
+        try:
+            return float(clock())
+        except Exception:  # noqa: BLE001 - a broken test clock never breaks status
+            pass
+    return time.time()
+
+
+def _timeout_notice_text(record):
+    """loops/b15.md requirement 3: the one top-level line of a working timeout, built from its turn row."""
+    k = int(record.get("transcript_records") or 0)
+    return (f"manager turn timeout: turn {record.get('n')} on {record.get('engine')} ({record.get('model')}) ran "
+            f"{float(record.get('duration_s') or 0):.0f} s while working ({k} replies); its events were answered as unavailable")
+
+
+def _timeout_status_line(home):
+    """loops/b15.md requirement 3: `last turn timeout: <PDT> turn <n> working (<k> replies)` or `... silent` for the
+    newest turn timeout within the last 24 hours; None otherwise."""
+    for r in reversed(read_jsonl(os.path.join(home, "logs", "turns.jsonl"))):
+        if not isinstance(r, dict) or r.get("timeout") not in ("working", "silent"):
+            continue
+        stamp = r.get("timeout_at") if r.get("timeout_at") is not None else r.get("at")
+        at = _status_timestamp(stamp)
+        if at is None or not (0 <= _status_now(home) - at < TIMEOUT_STATUS_WINDOW_S):
+            return None
+        kind = f"working ({int(r.get('transcript_records') or 0)} replies)" if r["timeout"] == "working" else "silent"
+        return f"last turn timeout: {_status_pdt(stamp)} turn {r.get('n')} {kind}"
+    return None
+
+
 def cli_compactions_since(data, offset):
     """Requirement 3, loops/b11.md: the module-level pure parser. `data` is bytes, `offset` the byte position to
     start from; returns ([{"at": <timestamp or None>}], new_offset) where new_offset is the end of the last
@@ -2242,6 +2355,9 @@ def compaction_status_line(home, now=None):
     limit = int(cfg["threshold_tokens"])
     ctx, turn_n = _last_measured_claude_turn(home)
     head = f"context: {ctx} tokens (turn {turn_n})" if ctx is not None else "context: unknown"
+    start = _session_start_tokens(home)  # loops/b15.md requirement 1: the new session's size, right after the context
+    if start is not None:
+        head += f" | session start: {start} tokens"
     last = state.get("last") or {}
     cli_list = state.get("cli_compactions") or []
     cli_last = cli_list[-1] if cli_list else None
@@ -2268,14 +2384,15 @@ def compaction_status_line(home, now=None):
     failed = parse_iso(state.get("failed_at"))
     backoff = bool(failed and (now - failed).total_seconds() < cfg["retry_after_s"])
     pending = state.get("pending") or {}
+    live = _measurement_since_rollover(home)  # a pre-rollover measurement is shown, never due (loops/b15.md)
     claude_selected = family_of(current_engine(home)) == "claude"  # requirement 1's engine-family guard
     if os.path.exists(os.path.join(home, "COMPACT")):
         line += "; compaction: forced"
     elif _held_outcome(last) and pending:
         line += "; compaction: held"
     elif claude_selected and not state.get("verify") and not backoff and (
-            (ctx is not None and ctx > limit) or pending.get("reason") == "bytes"):
-        reason = "tokens" if (ctx is not None and ctx > limit) else "bytes"
+            (live is not None and live > limit) or pending.get("reason") == "bytes"):
+        reason = "tokens" if (live is not None and live > limit) else "bytes"
         line += f"; compaction: due ({reason})"
     elif state.get("verify"):
         line += "; compaction: awaiting verification"
@@ -2508,7 +2625,7 @@ def _file_digest_or_none(path):
         return None
 
 
-def record_attempt(home, engine, model, rc, classification, reason, success, retried_resume=False):
+def record_attempt(home, engine, model, rc, classification, reason, success, retried_resume=False, extra=None):
     """Append one line to `logs/attempts.jsonl` (requirement 11/12, loops/b7.md): every engine attempt, success or
     failure; only successful turns enter the family-turn ledger. Historical ledger files are never rewritten.
     `retried_resume` (loops/b14.md requirement 2) marks an attempt whose refused `--session-id` start was retried
@@ -2517,6 +2634,8 @@ def record_attempt(home, engine, model, rc, classification, reason, success, ret
            "reason": (reason or "")[:FAILURE_REASON_MAX], "success": bool(success)}
     if retried_resume:
         row["retried_resume"] = True
+    if extra:
+        row.update(extra)  # loops/b15.md requirement 3: `timeout: working|silent` and `transcript_records` on an rc 124
     append_jsonl(os.path.join(home, "logs", "attempts.jsonl"), row)
 
 
@@ -2558,6 +2677,8 @@ class Supervisor:
         if config:
             self.config.update(config)
         self.clock = clock
+        if clock is not None:
+            _STATUS_CLOCKS[os.path.abspath(self.home)] = self.clock_epoch  # status_text's "now" follows a controlled clock
         explicit_codex_home = codex_home or self.config.get("codex_home")
         self.codex_home = explicit_codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
         self.export_codex_home = bool(explicit_codex_home)
@@ -2570,6 +2691,7 @@ class Supervisor:
         self.repo = repo if repo is not None else self.config.get("repo")
         self.dev_channel = self.config.get("dev_channel") or DEFAULT_DEV_CHANNEL
         self.engine_timeout = engine_timeout
+        self._last_timeout = None  # loops/b15.md requirement 3: {timeout: working|silent, transcript_records} of the last rc 124
         self.models = load_models(self.home)
         self.memory_dir = memory_dir_for(self.home, self.repo)
         if isinstance(self.config.get("compaction"), dict) and self.config["compaction"].get("over_ratio") is not None:
@@ -2585,6 +2707,7 @@ class Supervisor:
         self._reconcile_fallback_notice()  # requirement 12, loops/b7.md: before the next run_engines
         self._reconcile_unavailable_notice()
         self._reconcile_fault_notice()  # loops/b12.md requirement 3: a durable episode's notice is queued
+        self._reconcile_timeout_notice()  # loops/b15.md requirement 3: a working timeout's line survives a crash
 
     # ---- small helpers
     def path(self, *parts):
@@ -2796,13 +2919,24 @@ class Supervisor:
             e = failure
             log(f"turn {n}: every engine failed: {e}")
             pair = read_engine(self.home, self.engines)
-            append_jsonl(self.path("logs", "turns.jsonl"),
-                         {"n": n, "at": started, "engine": pair["acc"], "model": pair["model"],
-                          "events": [ev["id"] for ev in events], "reacted": reacted,
-                          "duration_s": round(time.time() - started, 3), "error": str(e)[:2000]})
+            record = {"n": n, "at": started, "engine": pair["acc"], "model": pair["model"],
+                      "events": [ev["id"] for ev in events], "reacted": reacted,
+                      "duration_s": round(time.time() - started, 3), "error": str(e)[:2000]}
+            timeout_info = getattr(e, "timeout_info", None)
+            if isinstance(timeout_info, dict) and timeout_info.get("timeout") in ("working", "silent"):
+                # loops/b15.md requirement 3: the kind is durable in the turn row before any line is queued
+                record.update({"timeout": timeout_info["timeout"], "transcript_records": int(timeout_info.get("transcript_records") or 0),
+                               "timeout_at": self.now()})
+            append_jsonl(self.path("logs", "turns.jsonl"), record)
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
             self.react_failed(events)
-            if getattr(e, "fault", False):
+            if record.get("timeout") == "working":
+                # requirement 3: one top-level line per working timeout (id timeout-<n>, reconciled at start), the
+                # events answered as unavailable, logs/fault.json untouched, the engine unchanged
+                text = _timeout_notice_text(record)
+                self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
+                _queue_notice_once(self.home, self.dev_channel, text, f"timeout-{n}")
+            elif getattr(e, "fault", False):
                 text = self._fault_text(getattr(e, "reasons", None))
                 self.post_unavailable([ev for ev in events if ev.get("source") in ("cli", "self")], text)
                 self._note_fault(n, text, step=getattr(e, "step", None), counted=getattr(e, "counted", False))  # founder rule 4
@@ -2830,7 +2964,7 @@ class Supervisor:
         cli_found = False
         if is_claude:
             self.snapshot_claude_memory()
-            compaction = self.verify_compaction(usage.get("context_tokens"))
+            compaction = self.verify_compaction(turn_tokens=usage.get("context_tokens"))  # loops/b15.md requirement 1
             cli_found = self._scan_cli_compactions(n)
         self.append_ledger(n, engine, model, before, transition, compaction=compaction)
         if notes:
@@ -3111,11 +3245,12 @@ class Supervisor:
             exc.reasons = list(reasons)
             return exc
 
-        def fault(uncertain=False, step=None, counted=False):
+        def fault(uncertain=False, step=None, counted=False, timeout_info=None):
             exc = EngineFault(errors[-1:], uncertain=uncertain)
             exc.reasons = reasons[-1:]
             exc.step = step
             exc.counted = counted  # the valve already counted this fault in the episode
+            exc.timeout_info = timeout_info  # loops/b15.md requirement 3: {timeout: working|silent, transcript_records}
             return exc
         for tier, name, model in order:
             spec = self.engines.get(name) or {}
@@ -3159,6 +3294,7 @@ class Supervisor:
                 preamble = FLUSH_LINE.format(n=self.compaction_config()["codex_every_turns"]) + "\n\n" + preamble
             tried_tiers.append(tier)
             self._last_retried_resume = False
+            self._last_timeout = None  # loops/b15.md requirement 3: set by the vendor boundary on an rc 124
             rc, out, err, usage = self.invoke(name, spec, message, model, preamble=preamble)
             if rc == 0:
                 record_attempt(self.home, name, model, rc, None, "", True, retried_resume=self._last_retried_resume)
@@ -3182,7 +3318,16 @@ class Supervisor:
                                                probe_errors=probe_errors, probed=probed)
                 return name, model, out, usage, transition
             classification = classify_engine_error(err)
-            record_attempt(self.home, name, model, rc, classification, err, False, retried_resume=self._last_retried_resume)
+            timeout_info = None
+            if rc == 124:
+                # loops/b15.md requirement 3: a timeout is told by what the session's transcript gained while the
+                # turn ran. A working one (k >= 1) is classified `timeout` and is no fault; a silent one (k = 0)
+                # keeps today's row (classification `other`) and is a fault as today.
+                timeout_info = dict(self._last_timeout or {"timeout": "silent", "transcript_records": 0})
+                if timeout_info["timeout"] == "working":
+                    classification = "timeout"
+            record_attempt(self.home, name, model, rc, classification, err, False, retried_resume=self._last_retried_resume,
+                           extra=timeout_info)
             if (name, model) == fault_step and rc not in (17, 124) and classification not in ("other", "rate_limit"):
                 self._fault_probe_consumed()  # loops/b14.md requirement 4: a usage failure on the probe is a probe
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
@@ -3195,13 +3340,19 @@ class Supervisor:
                 # must never be silently replayed on a different engine within the same turn; the event
                 # layer (turn()/post_unavailable) gives it a durable, truthful failure outcome instead.
                 reasons.append(step + ("crash" if rc == 17 else "timeout"))
+                if timeout_info and timeout_info["timeout"] == "working":
+                    # loops/b15.md requirement 3: the turn ran out of time while working. b8's uncertain disposition
+                    # stays (answered as unavailable, never replayed, the walk stops), but no fault episode is
+                    # opened, extended, counted or escalated and nothing moves: the valve is never asked.
+                    raise fault(uncertain=True, step=None, counted=True, timeout_info=timeout_info)
                 # loops/b14.md requirement 3: an uncertain failure keeps b8's precedence everywhere -- the walk
                 # stops here without replay or fallback even inside an escalated walk or on a probe; the valve's
                 # bookkeeping (count, escalation, the probe) only changes eligibility for a later turn
                 if escalating:  # a later step inside the escalated walk: the open episode is left untouched
-                    raise fault(uncertain=True, step=None, counted=True)
+                    raise fault(uncertain=True, step=None, counted=True, timeout_info=timeout_info)
                 counted = self._fault_valve(tier, name, model, reasons[-1], probe=(name, model) == fault_step)
-                raise fault(uncertain=True, step={"tier": tier, "acc": name, "model": model}, counted=counted)
+                raise fault(uncertain=True, step={"tier": tier, "acc": name, "model": model}, counted=counted,
+                            timeout_info=timeout_info)
             if classification == "other":
                 reasons.append(step + "other: " + ((err or "").strip() or f"exit {rc}")[:80])
             else:
@@ -3344,6 +3495,10 @@ class Supervisor:
         self._set_persistent_child(None)
         return result
 
+    def persistent_status(self):
+        """This home's durable persistent-child view (the module-level `persistent_status`, as the README names it)."""
+        return persistent_status(self.home)
+
     def _retire_persistent(self, category, reason):
         """Stop whatever persistent child is currently live, counting a planned restart; a no-op when none
         is running (most turns, and every non-Claude or per-turn-only invocation)."""
@@ -3407,9 +3562,11 @@ class Supervisor:
             self._set_persistent_child(child)
             _save_persistent_status(self.home, pid=child.pid, account=name, model=model, sid=sid,
                                     started_at=time.time(), turns_served=0)
+        records_before = self._assistant_records(sid)  # loops/b15.md requirement 3: the count at the start
         lines, timed_out, crashed = child.send(message, self.engine_timeout)
         text = "\n".join(lines)
         if timed_out:
+            self._note_timeout(sid, records_before)
             child.kill_tree()
             self._set_persistent_child(None)
             _bump_restart(self.home, "timeout", f"turn timed out after {self.engine_timeout}s")
@@ -3467,6 +3624,7 @@ class Supervisor:
         if not sid:
             sid = str(uuid.uuid4())
         argv = self._claude_argv(spec, model, sid, resume)
+        sid0, records_before = sid, self._assistant_records(sid)  # loops/b15.md requirement 3: the count at the start
         rc, out, err = self._run(argv, message, self.engine_env(spec))
         if rc not in (0, 17, 124) and not resume and self._refused_in_use(out, err):
             # loops/b14.md requirement 2: the id exists after all (the CLI says so): mark it started and retry the
@@ -3477,6 +3635,8 @@ class Supervisor:
         elif rc != 0 and resume and NO_SESSION_RE.search(err or ""):
             sid = str(uuid.uuid4())
             rc, out, err = self._run(self._claude_argv(spec, model, sid, False), message, self.engine_env(spec))
+        if rc == 124:
+            self._note_timeout(sid, records_before if sid == sid0 else 0)
         reply, usage, error_text, new_sid = self._parse_claude_output(out)
         if rc != 0 or error_text:
             return (rc or 1), "", self._failure_reason(error_text, out, err), None
@@ -3807,6 +3967,10 @@ class Supervisor:
         compacts while another engine family is selected."""
         if os.path.exists(self.path("COMPACT")):
             return True, "forced"
+        if self.compaction_state().get("verify"):
+            # loops/b15.md requirement 1: an outstanding verification is settled from the new session's transcript
+            # before the guards, so a timed-out or crashed first turn never leaves a due compaction blocked
+            self.verify_compaction(quiet=True)
         state = self.compaction_state()
         cfg = self.compaction_config()
         verify_pending = bool(state.get("verify"))
@@ -3820,7 +3984,7 @@ class Supervisor:
             return False, None
         if family_of(current_engine(self.home), self.engines) != "claude":
             return False, None
-        ctx = self.last_claude_context_tokens()
+        ctx = _measurement_since_rollover(self.home, self.engines)  # loops/b15.md: never the old session's size
         if ctx is not None and ctx > cfg["threshold_tokens"]:
             return True, "tokens"
         if (state.get("pending") or {}).get("reason") == "bytes":
@@ -3869,29 +4033,46 @@ class Supervisor:
             state["failed_at"] = None
             state["fail_posted"] = False
 
-    def verify_compaction(self, context_tokens):
-        """At a Claude turn after a rollover: did its context tokens drop below the threshold? Returns the ledger
-        record `{before_tokens, after_tokens, at, ok, reason, old_id, new_id}`; None when nothing awaits
-        verification. Missing measurement cannot falsely declare success or failure (requirement 4/13, loops/b7.md):
-        it leaves `ok` null and the verification pending for a later measured turn, which alone may settle it."""
+    def verify_compaction(self, context_tokens=_UNSET, *, turn_tokens=None, quiet=False):
+        """After a rollover: did the new session start small? Returns the ledger record `{before_tokens,
+        after_tokens, at, ok, reason, old_id, new_id, source}`; None when nothing awaits verification.
+        loops/b15.md requirement 1: called without an argument (the turn path, and `compaction_due` before its
+        guards), the verification is settled from the new session's transcript: its first `assistant` record's
+        context (`source: "transcript"`); a transcript with no assistant record yet keeps it pending whatever the
+        turn measured. Only when no transcript file of `new_id` exists at all does the turn's own measurement
+        (`turn_tokens`) settle it as before (`source: "turn"`, amendment 1). An explicit argument settles it with
+        `source: "argument"` (the baseline contract). A missing measurement never settles anything (requirement
+        4/13, loops/b7.md): `ok` stays null and the verification pending."""
         state = self.compaction_state()
         v = state.get("verify")
         if not v:
             return None
-        rec = {"before_tokens": v.get("before_tokens"), "after_tokens": context_tokens, "at": v.get("at"),
+        rec = {"before_tokens": v.get("before_tokens"), "after_tokens": None, "at": v.get("at"),
                "ok": None, "reason": v.get("reason")}
         for k in ("old_id", "new_id"):
             if v.get(k) is not None:
                 rec[k] = v[k]
-        if context_tokens is None:
-            state["last"] = rec  # still records old/new ids with ok=null; verification stays pending
-            self.save_compaction_state(state)
-            log(f"compaction verification pending (no measured context yet): {rec}")
+        if context_tokens is _UNSET:
+            path = find_claude_transcript(self.path(".claude"), self.home, v.get("new_id")) if v.get("new_id") else None
+            if path:
+                measured, source = _transcript_first_context(path), "transcript"
+            else:
+                measured, source = turn_tokens, "turn"
+        else:
+            measured, source = context_tokens, "argument"
+        if measured is None:
+            if state.get("last") != rec:
+                state["last"] = rec  # still records old/new ids with ok=null; verification stays pending
+                self.save_compaction_state(state)
+            if not quiet:
+                log(f"compaction verification pending (no measured context yet): {rec}")
             return rec
         cfg = self.compaction_config()
-        rec["ok"] = bool(context_tokens < cfg["threshold_tokens"])
+        rec["after_tokens"] = measured
+        rec["source"] = source
+        rec["ok"] = bool(measured < cfg["threshold_tokens"])
         if rec["ok"] is False:
-            rec["error"] = f"context tokens still {context_tokens} after rollover (threshold {cfg['threshold_tokens']})"
+            rec["error"] = f"context tokens still {measured} after rollover (threshold {cfg['threshold_tokens']})"
         state["verify"] = None
         state["last"] = rec
         self._compaction_outcome(state, rec)
@@ -3999,6 +4180,8 @@ class Supervisor:
         state["verify"] = {"before_tokens": before_tokens, "at": at, "reason": reason, "turn": turn,
                            "old_id": old_id, "new_id": new_id}
         state["baseline_bytes"] = 0
+        state.pop("shape_failures", None)  # loops/b15.md requirement 2b: a rollover resets the shape-failure streak
+        state.pop("shape_miss", None)
         with contextlib.suppress(FileNotFoundError):
             os.remove(self.path("COMPACT"))
         self.save_compaction_state(state)
@@ -4253,7 +4436,7 @@ class Supervisor:
             log(f"compaction held: rollover disabled; session {old_id or '-'} kept")
             return rec
         name, spec = self.compaction_engine()
-        error, model = None, None
+        error, model, shape_miss = None, None, None
         if name is None:
             error = "no Claude engine configured"
         else:
@@ -4265,7 +4448,11 @@ class Supervisor:
             before_hash = _file_digest_or_none(memory_path)
             before_dir = dir_hashes(self.memory_dir)
             log(f"compaction ({reason}) on {name}: [compaction] turn")
-            rc, out, err, usage = self.invoke(name, spec, COMPACTION_MESSAGE, model)
+            message = COMPACTION_MESSAGE
+            miss = state.get("shape_miss") if state.get("shape_failures") else None
+            if miss in COMPACTION_MISS_SENTENCES:  # loops/b15.md requirement 2b: the retry names the previous miss
+                message = message + " " + COMPACTION_MISS_SENTENCES[miss]
+            rc, out, err, usage = self.invoke(name, spec, message, model)
             mb = self._last_message_bytes
             if rc != 0:
                 error = f"[compaction] turn failed on {name} (rc={rc}): {(err or out or '').strip()[-200:]}"
@@ -4274,8 +4461,10 @@ class Supervisor:
                 after_hash = _file_digest_or_none(memory_path)
                 if not handoff or not _valid_handoff(handoff):
                     error = "the memory-writing turn produced no valid five-line handoff"
+                    shape_miss = "handoff"
                 elif after_hash == before_hash:
                     error = "the memory-writing turn did not change MEMORY.md"
+                    shape_miss = "memory"
                 else:
                     self.write_handoff(handoff, name)
                     self.snapshot_claude_memory()
@@ -4305,6 +4494,19 @@ class Supervisor:
             record_attempt(self.home, name, model, rc, classify_engine_error(error), error, False)
         rec = {"before_tokens": before_tokens, "after_tokens": None, "at": at, "ok": False, "reason": reason,
                "error": error}
+        if shape_miss:
+            # loops/b15.md requirement 2b: a shape failure (rc 0, no valid handoff or MEMORY.md unchanged) keeps the
+            # old id as today; the first of a streak arms no back-off, keeps the forced file and the schedule, and
+            # the next turn boundary runs the compaction again with the sentence naming the miss. The second
+            # consecutive miss backs off exactly as today. A rollover resets the streak.
+            streak = int(state.get("shape_failures") or 0) + 1
+            state["shape_failures"], state["shape_miss"], rec["shape_failures"] = streak, shape_miss, streak
+            if streak == 1:
+                state["last"] = rec
+                state["pending"] = pending or None
+                self.save_compaction_state(state)
+                log(f"compaction shape failure ({shape_miss}): {error}; session {old_id or '-'} kept; retried at the next tick")
+                return rec
         state["last"] = rec
         state["pending"] = pending or None
         with contextlib.suppress(FileNotFoundError):
@@ -4742,6 +4944,28 @@ class Supervisor:
         _queue_notice_once(self.home, self.dev_channel, text, f"fault-{data['episode_id']}-escalated")
         data["escalated_queued"] = True
         write_text(self.fault_path(), json.dumps(data, indent=1) + "\n")
+
+    def _assistant_records(self, sid):
+        """loops/b15.md requirement 3: the assistant records the session's transcript holds now (0 without one)."""
+        return _count_assistant_records(find_claude_transcript(self.path(".claude"), self.home, sid) if sid else None)
+
+    def _note_timeout(self, sid, records_before):
+        """An rc 124 on `sid`: working when the transcript gained at least one assistant record since
+        `records_before`, silent otherwise; read by run_engines for the attempt row and the fault decision."""
+        k = max(0, self._assistant_records(sid) - int(records_before or 0))
+        self._last_timeout = {"timeout": "working" if k else "silent", "transcript_records": k}
+
+    def _reconcile_timeout_notice(self):
+        """loops/b15.md requirement 3: a working timeout's line is durable in its turn row before it is queued; a
+        restart queues the line of any recent row that never reached the outbox, exactly once (the outbox and the
+        bridge receipts deduplicate)."""
+        for r in self.turns():
+            if not isinstance(r, dict) or r.get("timeout") != "working" or r.get("n") is None:
+                continue
+            at = _status_timestamp(r.get("at"))
+            if at is None or time.time() - at > 7 * 86400:
+                continue
+            _queue_notice_once(self.home, self.dev_channel, _timeout_notice_text(r), f"timeout-{r['n']}")
 
     def _reconcile_fault_notice(self):
         data = self._read_fault()

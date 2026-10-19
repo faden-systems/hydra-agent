@@ -162,12 +162,22 @@ Five founder rules (2026-10-15) govern a fallback episode:
    stated as `resets <ISO instant>`, else one hour, `TIER_PROBE_S` = 3600 s); otherwise the turn starts at the
    effective pair and walks toward the floor. A missing or unparsable `probe_after` makes the tiers above eligible at
    once. Any success at or above the configured tier removes `probe_after`.
-4. **Faults never move the manager.** `rate_limit`, `other`, a crash (rc 17) or a timeout (rc 124) stops the walk at
+4. **Faults never move the manager.** `rate_limit`, `other`, a crash (rc 17) or a silent timeout (rc 124 with no reply
+   written to the session's transcript while the turn ran) stops the walk at
    that step: nothing is persisted, no tier or account changes, no episode starts; the turn keeps the failed-turn
    bookkeeping (`logs/retry-after`, failed reaction, events pending) and the retry runs the same engine first. One
    top-level line per fault episode, `engine fault: tier <k> <acc> (<model>): <what>`, is durable in
    `logs/fault.json` before it is queued (id `fault-<episode_id>`); the episode ends silently at the next served turn.
    A CLI or self event gets the same text in its reply file or `logs/self-replies.jsonl`.
+   Turn timeouts are told apart from account faults (`loops/b15.md` requirement 3): every rc 124 attempt row carries
+   `timeout: "working"` or `"silent"` and `transcript_records: <k>`, k being the `assistant` records the session's
+   transcript gained between the attempt's start and the kill (a missing or unreadable transcript counts 0). A
+   **working** timeout (k >= 1, classification `timeout`) keeps the uncertain disposition (the events answered as
+   unavailable, nothing replayed, the walk stopped) but opens, extends, counts in or escalates no fault episode and
+   never moves the engine; it queues one top-level line `manager turn timeout: turn <n> on <acc> (<model>) ran <T> s
+   while working (<k> replies); its events were answered as unavailable` (id `timeout-<n>`, durable in the turn's
+   row as `timeout: "working"` before it is queued, reconciled at start). A **silent** timeout (k = 0) is a fault
+   exactly as above, with today's row (classification `other`) and fault text `timeout`.
 5. **Every switch is announced with its tier.** Besides `fallback started` and `fallback ended`, a change of the
    effective pair inside an episode queues `fallback moved (episode <id>): tier <k> <acc> (<model>) unavailable
    (<reason>); now running tier <k> <acc> (<model>)` (id `fallback-<episode_id>-move-<n>`, durable in the runtime
@@ -413,23 +423,37 @@ The supervisor keeps it within `compaction.threshold_tokens` (default 300000):
   `last.error` starts `held:`, `pending` stays, a forced `COMPACT` is consumed, and one buildlog line per held
   episode `hydra-manager: compaction held (rollover disabled): context <N> over <limit>; enable
   compaction.rollover_enabled` (an episode ends when a measured turn clears `pending`).
-- `hydra status` shows one line, one number: `context: <N> tokens (turn <n>) | due over <limit> | last compaction:
+- `hydra status` shows one line, one number: `context: <N> tokens (turn <n>) | session start: <S> tokens | due over <limit> | last compaction:
   <at> (<before> -> <after>|failed|unverified|held)` or `<at> (cli)` for a compaction the Claude CLI did on its
   own (detected from the session transcript's `compact_boundary` records, recorded in `logs/compaction.json`
   `cli_compactions`), plus at most one suffix: `; compaction: forced` > `held` > `due (<reason>)` > `awaiting
-  verification`.
+  verification`. The `session start:` segment is the current session transcript's first assistant usage and is
+  absent when the session has no transcript or no assistant record yet. Right after this line, when a turn timed out
+  within the last 24 hours: `last turn timeout: <PDT> turn <n> working (<k> replies)` or `... silent`.
 - The compaction itself, under the WRITER lock and before the batched turn: a dedicated turn on the same session,
   `[compaction] Compact: write everything from this session that must survive into MEMORY.md (facts, decisions,
-  open questions, with dates), update MANAGER-HANDOFF.md, then reply only \`compacted\`.` (its handoff and memory
+  open questions, with dates), update MANAGER-HANDOFF.md, then reply `compacted` followed by the `---HANDOFF---` block with its five lines.` (its handoff and memory
   writes are kept; its own ledger line has `kind: compaction`), then `claude -p --resume <session-id> --model <id>
   --dangerously-skip-permissions "/compact"`. The session id is never touched.
-- The next Claude turn verifies: its `input_tokens` must be below the threshold. That turn's ledger line records
-  `compaction: {before_tokens, after_tokens, at, ok, reason}`; `hydra status` shows `last compaction: <at>
+- The rollover is verified by the new session's first request (`loops/b15.md` requirement 1): at every Claude turn's
+  end and at the start of `compaction_due`, the supervisor reads the new id's transcript
+  (`$CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<new id>.jsonl`) and takes its first `assistant` record's context (input +
+  cache creation + cache read); `ok` is that number under the threshold, the record carries `source: "transcript"`. A
+  transcript with no assistant record yet keeps the verification pending (`ok: null`); a turn's own measurement
+  settles it only when no transcript file of the new id exists at all (`source: "turn"`), and a measurement from
+  before the rollover never makes a compaction due. The turn's ledger line records
+  `compaction: {before_tokens, after_tokens, at, ok, reason, source}`; `hydra status` shows `last compaction: <at>
   (<before> -> <after>)`.
 - A failure (the `[compaction]` turn fails, `/compact` exits non-zero, or the tokens did not drop) is recorded with
   `ok: false` and `error` (on the compaction's own ledger line when known at once, else on the verifying turn's),
   posted once per streak to the buildlog (the webhook, or `buildlog_poster` in tests), and the policy backs off for
   `compaction.retry_after_s` (default 6 hours) before trying again. The session is kept as it is.
+- A shape failure of the `[compaction]` turn (rc 0, but no valid five-line handoff, or MEMORY.md's bytes unchanged)
+  keeps the old id as any failure does; the first shape failure of a streak arms no back-off, records
+  `shape_failures: 1` in `logs/compaction.json`, keeps `COMPACT` when the compaction was forced, and the next turn
+  boundary runs the compaction again with the message followed by one sentence naming the miss (the handoff block,
+  or MEMORY.md unchanged). The second consecutive shape failure backs off exactly as any failure; a rollover resets
+  the streak. An engine failure (nonzero return code) backs off at once.
 - `hydra compact` and `@manager compact` (founder only) write `COMPACT`: the compaction runs on the next tick, with or
   without queued events, regardless of quiet hours and the back-off. With a live loop `hydra compact` waits for it
   (`HYDRA_COMPACT_TIMEOUT`, default 900 s) and prints the outcome.
