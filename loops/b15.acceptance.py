@@ -118,7 +118,7 @@ def entry(msg):
 def record(msg, e, persistent=False):
     with open(D / 'calls.jsonl', 'a') as f:
         f.write(json.dumps({'acc': acc, 'model': model, 'argv': argv, 'resume': resume, 'sid': sid, 'transcript_existed': existed,
-                            'behaviour': e.get('behaviour'), 'stdin': msg[:400], 'stdin_sha': hashlib.sha256(msg.encode()).hexdigest(),
+                            'behaviour': e.get('behaviour'), 'stdin': msg, 'stdin_sha': hashlib.sha256(msg.encode()).hexdigest(),
                             'persistent_turn': persistent}) + '\n')
 def usage_of(e):
     ctx = int(e.get('ctx', 50000))
