@@ -605,3 +605,79 @@ def test_status_shows_the_session_start_and_the_last_turn_timeout_for_a_day(tmp_
     sup3.clock.now = T0 + dt.timedelta(hours=25)
     assert not status_lines(h3, "last turn timeout: "), "gone after 24 h"
     _ = sup
+
+
+# ---------------------------------------------------------------------------- PR #84 review round 1
+
+def test_an_engine_failure_ends_the_shape_streak_so_the_next_miss_is_retried_again(tmp_path):
+    """Round 1: a shape miss, then an engine failure of the compaction turn (rc 1, backs off as today), then a shape
+    miss after the back-off: the second miss is the first of a new streak (retried once, no back-off), never the
+    `second consecutive` one."""
+    h, d = make_home(tmp_path / "home"), make_fakes(tmp_path / "engine", {"compact": "no_handoff"})
+    buildlog = Poster()
+    sup = make(h, d, buildlog=buildlog)
+    old = session_id(h)
+    Path(h, "COMPACT").write_text("founder\n")
+    tick(sup, h, 0)
+    sup.run_once()
+    assert cstate(h)["shape_failures"] == 1 and cstate(h).get("failed_at") is None
+    set_table(d, {"compact": "fail"})
+    tick(sup, h, 1)
+    sup.run_once()
+    assert session_id(h) == old and cstate(h)["failed_at"] and not cstate(h).get("shape_failures") and not cstate(h).get("shape_miss")
+    assert not Path(h, "COMPACT").exists() and len(buildlog.posted) == 1
+    failed_before = cstate(h)["failed_at"]
+    set_table(d, {"compact": "no_handoff"})
+    Path(h, "COMPACT").write_text("founder\n")
+    tick(sup, h, 6 * 60 + 5)  # past the back-off
+    assert sup.compaction_due() == (True, "forced")
+    sup.run_once()
+    assert session_id(h) == old and cstate(h)["shape_failures"] == 1 and cstate(h)["failed_at"] == failed_before, "failed_at left alone"
+    assert Path(h, "COMPACT").exists() and len(buildlog.posted) == 1, "the first miss of the new streak: no back-off, no line"
+    assert sup.compaction_due() == (True, "forced"), "no new back-off"
+    set_table(d, {"compact": "ok"})
+    tick(sup, h, 6 * 60 + 6)
+    sup.run_once()
+    cc = compaction_calls(d)
+    assert HANDOFF_MISS in cc[-1]["stdin"] and session_id(h) != old and not cstate(h).get("shape_failures")
+
+
+def test_reconcile_queues_an_old_working_timeout_line_however_late_the_restart(tmp_path):
+    """Round 1: the row is the durable record and the receipts deduplicate forever, so a row older than any
+    cutoff whose enqueue was lost still gets its one line at the next start."""
+    h, d = make_home(tmp_path / "home"), make_fakes(tmp_path / "engine")
+    row = {"n": 7, "at": (T0 - dt.timedelta(days=30)).timestamp(), "engine": "claude-r2d2", "model": FABLE,
+           "events": ["e1"], "duration_s": 1800.4, "error": "claude-r2d2: timeout after 1800s",
+           "timeout": "working", "transcript_records": 2, "timeout_at": (T0 - dt.timedelta(days=30)).isoformat()}
+    S.append_jsonl(os.path.join(h, "logs", "turns.jsonl"), row)
+    make(h, d)
+    line = notices(h, "manager turn timeout: ")
+    assert len(line) == 1 and line[0]["id"] == "timeout-7" and line[0]["text"].startswith(f"manager turn timeout: turn 7 on claude-r2d2 ({FABLE}) ran 1800 s while working (2 replies)")
+    make(h, d)
+    assert len(notices(h, "manager turn timeout: ")) == 1, "exactly once"
+
+
+def test_working_timeout_line_names_the_step_that_timed_out_not_the_configured_pair(tmp_path, monkeypatch):
+    """Round 1: during a fault episode's probe or a fallback the step that ran out of time is not the configured
+    pair; the turn row and the line name the step (`timeout_engine`/`timeout_model`), the row's `engine` stays the
+    configured pair as in every failed turn."""
+    h, d = make_home(tmp_path / "home"), make_fakes(tmp_path / "engine")
+    sup = make(h, d)
+
+    def probe_timed_out(message, notes):
+        exc = S.EngineFault([("claude-l", "timeout after 3s")], uncertain=True)
+        exc.reasons, exc.step, exc.counted = [f"tier 1 claude-l ({FABLE}): timeout"], None, True
+        exc.timeout_info = {"timeout": "working", "transcript_records": 2, "acc": "claude-l", "model": FABLE}
+        raise exc
+    monkeypatch.setattr(sup, "run_engines", probe_timed_out)
+    eid = turn(sup, h, 0)
+    row = turns(h)[-1]
+    assert (row["engine"], row["timeout_engine"], row["timeout_model"], row["timeout"]) == ("claude-r2d2", "claude-l", FABLE, "working")
+    line = notices(h, "manager turn timeout: ")
+    assert len(line) == 1 and line[0]["text"].startswith(f"manager turn timeout: turn {row['n']} on claude-l ({FABLE}) ran ")
+    assert eid in S.handled_ids(h) and not Path(h, "logs", "fault.json").exists()
+    # the real path records the step too
+    d2 = make_fakes(tmp_path / "engine2", {f"claude-r2d2|{FABLE}": {"behaviour": "timeout_working", "records": 1}})
+    h2 = make_home(tmp_path / "home2")
+    turn(make(h2, d2), h2, 0)
+    assert (turns(h2)[-1]["timeout_engine"], turns(h2)[-1]["timeout_model"]) == ("claude-r2d2", FABLE)

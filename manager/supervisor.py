@@ -2301,7 +2301,8 @@ def _status_now(home):
 def _timeout_notice_text(record):
     """loops/b15.md requirement 3: the one top-level line of a working timeout, built from its turn row."""
     k = int(record.get("transcript_records") or 0)
-    return (f"manager turn timeout: turn {record.get('n')} on {record.get('engine')} ({record.get('model')}) ran "
+    acc, model = record.get("timeout_engine") or record.get("engine"), record.get("timeout_model") or record.get("model")
+    return (f"manager turn timeout: turn {record.get('n')} on {acc} ({model}) ran "
             f"{float(record.get('duration_s') or 0):.0f} s while working ({k} replies); its events were answered as unavailable")
 
 
@@ -2926,7 +2927,9 @@ class Supervisor:
             if isinstance(timeout_info, dict) and timeout_info.get("timeout") in ("working", "silent"):
                 # loops/b15.md requirement 3: the kind is durable in the turn row before any line is queued
                 record.update({"timeout": timeout_info["timeout"], "transcript_records": int(timeout_info.get("transcript_records") or 0),
-                               "timeout_at": self.now()})
+                               "timeout_at": self.now(), "timeout_engine": timeout_info.get("acc") or pair["acc"],
+                               "timeout_model": timeout_info.get("model") or pair["model"]})  # the step that timed out, not
+                # the configured pair: during a fault episode's probe or a fallback the two differ (PR #84 round 1)
             append_jsonl(self.path("logs", "turns.jsonl"), record)
             write_text(self.path("logs", "retry-after"), str(time.time() + RETRY_AFTER_S))
             self.react_failed(events)
@@ -3328,6 +3331,8 @@ class Supervisor:
                     classification = "timeout"
             record_attempt(self.home, name, model, rc, classification, err, False, retried_resume=self._last_retried_resume,
                            extra=timeout_info)
+            if timeout_info is not None:
+                timeout_info.update({"acc": name, "model": model})  # the step that timed out, for the turn row and its line
             if (name, model) == fault_step and rc not in (17, 124) and classification not in ("other", "rate_limit"):
                 self._fault_probe_consumed()  # loops/b14.md requirement 4: a usage failure on the probe is a probe
             errors.append((name, (err or "").strip()[-400:] or f"exit {rc}"))
@@ -4507,6 +4512,11 @@ class Supervisor:
                 self.save_compaction_state(state)
                 log(f"compaction shape failure ({shape_miss}): {error}; session {old_id or '-'} kept; retried at the next tick")
                 return rec
+        if not shape_miss:
+            # an engine failure (rc != 0) backs off and ends any shape-failure streak: the next shape miss after it
+            # is the first of a new streak and is retried once again (PR #84 round 1)
+            state.pop("shape_failures", None)
+            state.pop("shape_miss", None)
         state["last"] = rec
         state["pending"] = pending or None
         with contextlib.suppress(FileNotFoundError):
@@ -4957,14 +4967,13 @@ class Supervisor:
 
     def _reconcile_timeout_notice(self):
         """loops/b15.md requirement 3: a working timeout's line is durable in its turn row before it is queued; a
-        restart queues the line of any recent row that never reached the outbox, exactly once (the outbox and the
+        restart queues the line of any row that never reached the outbox, exactly once (the outbox and the
         bridge receipts deduplicate)."""
         for r in self.turns():
             if not isinstance(r, dict) or r.get("timeout") != "working" or r.get("n") is None:
                 continue
-            at = _status_timestamp(r.get("at"))
-            if at is None or time.time() - at > 7 * 86400:
-                continue
+            # no age cutoff: the row is the durable record and the receipts file deduplicates forever, so a line
+            # whose enqueue was lost is delivered however late the restart comes (review round 1 of PR #84)
             _queue_notice_once(self.home, self.dev_channel, _timeout_notice_text(r), f"timeout-{r['n']}")
 
     def _reconcile_fault_notice(self):
