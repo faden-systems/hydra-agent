@@ -25,7 +25,9 @@ for f in "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py"; do
 done
 # the gate: refuses a spec without a current dry-run (verdict STOPPED_AT_PRODUCT, the three spec files unchanged since)
 if ! bash "$HERE/dry_run_gate.sh" "$ID" "$R" | tee "$L/dry-run-gate.txt"; then
-  echo "LAUNCH REFUSED by the dry-run gate (see $L/dry-run-gate.txt); run tools/factory/loop_dry_run.sh $ID first"; rm -rf "$R"; exit 6
+  # a refusal leaves nothing behind that a retry would trip on: the gate's text is kept beside the logs dirs
+  REF="$C/$ID-$M-gate-refused-$(date -u +%Y%m%dT%H%M%SZ).txt"; mv "$L/dry-run-gate.txt" "$REF"; rm -rf "$R" "$L"
+  echo "LAUNCH REFUSED by the dry-run gate (see $REF); run tools/factory/loop_dry_run.sh $ID first, then retry this launch"; exit 6
 fi
 cp "$C/$ID-dry-run.json" "$L/dry-run.json"
 python3 - "$R" "$L" "$ID" <<'PY'

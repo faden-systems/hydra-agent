@@ -8,8 +8,11 @@ Before a coder launches or the manager starts a build, the spec's checks run onc
    (every `## heading` the exit names). `CI=true BASE_REF=<main> bash loops/<id>.exit.sh` then runs the fence, the
    function fence, the frozen files, the amended-ids rule, the notes and the base checks for real. Verdicts:
    - `STOPPED_AT_PRODUCT`: the exit failed at its first product-dependent check: exactly one FAIL line, matching
-     `--expect` (default: the "unchanged / missing / own tests are missing / does not call" wordings), the last tagged
-     line of the log, nothing crash-like after it, rc 1. The dry-run passes.
+     `--expect`, the last tagged line of the log, nothing crash-like after it, rc 1. The dry-run passes. The default
+     `--expect` is narrow on purpose: `<file> is unchanged`, `tests <glob> are missing`, `does not call|pass|receive`,
+     `still calls`, `has no <symbol>` (one word, or `<name> class|method|function`); a notes, base, fence, amended-ids
+     or cut-short wording never matches. A spec whose product check says it differently passes its wording in
+     `--expect`, and the spec PR's dry-run comment shows which line stopped the exit.
    - `HARNESS_DEFECT`: any other FAIL, a crash, or the 1800 s cap. Fix the spec PR and rerun.
    - `NO_PRODUCT_GATE`: the exit passed with no product. The spec checks nothing of its own; fix it.
 2. Every `--replay <dir>` runs `python loops/<id>.acceptance.py --replay <dir>`: the driver's parsers and counters over
@@ -32,7 +35,7 @@ Before a coder launches or the manager starts a build, the spec's checks run onc
    exception for a spec without a PR, and it prints), and the record hashes exactly the three spec files and each
    sha256 still matches (an amendment after the dry-run needs a new one). It is on the launch path: `tools/factory/coder_launch.sh <id> <main sha> <spec sha>`
    (the one launcher for every loop from rs1 on; it replaces the per-loop `coder/<id>-launch.sh` copies) clones, checks
-   the frozen spec files against the spec commit, then runs the gate and removes the clone on refusal (exit 6) before
+   the frozen spec files against the spec commit, then runs the gate and removes the clone and the logs dir on refusal (exit 6, the gate's text kept as `coder/<id>-<main>-gate-refused-<stamp>.txt`, so a retry after the dry-run starts clean) before
    the account check and the coder start. The gate's output is kept at `coder/<id>-<main>-logs/dry-run-gate.txt` with
    a copy of the dry-run record. `--dry` stops after the gate (a launch rehearsal). A manager-run build has no script;
    the manager runs the gate by hand before its first build command.
