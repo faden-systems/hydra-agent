@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # The dry-run of a loop's checks before its build (founder standing rule 2026-10-19, 1792422361):
 #
-#   tools/factory/loop_dry_run.sh <id> [--repo <checkout>] [--pr <number>] [--replay <evidence-dir>]... [--out <dir>]
-#                                      [--expect <regex>] [--replay-optional]
+#   tools/factory/loop_dry_run.sh <id> [--repo <checkout>] [--spec-ref <branch>] [--pr <number>] [--replay <evidence-dir>]...
+#                                      [--out <dir>] [--expect <regex>] [--replay-optional]
+# --spec-ref <branch>: the spec under review is not on main yet (the usual case): its three loops files are put on top of
+#   main. It needs --pr: the branch must be the head of an open spec PR of this repository opened by the account running
+#   the script (the branch's exit and acceptance scripts execute on this host; see README "limits").
+# origin/main as the exit's base, then the no-op candidate; without it the spec is read from origin/main.
 # (--repo, --out and --replay paths may be relative to the caller's directory; they are resolved before the worktree switch)
 #
 # 1. A temporary worktree of the checkout's origin/main; a no-op candidate = one commit adding the notes stub
@@ -21,12 +25,13 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${1:?loop id}"; shift
-REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=()
+REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=(); SPEC_REF=""
 while [ $# -gt 0 ]; do
   case "$1" in
     # paths are made absolute here: the script changes into a temporary worktree before using them
     --repo) REPO="$(realpath -m "$2")"; shift 2;; --pr) PR="$2"; shift 2;; --out) OUT="$(realpath -m "$2")"; shift 2;;
     --expect) EXPECT="$2"; shift 2;; --replay) REPLAYS+=("$(realpath -m "$2")"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
+    --spec-ref) SPEC_REF="$2"; shift 2;;  # the spec PR's branch: its three loops files on top of main (the usual case: a spec not yet merged)
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -37,8 +42,36 @@ EXPECT="${EXPECT:-$DEFAULT_EXPECT}"
 cd "$REPO" || exit 2
 git fetch -q origin || { echo "fetch failed in $REPO" >&2; exit 2; }
 MAIN="$(git rev-parse origin/main)"
+SPEC_AT="$MAIN"
+if [ -n "$SPEC_REF" ]; then
+  # the remote's branch first (just fetched), a local ref only when no such remote branch exists: a stale local branch
+  # never stands in for the PR's head
+  SPEC_AT="$(git rev-parse "origin/$SPEC_REF" 2>/dev/null)" || SPEC_AT="$(git rev-parse "$SPEC_REF" 2>/dev/null)" || { echo "spec ref not found: $SPEC_REF" >&2; exit 2; }
+fi
+# a spec that is not on main runs only from a spec PR of this repository opened by the account running this script (the
+# manager's own): the branch's exit and acceptance scripts execute here, so the source must be the reviewed, manager-owned
+# spec PR, not any branch someone pushed
+[ -n "$SPEC_REF" ] && [ -z "$PR" ] && { echo "--spec-ref needs --pr <number>: a spec off main runs only from its spec PR" >&2; exit 2; }
+if [ -n "$PR" ]; then
+  # the record must describe the PR's head: with --spec-ref the ref must be the PR's head; without it the PR's head is the spec
+  REMOTE_EARLY="$(git remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')"
+  PR_INFO="$(gh pr view "$PR" --repo "$REMOTE_EARLY" --json headRefOid,author,isCrossRepository,state -q '[.headRefOid, .author.login, (.isCrossRepository|tostring), .state] | join(" ")' 2>/dev/null)" || PR_INFO=""
+  read -r PR_HEAD PR_AUTHOR PR_CROSS PR_STATE <<<"$PR_INFO"
+  [ -n "$PR_HEAD" ] || { echo "cannot read PR #$PR's head on $REMOTE_EARLY (gh pr view failed)" >&2; exit 2; }
+  ME="$(gh api user -q .login 2>/dev/null)" || ME=""
+  [ -n "$ME" ] || { echo "cannot read the gh account (gh api user failed)" >&2; exit 2; }
+  [ "$PR_AUTHOR" = "$ME" ] || { echo "PR #$PR was opened by $PR_AUTHOR, not by this account ($ME): only the manager's own spec PRs run here" >&2; exit 2; }
+  [ "$PR_CROSS" = "false" ] || { echo "PR #$PR comes from a fork: only branches of $REMOTE_EARLY run here" >&2; exit 2; }
+  [ "$PR_STATE" = "OPEN" ] || { echo "PR #$PR is $PR_STATE, not open" >&2; exit 2; }
+  if [ -n "$SPEC_REF" ]; then
+    [ "$SPEC_AT" = "$PR_HEAD" ] || { echo "spec ref $SPEC_REF resolves to $SPEC_AT but PR #$PR's head is $PR_HEAD: fetch, or name the PR's branch" >&2; exit 2; }
+  else
+    git cat-file -e "$PR_HEAD^{commit}" 2>/dev/null || git fetch -q origin "$PR_HEAD" || { echo "cannot fetch PR #$PR's head $PR_HEAD" >&2; exit 2; }
+    SPEC_REF="pr-$PR"; SPEC_AT="$PR_HEAD"
+  fi
+fi
 for f in loops/$ID.md loops/$ID.exit.sh loops/$ID.acceptance.py; do
-  git cat-file -e "$MAIN:$f" 2>/dev/null || { echo "spec file missing on origin/main: $f" >&2; exit 2; }
+  git cat-file -e "$SPEC_AT:$f" 2>/dev/null || { echo "spec file missing at ${SPEC_REF:-origin/main} ($SPEC_AT): $f" >&2; exit 2; }
 done
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${OUT:-${HYDRA_HOME:-$HOME}/artifacts/dry-run/$ID-${MAIN:0:8}-$STAMP}"; mkdir -p "$OUT"
@@ -50,6 +83,19 @@ cleanup() { git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
 trap cleanup EXIT
 cd "$WT"
 git config user.name hydra-dry-run; git config user.email dry-run@hydra.local
+if [ "$SPEC_AT" != "$MAIN" ]; then
+  # the spec under review on top of main: exactly its three loops files (the rest of the PR, if any, is not the spec)
+  git checkout -q "$SPEC_AT" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py" || { echo "cannot take the spec files from $SPEC_AT" >&2; exit 2; }
+  if git diff --cached --quiet -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py"; then
+    say "[dry-run] the spec files at $SPEC_REF equal origin/main's: the base is main itself"
+  else
+    git commit -q -m "dry-run: the $ID spec from $SPEC_REF ($SPEC_AT)" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py" || { echo "the spec commit failed" >&2; exit 2; }
+  fi
+  git diff --cached --quiet && git diff --quiet || { echo "the worktree is not clean after the spec commit" >&2; exit 2; }
+  BASE_FOR_EXIT="$(git rev-parse HEAD)"
+else
+  BASE_FOR_EXIT="$MAIN"
+fi
 # the notes stub: every "## heading" the exit script names, in the order it names them, plus the standard four
 HEADS="$(grep -o '"## [A-Za-z][A-Za-z -]*"' "loops/$ID.exit.sh" | tr -d '"' | awk '!seen[$0]++')"
 {
@@ -63,11 +109,18 @@ HEADS="$(grep -o '"## [A-Za-z][A-Za-z -]*"' "loops/$ID.exit.sh" | tr -d '"' | aw
     echo "$h"; echo; echo "dry-run: no product."; echo
   done
 } > "docs/notes/$ID.md"
-git add "docs/notes/$ID.md"; git commit -q -m "dry-run: no-op candidate for $ID (notes stub only)"
-say "[dry-run] $ID on origin/main $MAIN; no-op candidate $(git rev-parse --short HEAD); out $OUT"
-say "[dry-run] exit: CI=true BASE_REF=$MAIN bash loops/$ID.exit.sh"
+git add "docs/notes/$ID.md"; git commit -q -m "dry-run: no-op candidate for $ID (notes stub only)" || { echo "the notes-stub commit failed" >&2; exit 2; }
+# the candidate is exactly the notes stub on top of the spec base, nothing else
+ONLY="$(git diff --name-only "$BASE_FOR_EXIT" HEAD)"
+[ "$ONLY" = "docs/notes/$ID.md" ] || { echo "the no-op candidate is not notes-only (changed: $(echo "$ONLY" | tr '\n' ' '))" >&2; exit 2; }
+say "[dry-run] $ID on origin/main $MAIN${SPEC_REF:+ with the spec from $SPEC_REF ($SPEC_AT)}; no-op candidate $(git rev-parse --short HEAD); out $OUT"
+say "[dry-run] exit: CI=true BASE_REF=$BASE_FOR_EXIT bash loops/$ID.exit.sh"
 PY="${PYTHON:-$(command -v python3)}"
-( CI=true BASE_REF="$MAIN" PYTHON="$PY" timeout -k 10 1800 bash "loops/$ID.exit.sh" ) > "$OUT/exit.log" 2>&1; RC=$?
+# the exit of a spec under review is a branch's shell script: it runs in the replay's sandbox (every credential-looking
+# variable removed, the proxies dead, no_proxy empty) - its pre-product checks need git, python and the local tree only
+( env -u NO_PROXY -u no_proxy $(env | grep -iE '^[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=' | cut -d= -f1 | sed 's/^/-u /') \
+    HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+    CI=true DRY_RUN=1 BASE_REF="$BASE_FOR_EXIT" PYTHON="$PY" timeout -k 10 1800 bash "loops/$ID.exit.sh" ) > "$OUT/exit.log" 2>&1; RC=$?
 sed "s/^/  | /" "$OUT/exit.log" | tail -n 80 >> "$LOG"
 FAIL_LINE="$(grep -E "^\[$ID\] FAIL:" "$OUT/exit.log" | tail -n 1)"
 FAIL_COUNT="$(grep -cE "^\[$ID\] FAIL:" "$OUT/exit.log")"
@@ -103,8 +156,9 @@ for d in "${REPLAYS[@]:-}"; do
     # with every credential-looking variable removed and HTTP(S)_PROXY pointed at a dead local port with no_proxy
     # empty: a driver that does start live work (a model call, its own server) fails on its first connection instead
     # of running it; the 600 s cap bounds the rest
+    OUT_VAR="$(echo "$ID" | tr '[:lower:]' '[:upper:]')_OUT"  # the driver's own evidence variable: its replay output lands beside the dry-run
     ( env -u NO_PROXY -u no_proxy $(env | grep -iE '^[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=' | cut -d= -f1 | sed 's/^/-u /') \
-        CI=true DRY_RUN_REPLAY=1 HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+        "$OUT_VAR=$OUT/replay-$(basename "$d")" CI=true DRY_RUN_REPLAY=1 HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
         PYTHONPATH="$WT/fitflow-app:$WT/loops:$WT" timeout -k 10 600 "$PY" "loops/$ID.acceptance.py" --replay "$d" ) > "$rl" 2>&1; rrc=$?; mode="ran (sandboxed: no credentials, dead proxy)"
   fi
   [ $rrc -eq 0 ] || RFAIL=1
@@ -114,10 +168,10 @@ for d in "${REPLAYS[@]:-}"; do
 done
 if [ $RFAIL -ne 0 ] && [ $OPTIONAL -eq 0 ]; then say "[dry-run] a replay failed: the acceptance driver's checks do not hold on existing evidence (or lack --replay)"; [ "$VERDICT" = STOPPED_AT_PRODUCT ] && VERDICT="REPLAY_FAILED"; fi
 SPEC_SHA="$("$PY" -c 'import hashlib,sys,json; print(json.dumps({f: hashlib.sha256(open(f,"rb").read()).hexdigest() for f in sys.argv[1:]}))' "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py")"
-"$PY" - "$OUT/dry-run.json" "$ID" "$MAIN" "$VERDICT" "$STOP" "$RC" "$REPLAY_JSON" "$SPEC_SHA" "$STAMP" "$LOG" "$PR" <<'PYJ'
+"$PY" - "$OUT/dry-run.json" "$ID" "$MAIN" "$VERDICT" "$STOP" "$RC" "$REPLAY_JSON" "$SPEC_SHA" "$STAMP" "$LOG" "$PR" "${SPEC_REF:+$SPEC_REF@$SPEC_AT}" <<'PYJ'
 import json, sys
-o, i, m, v, s, rc, rj, ss, st, log, pr = sys.argv[1:]
-json.dump({"id": i, "main": m, "verdict": v, "stopped_at": s, "exit_rc": int(rc), "replays": json.loads(rj), "spec_sha256": json.loads(ss), "at": st, "log": log, "pr": (int(pr) if pr else None)}, open(o, "w"), indent=1)
+o, i, m, v, s, rc, rj, ss, st, log, pr = sys.argv[1:12]
+json.dump({"id": i, "main": m, "verdict": v, "stopped_at": s, "exit_rc": int(rc), "replays": json.loads(rj), "spec_sha256": json.loads(ss), "at": st, "log": log, "pr": (int(pr) if pr else None), "spec_ref": (sys.argv[12] if len(sys.argv) > 12 and sys.argv[12] else None)}, open(o, "w"), indent=1)
 PYJ
 POSTED=false
 if [ -n "$PR" ]; then
