@@ -177,7 +177,8 @@ POSTED=false
 if [ -n "$PR" ]; then
   REMOTE="$(git -C "$REPO" remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')"
   if { echo "## Dry-run (${MAIN:0:8}, $STAMP)"; echo; echo "verdict: **$VERDICT**"; echo; echo "stopped at: \`$STOP\`"; echo
-    [ "$REPLAY_JSON" != "[]" ] && { echo "replays:"; "$PY" -c 'import json,sys; [print(f"- {r[\"dir\"]}: rc={r[\"rc\"]} ({r[\"mode\"]})") for r in json.loads(sys.argv[1])]' "$REPLAY_JSON"; echo; }
+    [ "$REPLAY_JSON" != "[]" ] && { echo "replays:"; "$PY" -c 'import json,sys
+for r in json.loads(sys.argv[1]): print("- %s: rc=%s (%s)" % (r["dir"], r["rc"], r["mode"]))' "$REPLAY_JSON"; echo; }
     echo '```'; tail -n 40 "$OUT/exit.log"; echo '```'; } | gh pr comment "$PR" --repo "$REMOTE" --body-file - >/dev/null
   then POSTED=true; say "[dry-run] posted on PR #$PR"
   else say "[dry-run] the PR comment on #$PR FAILED: the record is not accepted (no copy for the gate); rerun with --pr once gh works"; fi
