@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # The dry-run of a loop's checks before its build (founder standing rule 2026-10-19, 1792422361):
 #
-#   tools/factory/loop_dry_run.sh <id> [--repo <checkout>] [--pr <number>] [--replay <evidence-dir>]... [--out <dir>]
-#                                      [--expect <regex>] [--replay-optional]
+#   tools/factory/loop_dry_run.sh <id> [--repo <checkout>] [--spec-ref <branch>] [--pr <number>] [--replay <evidence-dir>]...
+#                                      [--out <dir>] [--expect <regex>] [--replay-optional]
+# --spec-ref <branch>: the spec under review is not on main yet (the usual case): its three loops files are put on top of
+# origin/main as the exit's base, then the no-op candidate; without it the spec is read from origin/main.
 # (--repo, --out and --replay paths may be relative to the caller's directory; they are resolved before the worktree switch)
 #
 # 1. A temporary worktree of the checkout's origin/main; a no-op candidate = one commit adding the notes stub
@@ -21,12 +23,13 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${1:?loop id}"; shift
-REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=()
+REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=(); SPEC_REF=""
 while [ $# -gt 0 ]; do
   case "$1" in
     # paths are made absolute here: the script changes into a temporary worktree before using them
     --repo) REPO="$(realpath -m "$2")"; shift 2;; --pr) PR="$2"; shift 2;; --out) OUT="$(realpath -m "$2")"; shift 2;;
     --expect) EXPECT="$2"; shift 2;; --replay) REPLAYS+=("$(realpath -m "$2")"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
+    --spec-ref) SPEC_REF="$2"; shift 2;;  # the spec PR's branch: its three loops files on top of main (the usual case: a spec not yet merged)
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -37,8 +40,12 @@ EXPECT="${EXPECT:-$DEFAULT_EXPECT}"
 cd "$REPO" || exit 2
 git fetch -q origin || { echo "fetch failed in $REPO" >&2; exit 2; }
 MAIN="$(git rev-parse origin/main)"
+SPEC_AT="$MAIN"
+if [ -n "$SPEC_REF" ]; then
+  SPEC_AT="$(git rev-parse "$SPEC_REF" 2>/dev/null)" || SPEC_AT="$(git rev-parse "origin/$SPEC_REF" 2>/dev/null)" || { echo "spec ref not found: $SPEC_REF" >&2; exit 2; }
+fi
 for f in loops/$ID.md loops/$ID.exit.sh loops/$ID.acceptance.py; do
-  git cat-file -e "$MAIN:$f" 2>/dev/null || { echo "spec file missing on origin/main: $f" >&2; exit 2; }
+  git cat-file -e "$SPEC_AT:$f" 2>/dev/null || { echo "spec file missing at ${SPEC_REF:-origin/main} ($SPEC_AT): $f" >&2; exit 2; }
 done
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${OUT:-${HYDRA_HOME:-$HOME}/artifacts/dry-run/$ID-${MAIN:0:8}-$STAMP}"; mkdir -p "$OUT"
@@ -50,6 +57,14 @@ cleanup() { git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
 trap cleanup EXIT
 cd "$WT"
 git config user.name hydra-dry-run; git config user.email dry-run@hydra.local
+if [ "$SPEC_AT" != "$MAIN" ]; then
+  # the spec under review on top of main: exactly its three loops files (the rest of the PR, if any, is not the spec)
+  git checkout -q "$SPEC_AT" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py"
+  git commit -q -m "dry-run: the $ID spec from $SPEC_REF ($SPEC_AT)" -- "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py" 2>/dev/null || true
+  BASE_FOR_EXIT="$(git rev-parse HEAD)"
+else
+  BASE_FOR_EXIT="$MAIN"
+fi
 # the notes stub: every "## heading" the exit script names, in the order it names them, plus the standard four
 HEADS="$(grep -o '"## [A-Za-z][A-Za-z -]*"' "loops/$ID.exit.sh" | tr -d '"' | awk '!seen[$0]++')"
 {
@@ -64,10 +79,10 @@ HEADS="$(grep -o '"## [A-Za-z][A-Za-z -]*"' "loops/$ID.exit.sh" | tr -d '"' | aw
   done
 } > "docs/notes/$ID.md"
 git add "docs/notes/$ID.md"; git commit -q -m "dry-run: no-op candidate for $ID (notes stub only)"
-say "[dry-run] $ID on origin/main $MAIN; no-op candidate $(git rev-parse --short HEAD); out $OUT"
-say "[dry-run] exit: CI=true BASE_REF=$MAIN bash loops/$ID.exit.sh"
+say "[dry-run] $ID on origin/main $MAIN${SPEC_REF:+ with the spec from $SPEC_REF ($SPEC_AT)}; no-op candidate $(git rev-parse --short HEAD); out $OUT"
+say "[dry-run] exit: CI=true BASE_REF=$BASE_FOR_EXIT bash loops/$ID.exit.sh"
 PY="${PYTHON:-$(command -v python3)}"
-( CI=true BASE_REF="$MAIN" PYTHON="$PY" timeout -k 10 1800 bash "loops/$ID.exit.sh" ) > "$OUT/exit.log" 2>&1; RC=$?
+( CI=true BASE_REF="$BASE_FOR_EXIT" PYTHON="$PY" timeout -k 10 1800 bash "loops/$ID.exit.sh" ) > "$OUT/exit.log" 2>&1; RC=$?
 sed "s/^/  | /" "$OUT/exit.log" | tail -n 80 >> "$LOG"
 FAIL_LINE="$(grep -E "^\[$ID\] FAIL:" "$OUT/exit.log" | tail -n 1)"
 FAIL_COUNT="$(grep -cE "^\[$ID\] FAIL:" "$OUT/exit.log")"
@@ -103,8 +118,9 @@ for d in "${REPLAYS[@]:-}"; do
     # with every credential-looking variable removed and HTTP(S)_PROXY pointed at a dead local port with no_proxy
     # empty: a driver that does start live work (a model call, its own server) fails on its first connection instead
     # of running it; the 600 s cap bounds the rest
+    OUT_VAR="$(echo "$ID" | tr '[:lower:]' '[:upper:]')_OUT"  # the driver's own evidence variable: its replay output lands beside the dry-run
     ( env -u NO_PROXY -u no_proxy $(env | grep -iE '^[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=' | cut -d= -f1 | sed 's/^/-u /') \
-        CI=true DRY_RUN_REPLAY=1 HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+        "$OUT_VAR=$OUT/replay-$(basename "$d")" CI=true DRY_RUN_REPLAY=1 HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
         PYTHONPATH="$WT/fitflow-app:$WT/loops:$WT" timeout -k 10 600 "$PY" "loops/$ID.acceptance.py" --replay "$d" ) > "$rl" 2>&1; rrc=$?; mode="ran (sandboxed: no credentials, dead proxy)"
   fi
   [ $rrc -eq 0 ] || RFAIL=1
@@ -114,10 +130,10 @@ for d in "${REPLAYS[@]:-}"; do
 done
 if [ $RFAIL -ne 0 ] && [ $OPTIONAL -eq 0 ]; then say "[dry-run] a replay failed: the acceptance driver's checks do not hold on existing evidence (or lack --replay)"; [ "$VERDICT" = STOPPED_AT_PRODUCT ] && VERDICT="REPLAY_FAILED"; fi
 SPEC_SHA="$("$PY" -c 'import hashlib,sys,json; print(json.dumps({f: hashlib.sha256(open(f,"rb").read()).hexdigest() for f in sys.argv[1:]}))' "loops/$ID.md" "loops/$ID.exit.sh" "loops/$ID.acceptance.py")"
-"$PY" - "$OUT/dry-run.json" "$ID" "$MAIN" "$VERDICT" "$STOP" "$RC" "$REPLAY_JSON" "$SPEC_SHA" "$STAMP" "$LOG" "$PR" <<'PYJ'
+"$PY" - "$OUT/dry-run.json" "$ID" "$MAIN" "$VERDICT" "$STOP" "$RC" "$REPLAY_JSON" "$SPEC_SHA" "$STAMP" "$LOG" "$PR" "${SPEC_REF:+$SPEC_REF@$SPEC_AT}" <<'PYJ'
 import json, sys
-o, i, m, v, s, rc, rj, ss, st, log, pr = sys.argv[1:]
-json.dump({"id": i, "main": m, "verdict": v, "stopped_at": s, "exit_rc": int(rc), "replays": json.loads(rj), "spec_sha256": json.loads(ss), "at": st, "log": log, "pr": (int(pr) if pr else None)}, open(o, "w"), indent=1)
+o, i, m, v, s, rc, rj, ss, st, log, pr = sys.argv[1:12]
+json.dump({"id": i, "main": m, "verdict": v, "stopped_at": s, "exit_rc": int(rc), "replays": json.loads(rj), "spec_sha256": json.loads(ss), "at": st, "log": log, "pr": (int(pr) if pr else None), "spec_ref": (sys.argv[12] if len(sys.argv) > 12 and sys.argv[12] else None)}, open(o, "w"), indent=1)
 PYJ
 POSTED=false
 if [ -n "$PR" ]; then

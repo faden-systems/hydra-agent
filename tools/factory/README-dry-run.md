@@ -2,7 +2,10 @@
 
 Before a coder launches or the manager starts a build, the spec's checks run once for real on main with no product.
 
-    tools/factory/loop_dry_run.sh <id> --repo <faden or hydra-agent checkout> [--pr <spec PR>] [--replay <evidence dir>]...
+    tools/factory/loop_dry_run.sh <id> --repo <faden or hydra-agent checkout> --spec-ref <spec branch> [--pr <spec PR>] [--replay <evidence dir>]...
+
+`--spec-ref` names the spec PR's branch: the three `loops/<id>.*` files of that branch are committed on top of origin/main
+(the exit's base), then the no-op candidate. Without it the spec is read from origin/main (a spec already merged).
 
 1. A temporary worktree of origin/main carries a no-op candidate: one commit adding the notes stub `docs/notes/<id>.md`
    (every `## heading` the exit names). `CI=true BASE_REF=<main> bash loops/<id>.exit.sh` then runs the fence, the
