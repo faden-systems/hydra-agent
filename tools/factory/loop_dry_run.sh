@@ -4,6 +4,8 @@
 #   tools/factory/loop_dry_run.sh <id> [--repo <checkout>] [--spec-ref <branch>] [--pr <number>] [--replay <evidence-dir>]...
 #                                      [--out <dir>] [--expect <regex>] [--replay-optional]
 # --spec-ref <branch>: the spec under review is not on main yet (the usual case): its three loops files are put on top of
+#   main. It needs --pr: the branch must be the head of an open spec PR of this repository opened by the account running
+#   the script (the branch's exit and acceptance scripts execute on this host; see README "limits").
 # origin/main as the exit's base, then the no-op candidate; without it the spec is read from origin/main.
 # (--repo, --out and --replay paths may be relative to the caller's directory; they are resolved before the worktree switch)
 #
@@ -46,11 +48,21 @@ if [ -n "$SPEC_REF" ]; then
   # never stands in for the PR's head
   SPEC_AT="$(git rev-parse "origin/$SPEC_REF" 2>/dev/null)" || SPEC_AT="$(git rev-parse "$SPEC_REF" 2>/dev/null)" || { echo "spec ref not found: $SPEC_REF" >&2; exit 2; }
 fi
+# a spec that is not on main runs only from a spec PR of this repository opened by the account running this script (the
+# manager's own): the branch's exit and acceptance scripts execute here, so the source must be the reviewed, manager-owned
+# spec PR, not any branch someone pushed
+[ -n "$SPEC_REF" ] && [ -z "$PR" ] && { echo "--spec-ref needs --pr <number>: a spec off main runs only from its spec PR" >&2; exit 2; }
 if [ -n "$PR" ]; then
   # the record must describe the PR's head: with --spec-ref the ref must be the PR's head; without it the PR's head is the spec
   REMOTE_EARLY="$(git remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')"
-  PR_HEAD="$(gh pr view "$PR" --repo "$REMOTE_EARLY" --json headRefOid -q .headRefOid 2>/dev/null)" || PR_HEAD=""
+  PR_INFO="$(gh pr view "$PR" --repo "$REMOTE_EARLY" --json headRefOid,author,isCrossRepository,state -q '[.headRefOid, .author.login, (.isCrossRepository|tostring), .state] | join(" ")' 2>/dev/null)" || PR_INFO=""
+  read -r PR_HEAD PR_AUTHOR PR_CROSS PR_STATE <<<"$PR_INFO"
   [ -n "$PR_HEAD" ] || { echo "cannot read PR #$PR's head on $REMOTE_EARLY (gh pr view failed)" >&2; exit 2; }
+  ME="$(gh api user -q .login 2>/dev/null)" || ME=""
+  [ -n "$ME" ] || { echo "cannot read the gh account (gh api user failed)" >&2; exit 2; }
+  [ "$PR_AUTHOR" = "$ME" ] || { echo "PR #$PR was opened by $PR_AUTHOR, not by this account ($ME): only the manager's own spec PRs run here" >&2; exit 2; }
+  [ "$PR_CROSS" = "false" ] || { echo "PR #$PR comes from a fork: only branches of $REMOTE_EARLY run here" >&2; exit 2; }
+  [ "$PR_STATE" = "OPEN" ] || { echo "PR #$PR is $PR_STATE, not open" >&2; exit 2; }
   if [ -n "$SPEC_REF" ]; then
     [ "$SPEC_AT" = "$PR_HEAD" ] || { echo "spec ref $SPEC_REF resolves to $SPEC_AT but PR #$PR's head is $PR_HEAD: fetch, or name the PR's branch" >&2; exit 2; }
   else
