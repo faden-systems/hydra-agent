@@ -9,7 +9,10 @@ a local ref only when no such remote branch exists) are committed on top of orig
 candidate. With `--pr` the ref must resolve to the PR's head (else exit 2); `--pr` alone takes the PR's head as the spec.
 Without either the spec is read from origin/main (a spec already merged). The exit of a spec under review is a branch's
 shell script, so it runs in the same sandbox as the replays (credentials removed, proxies dead): its pre-product checks
-need only git, python and the local tree.
+need only git, python and the local tree. That is a mitigation, not isolation: the script can still read files and open
+direct connections. The VM has no unprivileged user namespaces, bubblewrap, firejail or sudo, so nothing stronger is
+possible there today; a host that allows `unshare -n` adds it to the exit's invocation. What protects the host is that
+spec PRs are the manager's own and the exit script is reviewed in the same PR before the dry-run runs.
 
 1. A temporary worktree of origin/main carries a no-op candidate: one commit adding the notes stub `docs/notes/<id>.md`
    (every `## heading` the exit names). `CI=true BASE_REF=<main> bash loops/<id>.exit.sh` then runs the fence, the
