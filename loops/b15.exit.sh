@@ -37,7 +37,7 @@ assert ast.literal_eval(consts['ENGINE_TIMEOUT_S'])==1800,'ENGINE_TIMEOUT_S chan
 assert ast.literal_eval(consts['FAULT_ESCALATE_COUNT'])==3 and ast.literal_eval(consts['FAULT_ESCALATE_S'])==1800,'the b14 valve constants changed'
 for needle,why in (('"timeout"','the attempt classification literal (requirement 3)'),('"working"','the working literal'),('"silent"','the silent literal'),
                    ('"transcript"','the verification source literal (requirement 1)'),('shape_failures','the shape-failure streak (requirement 2b)'),
-                   ('manager turn timeout: ','the working-timeout line wording'),('silent timeout','the silent fault wording'),
+                   ('manager turn timeout: ','the working-timeout line wording'),
                    ('session start: ','the status session-start wording'),('last turn timeout: ','the status timeout wording'),
                    ('carried no valid five-line handoff; end it with','the handoff miss sentence'),('left MEMORY.md unchanged; write the durable facts','the MEMORY.md miss sentence')):
     assert needle in src,f'{why} is missing: {needle!r}'

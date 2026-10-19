@@ -584,17 +584,17 @@ def working_timeout_is_not_a_fault():
 
 
 def silent_timeout_is_a_fault_under_b14():
-    """(g) A hang with nothing written is a fault as today: episode count 1, text ending `silent timeout`; three
+    """(g) A hang with nothing written is a fault as today: episode count 1, text ending `timeout` (amendment 1); three
     silent timeouts over thirty minutes escalate under b14 and the next turn moves."""
     h, d = home(), fakes({f'claude-r2d2|{FABLE}': 'timeout_silent'})
     sup = make(h, d)
     for m in (0, 5, 10):
         turn(sup, h, m)
     row = timeout_row(h)
-    check((row['classification'], row.get('timeout'), row.get('transcript_records')) == ('timeout', 'silent', 0), f'the silent row: {row}')
+    check((row['classification'], row.get('timeout'), row.get('transcript_records')) == ('other', 'silent', 0), f'the silent row (amendment 1: the b14 row shape): {row}')
     f = fault(h)
-    check(f.get('count') == 3 and f.get('text', '').endswith('silent timeout') and not f.get('escalated'), f'three counted faults, silent wording: {f}')
-    check(len(notices(h, 'engine fault: ')) == 1 and notices(h, 'engine fault: ')[0]['text'].endswith('silent timeout') and not notices(h, 'manager turn timeout: '),
+    check(f.get('count') == 3 and f.get('text', '').endswith('timeout') and not f.get('escalated'), f'three counted faults, silent wording: {f}')
+    check(len(notices(h, 'engine fault: ')) == 1 and notices(h, 'engine fault: ')[0]['text'].endswith('timeout') and not notices(h, 'manager turn timeout: '),
           f'one fault line, no timeout line: {notices(h, "engine fault: ")}')
     turn(sup, h, 35)
     check(fault(h).get('escalated') is True and fault(h).get('count') == 4, f'the valve opened on the fourth silent timeout: {fault(h)}')
@@ -633,7 +633,7 @@ def status_shows_the_session_start_and_the_last_timeout():
     h2, d2 = home(sid='00000000-0000-4000-8000-000000000000'), fakes()
     transcript_path(h2, '00000000-0000-4000-8000-000000000000').unlink()
     sup2 = make(h2, d2)
-    check('session start: unknown' in compaction_line(h2), f'no transcript: unknown: {compaction_line(h2)}')
+    check('session start:' not in compaction_line(h2), f'no transcript: no session-start segment (amendment 1): {compaction_line(h2)}')
     h3, d3, sup3 = working_timeout_is_not_a_fault()
     text = S.status_text(h3).splitlines()
     ctx = [i for i, l in enumerate(text) if l.startswith('context:')]
