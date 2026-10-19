@@ -19,6 +19,7 @@
 # spec files); a copy at $HYDRA_HOME/coder/<id>-dry-run.json for the launch gate (tools/factory/dry_run_gate.sh);
 # with --pr, the verdict and the log tail are posted on the spec PR under "## Dry-run".
 set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${1:?loop id}"; shift
 REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=()
 while [ $# -gt 0 ]; do
@@ -80,9 +81,11 @@ REPLAY_JSON="[]"; RFAIL=0
 for d in "${REPLAYS[@]:-}"; do
   [ -n "$d" ] || continue
   rl="$OUT/replay-$(basename "$d").log"
-  if ! grep -q -- "--replay" "loops/$ID.acceptance.py"; then
-    # never start a script that would run its live sections: a driver without the flag is reported, not run
-    echo "loops/$ID.acceptance.py has no --replay mode (the flag does not appear in the script); not run" > "$rl"; rrc=3; mode="no --replay mode"
+  if ! "$PY" "$HERE/replay_mode_check.py" "loops/$ID.acceptance.py" > "$rl" 2>&1; then
+    # never start a script that would run its live sections: a driver whose code does not handle the flag (an AST
+    # check: add_argument("--replay") or a comparison against '--replay'; comments and help text do not count) is
+    # reported, not run
+    echo "loops/$ID.acceptance.py has no --replay mode; not run" >> "$rl"; rrc=3; mode="no --replay mode"
   else
     ( CI=true PYTHONPATH="$WT/fitflow-app:$WT/loops:$WT" timeout -k 10 600 "$PY" "loops/$ID.acceptance.py" --replay "$d" ) > "$rl" 2>&1; rrc=$?; mode="ran"
   fi
@@ -98,11 +101,23 @@ import json, sys
 o, i, m, v, s, rc, rj, ss, st, log, pr = sys.argv[1:]
 json.dump({"id": i, "main": m, "verdict": v, "stopped_at": s, "exit_rc": int(rc), "replays": json.loads(rj), "spec_sha256": json.loads(ss), "at": st, "log": log, "pr": (int(pr) if pr else None)}, open(o, "w"), indent=1)
 PYJ
-mkdir -p "${HYDRA_HOME:-$HOME}/coder"; cp "$OUT/dry-run.json" "${HYDRA_HOME:-$HOME}/coder/$ID-dry-run.json"
+POSTED=false
 if [ -n "$PR" ]; then
   REMOTE="$(git -C "$REPO" remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##')"
-  { echo "## Dry-run (${MAIN:0:8}, $STAMP)"; echo; echo "verdict: **$VERDICT**"; echo; echo "stopped at: \`$STOP\`"; echo
+  if { echo "## Dry-run (${MAIN:0:8}, $STAMP)"; echo; echo "verdict: **$VERDICT**"; echo; echo "stopped at: \`$STOP\`"; echo
     [ "$REPLAY_JSON" != "[]" ] && { echo "replays:"; "$PY" -c 'import json,sys; [print(f"- {r[\"dir\"]}: rc={r[\"rc\"]} ({r[\"mode\"]})") for r in json.loads(sys.argv[1])]' "$REPLAY_JSON"; echo; }
-    echo '```'; tail -n 40 "$OUT/exit.log"; echo '```'; } | gh pr comment "$PR" --repo "$REMOTE" --body-file - >/dev/null && say "[dry-run] posted on PR #$PR"
+    echo '```'; tail -n 40 "$OUT/exit.log"; echo '```'; } | gh pr comment "$PR" --repo "$REMOTE" --body-file - >/dev/null
+  then POSTED=true; say "[dry-run] posted on PR #$PR"
+  else say "[dry-run] the PR comment on #$PR FAILED: the record is not accepted (no copy for the gate); rerun with --pr once gh works"; fi
+fi
+"$PY" - "$OUT/dry-run.json" "$POSTED" <<'PYP'
+import json, sys
+o, posted = sys.argv[1:]; j = json.load(open(o)); j["posted"] = (posted == "true"); json.dump(j, open(o, "w"), indent=1)
+PYP
+# the gate's copy is written only when the record is complete: a --pr run whose comment failed leaves no accepted record
+if [ -z "$PR" ] || [ "$POSTED" = true ]; then
+  mkdir -p "${HYDRA_HOME:-$HOME}/coder"; cp "$OUT/dry-run.json" "${HYDRA_HOME:-$HOME}/coder/$ID-dry-run.json"
+else
+  rm -f "${HYDRA_HOME:-$HOME}/coder/$ID-dry-run.json"; exit 1
 fi
 case "$VERDICT" in STOPPED_AT_PRODUCT) exit 0;; *) exit 1;; esac

@@ -8,11 +8,18 @@ ID="${1:?loop id}"; DIR="${2:?checkout}"
 M="${HYDRA_HOME:-$HOME}/coder/$ID-dry-run.json"
 [ -s "$M" ] || { echo "DRY-RUN GATE: no dry-run recorded for $ID ($M missing); run tools/factory/loop_dry_run.sh $ID first"; exit 6; }
 python3 - "$M" "$DIR" "$ID" <<'PY'
-import hashlib, json, sys
+import hashlib, json, os, sys
 m, d, i = sys.argv[1:]
 j = json.load(open(m))
 if j.get("verdict") != "STOPPED_AT_PRODUCT":
     raise SystemExit(f"DRY-RUN GATE: the recorded dry-run of {i} has verdict {j.get('verdict')} (stopped at: {j.get('stopped_at')}); fix the spec and rerun")
+if not j.get("posted"):
+    # the rule: the dry-run's results are a comment on the spec PR before its last review round; a record without
+    # that comment refuses the launch unless the caller says the spec had no PR (DRY_RUN_GATE_NO_PR=1, printed)
+    if os.environ.get("DRY_RUN_GATE_NO_PR") == "1":
+        print(f"DRY-RUN GATE: {i}'s dry-run was not posted on a spec PR; allowed by DRY_RUN_GATE_NO_PR=1")
+    else:
+        raise SystemExit(f"DRY-RUN GATE: {i}'s dry-run was not posted on the spec PR (rerun tools/factory/loop_dry_run.sh {i} --pr <spec PR>; DRY_RUN_GATE_NO_PR=1 only for a spec without a PR)")
 for f, h in j.get("spec_sha256", {}).items():
     now = hashlib.sha256(open(f"{d}/{f}", "rb").read()).hexdigest()
     if now != h:
