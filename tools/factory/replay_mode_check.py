@@ -2,7 +2,7 @@
 """Does an acceptance script implement a --replay mode?  python tools/factory/replay_mode_check.py loops/<id>.acceptance.py
 Exit 0 when the script's code (not a comment, docstring or help text) handles the flag: a positional '--replay'
 argument of an add_argument(...) call, or a comparison / membership test against the literal '--replay'
-(e.g. `'--replay' in sys.argv`, `sys.argv[1] == '--replay'`). Exit 1 otherwise; exit 2 when the file does not parse."""
+(e.g. `'--replay' in sys.argv`, `sys.argv[1] == '--replay'`, `sys.argv[1] in ('--replay', '--replay-strict')`). Exit 1 otherwise; exit 2 when the file does not parse."""
 import ast, sys
 
 def has_replay_mode(src):
@@ -13,8 +13,10 @@ def has_replay_mode(src):
                 return True
         if isinstance(n, ast.Compare):
             operands = [n.left] + list(n.comparators)
-            if any(isinstance(a, ast.Constant) and a.value == "--replay" for a in operands):
-                return True
+            for a in operands:  # `x == '--replay'`, `'--replay' in argv`, and `x in ('--replay', '--replay-strict')`
+                members = a.elts if isinstance(a, (ast.Tuple, ast.List, ast.Set)) else [a]
+                if any(isinstance(m, ast.Constant) and m.value == "--replay" for m in members):
+                    return True
     return False
 
 if __name__ == "__main__":
