@@ -20,7 +20,11 @@ if not j.get("posted"):
         print(f"DRY-RUN GATE: {i}'s dry-run was not posted on a spec PR; allowed by DRY_RUN_GATE_NO_PR=1")
     else:
         raise SystemExit(f"DRY-RUN GATE: {i}'s dry-run was not posted on the spec PR (rerun tools/factory/loop_dry_run.sh {i} --pr <spec PR>; DRY_RUN_GATE_NO_PR=1 only for a spec without a PR)")
-for f, h in j.get("spec_sha256", {}).items():
+want = {f"loops/{i}.md", f"loops/{i}.exit.sh", f"loops/{i}.acceptance.py"}
+have = set(j.get("spec_sha256", {}))
+if have != want:
+    raise SystemExit(f"DRY-RUN GATE: the record of {i} does not hash all three spec files (has {sorted(have)}, needs {sorted(want)}); rerun tools/factory/loop_dry_run.sh {i}")
+for f, h in j["spec_sha256"].items():
     now = hashlib.sha256(open(f"{d}/{f}", "rb").read()).hexdigest()
     if now != h:
         raise SystemExit(f"DRY-RUN GATE: {f} changed since the dry-run ({j.get('at')}); rerun tools/factory/loop_dry_run.sh {i}")

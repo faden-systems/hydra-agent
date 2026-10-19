@@ -68,11 +68,21 @@ PY="${PYTHON:-$(command -v python3)}"
 ( CI=true BASE_REF="$MAIN" PYTHON="$PY" timeout -k 10 1800 bash "loops/$ID.exit.sh" ) > "$OUT/exit.log" 2>&1; RC=$?
 sed "s/^/  | /" "$OUT/exit.log" | tail -n 80 >> "$LOG"
 FAIL_LINE="$(grep -E "^\[$ID\] FAIL:" "$OUT/exit.log" | tail -n 1)"
+FAIL_COUNT="$(grep -cE "^\[$ID\] FAIL:" "$OUT/exit.log")"
+LAST_TAGGED="$(grep -E "^\[$ID\] " "$OUT/exit.log" | tail -n 1)"
 LAST_STEP="$(grep -E "^\[$ID\] " "$OUT/exit.log" | grep -vE "FAIL:|PASS" | tail -n 1)"
+# anything after the FAIL line that looks like a crash (a traceback, a shell error) makes the stop suspect
+AFTER_FAIL="$(awk -v f="$FAIL_LINE" 'found && /Traceback|command not found|syntax error|No such file|Permission denied|^\[/ {print; n++} $0==f {found=1} END {}' "$OUT/exit.log" | head -n 3)"
 # the cap is judged first: an exit that prints an expected FAIL line and then hangs is a harness defect, not a stop
 if [ $RC -eq 124 ] || [ $RC -eq 137 ]; then VERDICT="HARNESS_DEFECT"; STOP="the exit did not finish in 1800 s (rc $RC; last step: $LAST_STEP; last FAIL line: ${FAIL_LINE:-none})"
 elif [ $RC -eq 0 ]; then VERDICT="NO_PRODUCT_GATE"; STOP="the exit passed with no product"
-elif [ -n "$FAIL_LINE" ] && echo "$FAIL_LINE" | grep -Eq "$EXPECT"; then VERDICT="STOPPED_AT_PRODUCT"; STOP="$FAIL_LINE"
+elif [ -n "$FAIL_LINE" ] && echo "$FAIL_LINE" | grep -Eq "$EXPECT"; then
+  # a product stop is exactly one FAIL line, the last tagged line of the log, nothing crash-like after it, rc 1
+  if [ "$FAIL_COUNT" -ne 1 ]; then VERDICT="HARNESS_DEFECT"; STOP="$FAIL_COUNT FAIL lines (a product stop is exactly one); last: $FAIL_LINE"
+  elif [ "$LAST_TAGGED" != "$FAIL_LINE" ]; then VERDICT="HARNESS_DEFECT"; STOP="the exit went on after its FAIL line (last tagged line: $LAST_TAGGED)"
+  elif [ -n "$AFTER_FAIL" ]; then VERDICT="HARNESS_DEFECT"; STOP="crash-like output after the FAIL line: $(echo "$AFTER_FAIL" | head -n 1)"
+  elif [ $RC -ne 1 ]; then VERDICT="HARNESS_DEFECT"; STOP="exit rc $RC after the FAIL line (an exit script fails with rc 1): $FAIL_LINE"
+  else VERDICT="STOPPED_AT_PRODUCT"; STOP="$FAIL_LINE"; fi
 else VERDICT="HARNESS_DEFECT"; STOP="${FAIL_LINE:-exit rc $RC with no FAIL line (last step: $LAST_STEP)}"; fi
 say "[dry-run] exit rc=$RC verdict=$VERDICT"
 say "[dry-run] stopped at: $STOP"
@@ -87,7 +97,13 @@ for d in "${REPLAYS[@]:-}"; do
     # reported, not run
     echo "loops/$ID.acceptance.py has no --replay mode; not run" >> "$rl"; rrc=3; mode="no --replay mode"
   else
-    ( CI=true PYTHONPATH="$WT/fitflow-app:$WT/loops:$WT" timeout -k 10 600 "$PY" "loops/$ID.acceptance.py" --replay "$d" ) > "$rl" 2>&1; rrc=$?; mode="ran"
+    # the replay sandbox: no static check can prove a driver's --replay skips its live sections, so the replay runs
+    # with every credential-looking variable removed and HTTP(S)_PROXY pointed at a dead local port with no_proxy
+    # empty: a driver that does start live work (a model call, its own server) fails on its first connection instead
+    # of running it; the 600 s cap bounds the rest
+    ( env -u NO_PROXY -u no_proxy $(env | grep -iE '^[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*=' | cut -d= -f1 | sed 's/^/-u /') \
+        CI=true DRY_RUN_REPLAY=1 HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+        PYTHONPATH="$WT/fitflow-app:$WT/loops:$WT" timeout -k 10 600 "$PY" "loops/$ID.acceptance.py" --replay "$d" ) > "$rl" 2>&1; rrc=$?; mode="ran (sandboxed: no credentials, dead proxy)"
   fi
   [ $rrc -eq 0 ] || RFAIL=1
   say "[dry-run] replay $d: rc=$rrc ($mode); $(tail -n 1 "$rl")"

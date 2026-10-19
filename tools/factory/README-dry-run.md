@@ -7,15 +7,20 @@ Before a coder launches or the manager starts a build, the spec's checks run onc
 1. A temporary worktree of origin/main carries a no-op candidate: one commit adding the notes stub `docs/notes/<id>.md`
    (every `## heading` the exit names). `CI=true BASE_REF=<main> bash loops/<id>.exit.sh` then runs the fence, the
    function fence, the frozen files, the amended-ids rule, the notes and the base checks for real. Verdicts:
-   - `STOPPED_AT_PRODUCT`: the exit failed at its first product-dependent check (a FAIL line matching `--expect`,
-     default: the "unchanged / missing / own tests are missing / does not call" wordings). The dry-run passes.
+   - `STOPPED_AT_PRODUCT`: the exit failed at its first product-dependent check: exactly one FAIL line, matching
+     `--expect` (default: the "unchanged / missing / own tests are missing / does not call" wordings), the last tagged
+     line of the log, nothing crash-like after it, rc 1. The dry-run passes.
    - `HARNESS_DEFECT`: any other FAIL, a crash, or the 1800 s cap. Fix the spec PR and rerun.
    - `NO_PRODUCT_GATE`: the exit passed with no product. The spec checks nothing of its own; fix it.
 2. Every `--replay <dir>` runs `python loops/<id>.acceptance.py --replay <dir>`: the driver's parsers and counters over
    recorded evidence (chains, journey files, events.jsonl, records) from earlier runs under `artifacts/`; checks only,
    no server, no model. A driver whose code does not handle the flag (`tools/factory/replay_mode_check.py`: an
    `add_argument("--replay")` call or a comparison against the literal `'--replay'`; comments, docstrings and help
-   text do not count) is reported as `no --replay mode` and never started (its live sections would run). Verdict `REPLAY_FAILED` unless `--replay-optional` (loops written before the
+   text do not count) is reported as `no --replay mode` and never started. No static check proves that a `--replay`
+   skips the live sections, so every replay runs sandboxed: every credential-looking variable (`*KEY*`, `*TOKEN*`,
+   `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`) removed, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` pointed at a dead local
+   port with `no_proxy` empty, `DRY_RUN_REPLAY=1`, a 600 s cap: a driver that does start live work fails on its first
+   connection (a model call, its own server) instead of running it, and the replay is recorded as failed. Verdict `REPLAY_FAILED` unless `--replay-optional` (loops written before the
    rule).
 3. Output: `<out>/dry-run.log`, `<out>/exit.log`, `<out>/replay-*.log`, `<out>/dry-run.json` (verdict, the stopping
    line, the replays, the sha256 of the three spec files). A copy lands at `$HYDRA_HOME/coder/<id>-dry-run.json`.
@@ -24,8 +29,8 @@ Before a coder launches or the manager starts a build, the spec's checks run onc
    removed, exit 1): rerun with `--pr` once `gh` works.
 4. The launch gate: `tools/factory/dry_run_gate.sh <id> <checkout at the spec commit>` exits non-zero unless a recorded
    dry-run exists with verdict `STOPPED_AT_PRODUCT`, posted on the spec PR (`DRY_RUN_GATE_NO_PR=1` is the explicit
-   exception for a spec without a PR, and it prints), and the three spec files' sha256 still match (an amendment after
-   the dry-run needs a new one). It is on the launch path: `tools/factory/coder_launch.sh <id> <main sha> <spec sha>`
+   exception for a spec without a PR, and it prints), and the record hashes exactly the three spec files and each
+   sha256 still matches (an amendment after the dry-run needs a new one). It is on the launch path: `tools/factory/coder_launch.sh <id> <main sha> <spec sha>`
    (the one launcher for every loop from rs1 on; it replaces the per-loop `coder/<id>-launch.sh` copies) clones, checks
    the frozen spec files against the spec commit, then runs the gate and removes the clone on refusal (exit 6) before
    the account check and the coder start. The gate's output is kept at `coder/<id>-<main>-logs/dry-run-gate.txt` with
