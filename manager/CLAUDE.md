@@ -154,3 +154,58 @@ it; it never infers this from Slack text). It is the explicit scheduling input f
 ## Founder waiting notification (2026-10-05)
 
 Whenever anything waits on the founder, post one top-level line `⏳ waiting on L: <what> <link>`. A request buried in a thread does not count. Post once per waiting request; the link points to the thread containing the details.
+
+## Founder standing rule: dogfood restarts and open sessions (2026-10-18, 1792314597.820959)
+
+- A session counts as abandoned after 30 minutes idle: no human input and no presence heartbeat from the page for 30
+  minutes. A workout running with the page open is never idle, even if nobody taps.
+- Before any dogfood restart, check every open session. If any session was active in the last 30 minutes, wait and
+  post that at the top level. Sessions idle 30 minutes or more may be restarted over; they end as shutdown. Name each
+  one in the deploy post with its last activity time. This replaces "wait or ask me".
+
+## Founder account rule (2026-10-19, 1792377592.770399)
+
+- The manager runs on `claude-l` (Fable 5.1); `claude-r2d2` is the fallback. This replaces the rule of 1792274214 that
+  sent the manager back to R2D2 after a fallback episode.
+- Every new coder launch (cc1, wr1b, rs1 and later) runs on the L account, Opus 5.5 high, one attempt, with a one-call
+  L account check (`coder/<loop>-l-check.py`) in place of the R2D2 check. Coders already running finish on R2D2.
+- The same rule applies to coder or model jobs on the iMac and the MacBook; if the L login is missing on a machine, run
+  on the VM and tell the founder.
+- Post one top-level line when the manager has switched and one when the first coder launches on L.
+
+## Founder standing rule: dry-run a loop's checks before its build (2026-10-19, 1792422361.772469)
+
+- Before a coder launches or the manager starts a build, the spec's checks run once for real on main, with no product:
+  1. `tools/factory/loop_dry_run.sh <id> [evidence-dir...]` (hydra-agent; until it exists, the same steps by hand):
+     a temporary branch from main, a no-op candidate (the notes stub `docs/notes/<id>.md` with the required sections,
+     nothing else), then `CI=true BASE_REF=<main sha> bash loops/<id>.exit.sh`. The fence, function fence, frozen
+     files, amended-ids, notes and base checks must all pass; the exit may stop only at the first check that needs the
+     product (the "unchanged" or "no own tests" step), and the log names that step.
+  2. The acceptance driver's parsers and counters run against existing real evidence (the chains, journey files,
+     events.jsonl and records of earlier runs under `artifacts/`): `python loops/<id>.acceptance.py --replay <dir>`.
+     Every acceptance script written from now on has that `--replay` mode (checks only, no server, no model).
+     Parse errors, field-shape and nesting mistakes, word-match and count defects are fixed in the spec PR.
+- The dry-run's log and the replay's output go into the spec PR as a comment before its last review round; the launch
+  script refuses a spec whose dry-run comment is missing. Starts with rs1.
+- The digest reports the count of harness amendments per loop (spec PRs titled `<id> amendment`), so the rule's
+  effect is visible.
+
+## Founder standing rule: test app deploys need no word (2026-10-20, 1792510584.450749)
+
+- Deploys to the test app no longer need the founder's word. When a change or a batch is ready (its checks and real runs
+  passed, merged on the test app's line), deploy it. The only exception: a deploy the founder specifically asked to hold
+  stays held until the founder says otherwise.
+- The safety steps stay exactly as they are: the 30-minute session gate first (a running workout is never idle, so never
+  restart under one), backup first, pinned SHA, llm mode on gpt-6-sol (never strict), health 200/200, clean migration,
+  history kept, no test sessions, and the deploy report in the thread.
+- This replaces every earlier "test app only on the founder's word" line, including lw1b's and the small-fix lane's.
+
+## Founder standing rule: one call, not two (2026-10-21, 1792607818)
+
+- The founder's words: "The team is making this mistake again. The model has the intelligence and not a classic API
+  call that can only achieve one thing. The reason why two calls are needed is to transform the first call results and
+  use it for second call."
+- In every spec and review from now on: one carefully designed prompt does several things in one model call. A second
+  model call is justified only when the first call's result must be transformed and fed into it. sn1's gate-then-
+  instantiation sequence is the example of the mistake; sn1c (the verdict, the facts and the plan brief in one answer)
+  is the correction. A spec with two calls on one input says which transformation justifies the second, or merges them.
