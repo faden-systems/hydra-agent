@@ -25,20 +25,26 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${1:?loop id}"; shift
-REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=(); SPEC_REF=""
+REPO="$PWD"; PR=""; OUT=""; EXPECT=""; EXPECT_GIVEN=""; OPTIONAL=0; REPLAYS=(); SPEC_REF=""
 while [ $# -gt 0 ]; do
   case "$1" in
     # paths are made absolute here: the script changes into a temporary worktree before using them
     --repo) REPO="$(realpath -m "$2")"; shift 2;; --pr) PR="$2"; shift 2;; --out) OUT="$(realpath -m "$2")"; shift 2;;
-    --expect) EXPECT="$2"; shift 2;; --replay) REPLAYS+=("$(realpath -m "$2")"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
+    --expect) EXPECT="$2"; EXPECT_GIVEN=1; shift 2;; --replay) REPLAYS+=("$(realpath -m "$2")"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
     --spec-ref) SPEC_REF="$2"; shift 2;;  # the spec PR's branch: its three loops files on top of main (the usual case: a spec not yet merged)
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
 # the product-check wordings the exit scripts use for "the candidate has no product" (narrow on purpose: a notes, base,
 # fence, amended-ids or cut-short wording never matches; a spec whose product check says it differently passes --expect)
-DEFAULT_EXPECT='(is|are) unchanged|tests [^ ]+ are missing|does not (call|pass|receive) |still calls|has no (module-level|single|[A-Za-z_]+ (class|method|function)|[A-Za-z_]+$)'
+DEFAULT_EXPECT='(is|are) unchanged|tests [^ ]+ are missing|[A-Za-z0-9_./-]+\.(py|js|mjs|json) is missing|does not (call|pass|receive) |still calls|has no (module-level|single|[A-Za-z_]+ (class|method|function)|[A-Za-z_]+$)'
 EXPECT="${EXPECT:-$DEFAULT_EXPECT}"
+# a missing file under docs/, loops/ or tests/ is never the product's absence (the dry-run writes the notes stub itself;
+# the spec files and the loop's tests are harness matters), whatever --expect says: r1 of hydra-agent #91
+NOT_PRODUCT='(^|[^A-Za-z0-9_-])(docs|loops)/[A-Za-z0-9_./-]+ is missing'  # r2 of #91: ./docs/x and app/docs/x too; r3: a
+# missing test file IS the product's absence (the candidate's own tests, as the 'tests ... are missing' wording), so tests/ is not here;
+# and an explicit --expect is the spec author's word: the guard applies to the default expectation only
+[ -n "${EXPECT_GIVEN:-}" ] && NOT_PRODUCT='$^'
 cd "$REPO" || exit 2
 git fetch -q origin || { echo "fetch failed in $REPO" >&2; exit 2; }
 MAIN="$(git rev-parse origin/main)"
@@ -131,7 +137,7 @@ AFTER_FAIL="$(awk -v f="$FAIL_LINE" 'found && /Traceback|command not found|synta
 # the cap is judged first: an exit that prints an expected FAIL line and then hangs is a harness defect, not a stop
 if [ $RC -eq 124 ] || [ $RC -eq 137 ]; then VERDICT="HARNESS_DEFECT"; STOP="the exit did not finish in 1800 s (rc $RC; last step: $LAST_STEP; last FAIL line: ${FAIL_LINE:-none})"
 elif [ $RC -eq 0 ]; then VERDICT="NO_PRODUCT_GATE"; STOP="the exit passed with no product"
-elif [ -n "$FAIL_LINE" ] && echo "$FAIL_LINE" | grep -Eq "$EXPECT"; then
+elif [ -n "$FAIL_LINE" ] && echo "$FAIL_LINE" | grep -Eq "$EXPECT" && ! echo "$FAIL_LINE" | grep -Eq "$NOT_PRODUCT"; then
   # a product stop is exactly one FAIL line, the last tagged line of the log, nothing crash-like after it, rc 1
   if [ "$FAIL_COUNT" -ne 1 ]; then VERDICT="HARNESS_DEFECT"; STOP="$FAIL_COUNT FAIL lines (a product stop is exactly one); last: $FAIL_LINE"
   elif [ "$LAST_TAGGED" != "$FAIL_LINE" ]; then VERDICT="HARNESS_DEFECT"; STOP="the exit went on after its FAIL line (last tagged line: $LAST_TAGGED)"
