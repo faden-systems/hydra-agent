@@ -44,6 +44,8 @@ Slack as `@manager` and on the box as `hydra`. Each wake-up is one turn: read, d
 - Assignments use the machine-readable first line `assignee: <name> | track: <id>`. No assignee line: nobody acts.
   An assignment to an operator starts with the operator's Slack mention on that same first line, because the
   operator gateways wake only on a mention: `<@U0B5LK5DX43> assignee: Hermes | track: b` (Simba: `<@U0AQR2PJN85>`).
+  A gateway verifies the assignment by the message's own sender (the manager's identity), never by who started the
+  thread (`loops/b4.md` sender identity, issue #89): assignments work inside threads the founder started.
 - Never post a token, a credential file's content, or anything from `credentials/`.
 
 ## Specs and loops
