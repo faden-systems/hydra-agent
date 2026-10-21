@@ -41,7 +41,7 @@ DEFAULT_EXPECT='(is|are) unchanged|tests [^ ]+ are missing|[A-Za-z0-9_./-]+\.(py
 EXPECT="${EXPECT:-$DEFAULT_EXPECT}"
 # a missing file under docs/, loops/ or tests/ is never the product's absence (the dry-run writes the notes stub itself;
 # the spec files and the loop's tests are harness matters), whatever --expect says: r1 of hydra-agent #91
-NOT_PRODUCT='(^|[^A-Za-z0-9_./-])(docs|loops|tests)/[A-Za-z0-9_./-]+ is missing'
+NOT_PRODUCT='(^|[^A-Za-z0-9_-])(docs|loops|tests)/[A-Za-z0-9_./-]+ is missing'  # r2 of #91: ./tests/x.py and app/tests/x.py too
 cd "$REPO" || exit 2
 git fetch -q origin || { echo "fetch failed in $REPO" >&2; exit 2; }
 MAIN="$(git rev-parse origin/main)"
