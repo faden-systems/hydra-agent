@@ -209,3 +209,21 @@ Whenever anything waits on the founder, post one top-level line `⏳ waiting on 
   model call is justified only when the first call's result must be transformed and fed into it. sn1's gate-then-
   instantiation sequence is the example of the mistake; sn1c (the verdict, the facts and the plan brief in one answer)
   is the correction. A spec with two calls on one input says which transformation justifies the second, or merges them.
+
+## Founder speed rules (2026-10-21, 1792619941)
+
+- Coders stop at 120 streamed assistant messages (CLI cap 140), not 70, so a coder runs its own full exit (`CI=true`)
+  before it stops; the manager no longer runs coder exits by hand.
+- Rerun only the failed section: when the suites passed on a candidate SHA and a scripted or real journey failed on a
+  harness or driver defect, the exit reruns that section (or that journey) on the same SHA, never the whole hour; the
+  switch lives in the exit scripts (`<ID>_RERUN=<section> <ID>_PRIOR=<earlier evidence dir>`).
+- The driver runs on the scripted model before any real run: every real journey is first driven end to end on the
+  scripted model as a gate; a driver defect fails there in minutes.
+- The two lanes run at once: with the per-test limits and the recorded rerun in place, both exits run in parallel; a
+  flake is recorded, not a reason to queue.
+- Harness amendments are test code: one review round (the founder's small-change rule); four rounds are for product PRs.
+- Hermes takes exits, deploys and evidence runs; the manager keeps specs, reviews and merges. Assignments inside
+  founder-started threads verify once hydra-agent #89 (per-message sender verification) is in the gateway.
+- Parallel launches on the L account: a build that depends on an unmerged branch branches from that branch's candidate
+  now and rebases onto its merge (the pd1b/rc1 rule): sn1c from loop/lw1-base before sn1b merged, rp1b from rp1a's
+  candidate on loop/rp1.
