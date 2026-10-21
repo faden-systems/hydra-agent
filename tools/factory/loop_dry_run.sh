@@ -25,12 +25,12 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${1:?loop id}"; shift
-REPO="$PWD"; PR=""; OUT=""; EXPECT=""; OPTIONAL=0; REPLAYS=(); SPEC_REF=""
+REPO="$PWD"; PR=""; OUT=""; EXPECT=""; EXPECT_GIVEN=""; OPTIONAL=0; REPLAYS=(); SPEC_REF=""
 while [ $# -gt 0 ]; do
   case "$1" in
     # paths are made absolute here: the script changes into a temporary worktree before using them
     --repo) REPO="$(realpath -m "$2")"; shift 2;; --pr) PR="$2"; shift 2;; --out) OUT="$(realpath -m "$2")"; shift 2;;
-    --expect) EXPECT="$2"; shift 2;; --replay) REPLAYS+=("$(realpath -m "$2")"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
+    --expect) EXPECT="$2"; EXPECT_GIVEN=1; shift 2;; --replay) REPLAYS+=("$(realpath -m "$2")"); shift 2;; --replay-optional) OPTIONAL=1; shift;;
     --spec-ref) SPEC_REF="$2"; shift 2;;  # the spec PR's branch: its three loops files on top of main (the usual case: a spec not yet merged)
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
@@ -41,7 +41,10 @@ DEFAULT_EXPECT='(is|are) unchanged|tests [^ ]+ are missing|[A-Za-z0-9_./-]+\.(py
 EXPECT="${EXPECT:-$DEFAULT_EXPECT}"
 # a missing file under docs/, loops/ or tests/ is never the product's absence (the dry-run writes the notes stub itself;
 # the spec files and the loop's tests are harness matters), whatever --expect says: r1 of hydra-agent #91
-NOT_PRODUCT='(^|[^A-Za-z0-9_-])(docs|loops|tests)/[A-Za-z0-9_./-]+ is missing'  # r2 of #91: ./tests/x.py and app/tests/x.py too
+NOT_PRODUCT='(^|[^A-Za-z0-9_-])(docs|loops)/[A-Za-z0-9_./-]+ is missing'  # r2 of #91: ./docs/x and app/docs/x too; r3: a
+# missing test file IS the product's absence (the candidate's own tests, as the 'tests ... are missing' wording), so tests/ is not here;
+# and an explicit --expect is the spec author's word: the guard applies to the default expectation only
+[ -n "${EXPECT_GIVEN:-}" ] && NOT_PRODUCT='$^'
 cd "$REPO" || exit 2
 git fetch -q origin || { echo "fetch failed in $REPO" >&2; exit 2; }
 MAIN="$(git rev-parse origin/main)"
