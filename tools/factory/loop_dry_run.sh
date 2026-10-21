@@ -37,7 +37,7 @@ while [ $# -gt 0 ]; do
 done
 # the product-check wordings the exit scripts use for "the candidate has no product" (narrow on purpose: a notes, base,
 # fence, amended-ids or cut-short wording never matches; a spec whose product check says it differently passes --expect)
-DEFAULT_EXPECT='(is|are) unchanged|tests [^ ]+ are missing|does not (call|pass|receive) |still calls|has no (module-level|single|[A-Za-z_]+ (class|method|function)|[A-Za-z_]+$)'
+DEFAULT_EXPECT='(is|are) unchanged|tests [^ ]+ are missing|[A-Za-z0-9_./-]+\.(py|js|mjs|json|md) is missing|does not (call|pass|receive) |still calls|has no (module-level|single|[A-Za-z_]+ (class|method|function)|[A-Za-z_]+$)'
 EXPECT="${EXPECT:-$DEFAULT_EXPECT}"
 cd "$REPO" || exit 2
 git fetch -q origin || { echo "fetch failed in $REPO" >&2; exit 2; }
