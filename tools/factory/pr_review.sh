@@ -27,6 +27,10 @@ if [[ "$HEAD_REF" == loop/* ]] && [ -z "${PR_REVIEW_EVIDENCE:-}" ]; then
 # top-level *.json in it records the run's head (a "head" field, as suites-passed.json does) that head must be HEAD_SHA.
 # A URL or a prose pointer is accepted as given and named as such in the comment.
 EVIDENCE_NOTE=""
+# r3 of #95: for a build PR the pointer must be the exit's local evidence directory (the exits run on this machine), with a
+# chain and a recorded head equal to the PR head; a typo, a URL or prose is refused for a build PR.
+if [[ "$HEAD_REF" == loop/* ]] && [ ! -d "${PR_REVIEW_EVIDENCE%% *}" ]; then
+  echo "pr_review: $REPO#$PR is a build PR (head $HEAD_REF): PR_REVIEW_EVIDENCE must be the exit's local evidence directory (got '${PR_REVIEW_EVIDENCE}'); no review posted" >&2; exit 3; fi
 if [ -n "${PR_REVIEW_EVIDENCE:-}" ] && [ -d "${PR_REVIEW_EVIDENCE%% *}" ]; then
   EDIR="${PR_REVIEW_EVIDENCE%% *}"
   [ -n "$(find "$EDIR" -name '*chain*.jsonl' -print -quit 2>/dev/null)" ] || { echo "pr_review: PR_REVIEW_EVIDENCE $EDIR has no chain file (*chain*.jsonl); no review posted" >&2; exit 3; }
@@ -39,6 +43,7 @@ for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
 PY
 )"
   if [ -n "$EHEAD" ] && [ "$EHEAD" != "$HEAD_SHA" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records head $EHEAD, the PR head is $HEAD_SHA: evidence of another candidate; no review posted" >&2; exit 3; fi
+  if [[ "$HEAD_REF" == loop/* ]] && [ -z "$EHEAD" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records no head (the exit writes suites-passed.json with the candidate's head on a suites pass): for a build PR the evidence must name its head; no review posted" >&2; exit 3; fi
   EVIDENCE_NOTE="$( [ -n "$EHEAD" ] && echo "(chain present; recorded head $EHEAD = this PR's head)" || echo "(chain present; the directory records no head: the manager vouches for the run's SHA)" )"
 elif [ -n "${PR_REVIEW_EVIDENCE:-}" ]; then EVIDENCE_NOTE="(not a local directory: taken as given)"; fi
 gh pr diff "$PR" --repo "$REPO" > "$OUT/code.diff.full"
