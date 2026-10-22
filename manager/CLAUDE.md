@@ -182,6 +182,9 @@ Whenever anything waits on the founder, post one top-level line `⏳ waiting on 
   start; `TICKET_ENGINE=claude-r2d2` is the lane's Claude engine; `claude-l` is refused unless `TICKET_ALLOW_L=1` is set
   on the founder's word. This supersedes the 2026-10-19 rule's "every new coder launch runs on the L account"; the
   manager's own account (claude-l, fallback claude-r2d2) is not covered by this instruction.
+- The generic loop launcher `tools/factory/coder_launch.sh` (hydra-agent #85) calls `coder/r2d2-check.py` too (#99,
+  Hermes's audit of the VM tool clone); the per-loop `coder/<id>-launch.sh` copies and `coder/ticket-launch.sh` were
+  switched on the VM in turn 2633.
 - Post one top-level line when the first launch on R2D2 happens.
 
 ## Founder standing rule: dry-run a loop's checks before its build (2026-10-19, 1792422361.772469)

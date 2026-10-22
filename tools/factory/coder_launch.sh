@@ -5,7 +5,7 @@
 # current dry-run (tools/factory/dry_run_gate.sh) is refused, the clone removed, exit 6. Then, as before: the three spec
 # files at <main> must equal the spec commit's; the frozen hashes, prompt and run script come from
 # $HYDRA_HOME/coder/<id>-prompt.txt.tmpl, <id>-run.py.tmpl ({MERGE} = main sha), the one-call account check is
-# $HYDRA_HOME/coder/<id>-l-check.py; the coder starts detached. --dry stops after the gate and the frozen check.
+# $HYDRA_HOME/coder/r2d2-check.py; the coder starts detached. --dry stops after the gate and the frozen check.
 set -euo pipefail
 ID="${1:?loop id}"; M="${2:?full sha of main}"; SPEC="${3:?spec commit sha}"; shift 3
 URL="https://github.com/faden-systems/faden.git"; DRY=0
@@ -16,7 +16,7 @@ done
 [[ "$SPEC" =~ ^[0-9a-f]{7,40}$ ]] || { echo "need a sha for the spec commit"; exit 2; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 C="${HYDRA_HOME:-$HOME}/coder"; cd "$C"; R="$C/$ID-$M"; L="$R-logs"
-for f in "$C/$ID-prompt.txt.tmpl" "$C/$ID-run.py.tmpl" "$C/$ID-l-check.py"; do [ -s "$f" ] || { echo "missing: $f"; exit 2; }; done
+for f in "$C/$ID-prompt.txt.tmpl" "$C/$ID-run.py.tmpl" "$C/r2d2-check.py"; do [ -s "$f" ] || { echo "missing: $f"; exit 2; }; done
 [ -e "$R" ] && { echo "exists: $R"; exit 2; }; mkdir "$L"
 git clone -q "$URL" "$R"; cd "$R"
 git checkout -q -b "loop/$ID" "$M"; git config user.name hydra-coder; git config user.email coder@hydra.local
@@ -41,7 +41,7 @@ if [ $DRY -eq 1 ]; then echo "DRY: gate and frozen check passed for $ID at $M; n
 sed "s/{MERGE}/$M/g" "$C/$ID-prompt.txt.tmpl" > "$L/prompt.txt"
 sed "s/{MERGE}/$M/g" "$C/$ID-run.py.tmpl" > "$C/$ID-$M-run.py"
 python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$C/$ID-$M-run.py"
-echo "account check (one real call on the L account)..."; python3 "$C/$ID-l-check.py" "$L/account-check.json" || { echo "L ACCOUNT CHECK FAILED"; exit 4; }
+echo "account check (one real call on the R2D2 account)..."; python3 "$C/r2d2-check.py" "$L/account-check.json" || { echo "R2D2 ACCOUNT CHECK FAILED"; exit 4; }
 cd "$C"
 nohup setsid python3 "$C/$ID-$M-run.py" > "$L/launcher.out" 2>&1 < /dev/null &
 sleep 6; cat "$L/coder.json" 2>/dev/null || { echo "coder did not start"; tail -20 "$L/launcher.out"; exit 5; }
