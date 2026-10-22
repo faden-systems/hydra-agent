@@ -33,6 +33,9 @@ if [[ "$HEAD_REF" == loop/* ]] && [ ! -d "${PR_REVIEW_EVIDENCE%% *}" ]; then
   echo "pr_review: $REPO#$PR is a build PR (head $HEAD_REF): PR_REVIEW_EVIDENCE must be the exit's local evidence directory (got '${PR_REVIEW_EVIDENCE}'); no review posted" >&2; exit 3; fi
 if [ -n "${PR_REVIEW_EVIDENCE:-}" ] && [ -d "${PR_REVIEW_EVIDENCE%% *}" ]; then
   EDIR="${PR_REVIEW_EVIDENCE%% *}"
+  # r4 of #95: the reviewer runs in its own worktree, so a relative pointer valid here would be unreadable there:
+  # resolve the directory to an absolute path and hand the reviewer that.
+  EREST="${PR_REVIEW_EVIDENCE#"$EDIR"}"; EDIR="$(cd "$EDIR" && pwd -P)"; PR_REVIEW_EVIDENCE="${EDIR}${EREST}"
   [ -n "$(find "$EDIR" -name '*chain*.jsonl' -print -quit 2>/dev/null)" ] || { echo "pr_review: PR_REVIEW_EVIDENCE $EDIR has no chain file (*chain*.jsonl); no review posted" >&2; exit 3; }
   EHEAD="$(python3 - "$EDIR" <<'PY'
 import glob, json, os, sys
