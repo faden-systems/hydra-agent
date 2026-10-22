@@ -42,11 +42,14 @@ import glob, json, os, sys
 for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
     try: d = json.load(open(p))
     except Exception: continue
-    if isinstance(d, dict) and isinstance(d.get("head"), str): print(d["head"]); break
+    # the exits write "head" (suites-passed.json); rp1's/sn1's --smoke write "candidate" (smoke.json): both name the run's SHA
+    h = d.get("head") if isinstance(d, dict) else None
+    h = h if isinstance(h, str) else (d.get("candidate") if isinstance(d, dict) and isinstance(d.get("candidate"), str) else None)
+    if h: print(h); break
 PY
 )"
   if [ -n "$EHEAD" ] && [ "$EHEAD" != "$HEAD_SHA" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records head $EHEAD, the PR head is $HEAD_SHA: evidence of another candidate; no review posted" >&2; exit 3; fi
-  if [[ "$HEAD_REF" == loop/* ]] && [ -z "$EHEAD" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records no head (the exit writes suites-passed.json with the candidate's head on a suites pass): for a build PR the evidence must name its head; no review posted" >&2; exit 3; fi
+  if [[ "$HEAD_REF" == loop/* ]] && [ -z "$EHEAD" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records no head (the exit writes suites-passed.json with the candidate's head on a suites pass; a smoke writes smoke.json with "candidate"): for a build PR the evidence must name its head; no review posted" >&2; exit 3; fi
   EVIDENCE_NOTE="$( [ -n "$EHEAD" ] && echo "(chain present; recorded head $EHEAD = this PR's head)" || echo "(chain present; the directory records no head: the manager vouches for the run's SHA)" )"
 elif [ -n "${PR_REVIEW_EVIDENCE:-}" ]; then EVIDENCE_NOTE="(not a local directory: taken as given)"; fi
 gh pr diff "$PR" --repo "$REPO" > "$OUT/code.diff.full"
