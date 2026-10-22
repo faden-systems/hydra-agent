@@ -16,6 +16,12 @@ MODEL="${PR_REVIEW_MODEL:-gpt-6-sol}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$(mktemp -d /tmp/pr-review-${PR}-XXXXXX)"
 HEAD_SHA="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+# founder standing rule 3 (2026-10-22, 1792684647): a build PR (a loop/<id> head: the loop's candidate) is never reviewed
+# without the exit's run evidence; PR_REVIEW_EVIDENCE is required for it. Spec, amendment and lane PRs (spec/*, fix/*)
+# carry it when a run exists. (r1 of hydra-agent #95: the pointer must be enforced, not optional.)
+HEAD_REF="$(gh pr view "$PR" --repo "$REPO" --json headRefName --jq .headRefName)"
+if [[ "$HEAD_REF" == loop/* ]] && [ -z "${PR_REVIEW_EVIDENCE:-}" ]; then
+  echo "pr_review: $REPO#$PR is a build PR (head $HEAD_REF): set PR_REVIEW_EVIDENCE=\"<the exit's evidence pointer>\" (founder rule 3, 2026-10-22); no review posted" >&2; exit 3; fi
 gh pr diff "$PR" --repo "$REPO" > "$OUT/code.diff.full"
 # PR_REVIEW_EXCLUDE (optional, space-separated path prefixes): committed run evidence (screenshots, captured markup, the
 # chain and server logs of a loop's real run) is not code to review and can be larger than the cap, in which case the
