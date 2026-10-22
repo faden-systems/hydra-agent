@@ -173,6 +173,17 @@ Whenever anything waits on the founder, post one top-level line `⏳ waiting on 
   on the VM and tell the founder.
 - Post one top-level line when the manager has switched and one when the first coder launches on L.
 
+## Founder account switch (2026-10-22, 1792690104.858189)
+
+- The L account's reset credit has expired. Every NEW coder, delegate or review launch uses the R2D2 account
+  (`claude-r2d2`; coders stay on Opus 5.5 high). Nothing switches mid-task: work already running on L finishes on L.
+  Codex lanes are unchanged (reviews run on Codex through `tools/factory/pr_review.sh`).
+- The launcher defaults and the one-call account check are on R2D2: `coder/r2d2-check.py` (R2D2_OK) runs before each
+  start; `TICKET_ENGINE=claude-r2d2` is the lane's Claude engine; `claude-l` is refused unless `TICKET_ALLOW_L=1` is set
+  on the founder's word. This supersedes the 2026-10-19 rule's "every new coder launch runs on the L account"; the
+  manager's own account (claude-l, fallback claude-r2d2) is not covered by this instruction.
+- Post one top-level line when the first launch on R2D2 happens.
+
 ## Founder standing rule: dry-run a loop's checks before its build (2026-10-19, 1792422361.772469)
 
 - Before a coder launches or the manager starts a build, the spec's checks run once for real on main, with no product:
