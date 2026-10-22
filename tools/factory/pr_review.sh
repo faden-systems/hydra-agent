@@ -39,15 +39,20 @@ if [ -n "${PR_REVIEW_EVIDENCE:-}" ] && [ -d "${PR_REVIEW_EVIDENCE%% *}" ]; then
   [ -n "$(find "$EDIR" -name '*chain*.jsonl' -print -quit 2>/dev/null)" ] || { echo "pr_review: PR_REVIEW_EVIDENCE $EDIR has no chain file (*chain*.jsonl); no review posted" >&2; exit 3; }
   EHEAD="$(python3 - "$EDIR" <<'PY'
 import glob, json, os, sys
+# the exits write "head" (suites-passed.json); rp1's/sn1's --smoke write "candidate" (smoke.json): both name the run's SHA.
+# r1 of #96: every recorded SHA in the directory is read and they must agree; a disagreement prints "MIXED <file=sha> ..."
+found = {}
 for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
     try: d = json.load(open(p))
     except Exception: continue
-    # the exits write "head" (suites-passed.json); rp1's/sn1's --smoke write "candidate" (smoke.json): both name the run's SHA
-    h = d.get("head") if isinstance(d, dict) else None
-    h = h if isinstance(h, str) else (d.get("candidate") if isinstance(d, dict) and isinstance(d.get("candidate"), str) else None)
-    if h: print(h); break
+    if not isinstance(d, dict): continue
+    h = d.get("head") if isinstance(d.get("head"), str) else (d.get("candidate") if isinstance(d.get("candidate"), str) else None)
+    if h: found[os.path.basename(p)] = h
+shas = set(found.values())
+print(next(iter(shas)) if len(shas) == 1 else ("MIXED " + " ".join(f"{k}={v}" for k, v in found.items()) if shas else ""))
 PY
 )"
+  if [[ "$EHEAD" == MIXED* ]]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records more than one head (${EHEAD#MIXED }): evidence of mixed runs; no review posted" >&2; exit 3; fi
   if [ -n "$EHEAD" ] && [ "$EHEAD" != "$HEAD_SHA" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records head $EHEAD, the PR head is $HEAD_SHA: evidence of another candidate; no review posted" >&2; exit 3; fi
   if [[ "$HEAD_REF" == loop/* ]] && [ -z "$EHEAD" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records no head (the exit writes suites-passed.json with the candidate's head on a suites pass; a smoke writes smoke.json with "candidate"): for a build PR the evidence must name its head; no review posted" >&2; exit 3; fi
   EVIDENCE_NOTE="$( [ -n "$EHEAD" ] && echo "(chain present; recorded head $EHEAD = this PR's head)" || echo "(chain present; the directory records no head: the manager vouches for the run's SHA)" )"
