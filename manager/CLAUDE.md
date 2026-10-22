@@ -227,3 +227,43 @@ Whenever anything waits on the founder, post one top-level line `⏳ waiting on 
 - Parallel launches on the L account: a build that depends on an unmerged branch branches from that branch's candidate
   now and rebases onto its merge (the pd1b/rc1 rule): sn1c from loop/lw1-base before sn1b merged, rp1b from rp1a's
   candidate on loop/rp1.
+
+## Founder standing rules: testing in three stages; judgment graded, invariants matched (2026-10-22, 1792657353)
+
+- Stage 1, the merge gate (target 15 minutes): the unit suites, the scripted journeys, and one short real-model smoke run of
+  the happy path (a typed request reaches its first card and plan; a workout runs with one proposal, one Switch and a
+  summary). Exact checks on invariants only: the clock never waits for the model; the past is untouched; nothing is applied
+  before the person's own answer; Stop works; a proposal attaches; history is kept; health 200/200. No check on what the
+  coach chose to say or propose. Pass = merge and deploy under the standing rule.
+- Stage 2: the founder's own test on the test app; findings come as tickets through Claude with the session record attached.
+- Stage 3: the comprehensive real-model journeys (high heart rate, late answers, interruptions, the knee, the long scenarios)
+  run as a nightly batch on an isolated copy, off the merge path. Their findings become tickets; they never block a merge.
+  Today's drivers and journeys are that batch.
+- Judgment is graded, invariants are matched: in every acceptance a check on the coach's choice (an easier rest proposed, a
+  line said, a question asked) is never a single expected move. A second model grades it against a short rubric with the
+  evidence; any reasonable move passes; the grade and its reason go in the report. Only invariants are matched exactly.
+  rp1's (c) "easier rest asked" is the example of the mistake (four of rp1a's twelve runs failed on the model's choice).
+- Applied from rp1b's merge on: a loop merges on Stage 1 (its CI exit plus the smoke run); rp1's and sn1's acceptance
+  sections become the Stage 1 smoke plus the Stage 3 batch by harness amendment (one round); the nightly batch posts its
+  graded report and the tickets it opened in #faden-dev each morning.
+
+## Founder standing rules: from the two-day bug count (2026-10-22, 1792684647)
+
+Source: 12 product bugs in two days (6 from rp1a's new paths, 3 latent in older loops, 3 design), about 14 harness
+amendments; the reviewers caught none of the 12, the real runs found all of them. Apply from the next build.
+
+1. The coder runs the Stage 1 smoke itself before it stops (the 120-message cap allows it) and fixes what the smoke
+   finds in the same session; the manager's exit reruns it as the gate. Every coder prompt from now on carries the smoke
+   command and the invariant list (`coder/stage1-smoke.txt` is the block; `{SMOKE_CMD}` is the loop's command).
+2. Record kinds are an exit invariant: every record kind a run writes must be in `faden/attest/record.py` KINDS, checked
+   by the exit on the run's chain (a code check, no judgment); an unregistered kind fails the exit with the kind named.
+   Backfill: ck1's `plan_revised` is the first case (ticket rk1).
+3. Reviewers get the run evidence with the diff: every review round on a build PR carries the exit's evidence pointer
+   (the chain, the status timeline, the shots) and a line asking the reviewer to check behaviour against it, not the
+   diff alone (`PR_REVIEW_EVIDENCE="..." tools/factory/pr_review.sh ...`).
+4. Harness code is built like product: drivers, acceptance scripts and nightly runners are written by a coder from a
+   ticket and reviewed in one round, not written by the manager between turns. The manager specifies and reviews.
+
+Hermes recorded the same four rules here at 16:03Z (his section is folded into this one): the invariant list the coder
+runs includes the registered chain kinds; the manager's exit rerun is verification, not a substitute for the coder's own
+smoke, and supersedes any older "the manager no longer runs coder exits" wording.
