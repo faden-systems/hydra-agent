@@ -281,3 +281,18 @@ amendments; the reviewers caught none of the 12, the real runs found all of them
 Hermes recorded the same four rules here at 16:03Z (his section is folded into this one): the invariant list the coder
 runs includes the registered chain kinds; the manager's exit rerun is verification, not a substitute for the coder's own
 smoke, and supersedes any older "the manager no longer runs coder exits" wording.
+
+## Founder freeze: no feature work until the new core is approved (2026-10-22, 1792692381.102299)
+
+- The founder's words (11:06 PT): the audit of the live code (about 25 places where code reads the person's words or
+  makes judgment calls, plus the plan-rewrite path that lost the founder's 40 minutes) points at the architecture: code
+  owns the conversation and calls the model for narrow jobs. A new core is designed first: the coach owns the
+  conversation; code owns the clock, the record, the safety rules, consent, the past, data checks and layout; the pure
+  modules are reused. The design comes as a Faden doc section and a brief in the thread.
+- Until the founder says the design is read and approved: (1) no new loops, tickets or coders launch; whatever was
+  mid-run finishes (gf1 merged; the nightly shakedown completes), then nothing new. (2) The test app stays on 611250ed;
+  a bug fix to the old core only on the founder's explicit word. (3) The nightly batch keeps running as information;
+  its findings become drafts in `coder/tickets/`, never launches. (4) Freeze on the old core: no new code anywhere
+  that reads the person's words with patterns or picks content for them.
+- Ops work that is not feature work continues (the operator gateway #89, the nightly timer install). The inventory of
+  everything in flight at the freeze: `factory/log/evidence/freeze-2026-10-22.md` (faden).
