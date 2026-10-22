@@ -22,6 +22,25 @@ HEAD_SHA="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)"
 HEAD_REF="$(gh pr view "$PR" --repo "$REPO" --json headRefName --jq .headRefName)"
 if [[ "$HEAD_REF" == loop/* ]] && [ -z "${PR_REVIEW_EVIDENCE:-}" ]; then
   echo "pr_review: $REPO#$PR is a build PR (head $HEAD_REF): set PR_REVIEW_EVIDENCE=\"<the exit's evidence pointer>\" (founder rule 3, 2026-10-22); no review posted" >&2; exit 3; fi
+# r2 of #95: a pointer is validated before the reviewer is told it is this candidate's evidence. When it names a local
+# directory (the exit's evidence dir on this machine) it must exist and hold a chain file (*chain*.jsonl), and when a
+# top-level *.json in it records the run's head (a "head" field, as suites-passed.json does) that head must be HEAD_SHA.
+# A URL or a prose pointer is accepted as given and named as such in the comment.
+EVIDENCE_NOTE=""
+if [ -n "${PR_REVIEW_EVIDENCE:-}" ] && [ -d "${PR_REVIEW_EVIDENCE%% *}" ]; then
+  EDIR="${PR_REVIEW_EVIDENCE%% *}"
+  [ -n "$(find "$EDIR" -name '*chain*.jsonl' -print -quit 2>/dev/null)" ] || { echo "pr_review: PR_REVIEW_EVIDENCE $EDIR has no chain file (*chain*.jsonl); no review posted" >&2; exit 3; }
+  EHEAD="$(python3 - "$EDIR" <<'PY'
+import glob, json, os, sys
+for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.json"))):
+    try: d = json.load(open(p))
+    except Exception: continue
+    if isinstance(d, dict) and isinstance(d.get("head"), str): print(d["head"]); break
+PY
+)"
+  if [ -n "$EHEAD" ] && [ "$EHEAD" != "$HEAD_SHA" ]; then echo "pr_review: PR_REVIEW_EVIDENCE $EDIR records head $EHEAD, the PR head is $HEAD_SHA: evidence of another candidate; no review posted" >&2; exit 3; fi
+  EVIDENCE_NOTE="$( [ -n "$EHEAD" ] && echo "(chain present; recorded head $EHEAD = this PR's head)" || echo "(chain present; the directory records no head: the manager vouches for the run's SHA)" )"
+elif [ -n "${PR_REVIEW_EVIDENCE:-}" ]; then EVIDENCE_NOTE="(not a local directory: taken as given)"; fi
 gh pr diff "$PR" --repo "$REPO" > "$OUT/code.diff.full"
 # PR_REVIEW_EXCLUDE (optional, space-separated path prefixes): committed run evidence (screenshots, captured markup, the
 # chain and server logs of a loop's real run) is not code to review and can be larger than the cap, in which case the
@@ -86,7 +105,7 @@ NOW_SHA="$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)"
   printf '## VM review round (Codex %s, read-only on the PR diff and a worktree of head %s)\n\n' "$MODEL" "$HEAD_SHA"
   [ -n "$TRUNC" ] && printf '**%s**\n\n' "$TRUNC"
   [ -n "$EXCL" ] && printf '**%s**\n\n' "$EXCL"
-  [ -n "${PR_REVIEW_EVIDENCE:-}" ] && printf 'Run evidence given to the reviewer: %s\n\n' "$PR_REVIEW_EVIDENCE"
+  [ -n "${PR_REVIEW_EVIDENCE:-}" ] && printf 'Run evidence given to the reviewer: %s %s\n\n' "$PR_REVIEW_EVIDENCE" "$EVIDENCE_NOTE"
   cat "$OUT/review.md"
   printf '\n\n_tools/factory/pr_review.sh; dispositions follow on this PR._\n'
 } > "$OUT/comment.md"

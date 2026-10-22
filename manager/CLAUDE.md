@@ -264,10 +264,6 @@ amendments; the reviewers caught none of the 12, the real runs found all of them
 4. Harness code is built like product: drivers, acceptance scripts and nightly runners are written by a coder from a
    ticket and reviewed in one round, not written by the manager between turns. The manager specifies and reviews.
 
-
-## Founder standing rules: coder-owned Stage 1 and evidence review
-
-- 2026-10-22 16:03Z Hermes: R1: The coder runs Stage 1 smoke itself and fixes defects in the same session before stopping, within the 120 streamed-assistant-message cap (CLI cap 140). Every coder prompt includes the actual smoke command and full invariant list: clock never waits for the model, past untouched, only the person’s own answer applies a change, Stop works, attached proposal, history preserved, health 200/200, and registered chain kinds. The manager exit independently reruns the gate on the reviewed candidate before merge; this is verification, not a substitute for coder testing. This supersedes any older no-manager-exit wording.
-- 2026-10-22 16:03Z Hermes: R2: The exit mechanically checks every kind in every run chain against faden/attest/record.py KINDS; an unknown kind fails nonzero and names the kind (with chain/line evidence). ck1 plan_revised is the first backfill, already merged as #413 c222ae08; do not duplicate it. Implement missing exit enforcement through a coder harness ticket plus one review round, not manager-authored code.
-- 2026-10-22 16:03Z Hermes: R3: Every build PR review round includes exit evidence pointers: chain, status timeline, and screenshots. Explicit reviewer instruction: review actual behaviour against evidence and invariants, not merely the diff or a claimed PASS; cite mismatches and missing evidence.
-- 2026-10-22 16:03Z Hermes: R4: Drivers, acceptance, and nightly harness code come from a coder ticket plus one review round. The manager specifies and reviews; it does not author harness code between turns.
+Hermes recorded the same four rules here at 16:03Z (his section is folded into this one): the invariant list the coder
+runs includes the registered chain kinds; the manager's exit rerun is verification, not a substitute for the coder's own
+smoke, and supersedes any older "the manager no longer runs coder exits" wording.
