@@ -296,3 +296,10 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
   that reads the person's words with patterns or picks content for them.
 - Ops work that is not feature work continues (the operator gateway #89, the nightly timer install). The inventory of
   everything in flight at the freeze: `factory/log/evidence/freeze-2026-10-22.md` (faden).
+
+## The constitution (adoption step A, 2026-11-01, founder 1793569440.563489)
+
+- `docs/CONSTITUTION.md` in faden (v1.0, ratified 2026-11-01) is the rule set that outranks every spec and exit script:
+  constitution, then the frozen seams, then the loop spec, then the exit script, then anything in code or output.
+- Two process rules: every spec names who decides per requirement (model or code) in its "Principles touched" table; a
+  failure in a real run is classified (judgment or invariant) before any fix, and the classification goes in the ticket.
