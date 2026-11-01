@@ -9,5 +9,5 @@ or unknown in your review, and every yes is a concrete problem:
 5. Any path that avoids the model, or any exit assertion on the model's wording?
 6. Any weakened or skipped test, or edit to a file the author may not edit?
 7. Any per-sport or per-flow branch in code outside declarations?
-8. For two model calls on one input: is the transformation named?
+8. Two model calls on one input whose second call is not justified by a named transformation of the first call's output?
 End with the line `rubric: appendix-c v1.0` and the eight answers in order (for example `1 no 2 no 3 unknown ...`).
