@@ -296,3 +296,23 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
   that reads the person's words with patterns or picks content for them.
 - Ops work that is not feature work continues (the operator gateway #89, the nightly timer install). The inventory of
   everything in flight at the freeze: `factory/log/evidence/freeze-2026-10-22.md` (faden).
+
+## Founder account switch (2026-11-01, 1793568066.805149)
+
+- The manager and every coder, delegate or review launch run on the R2D2 account (`claude-r2d2`, Fable 5.1 for the
+  manager, Opus 5.5 high for coders) from 2026-11-01 on; `claude-l` is the fallback only. This replaces the 2026-10-19
+  rule's "the manager runs on claude-l; claude-r2d2 is the fallback". The configured engine was set with
+  `hydra engine acc=claude-r2d2 model=fable5.1` (turn 2721); the R2D2 credential had already carried every manager turn
+  since the 2026-10-23 fallback, so no re-login and no process restart were needed.
+- Confirmation of an account goes to the thread as the CLI's own status line (`claude auth status`: loggedIn,
+  authMethod) plus the credential's name; the identity line is the supervisor's `identity: verified` entry. Never a
+  token, a config dump or environment output.
+- Nothing launches on the new-core work until the founder's brief arrives in the thread 1792508244.042319. The freeze on
+  the old core stays (test app 611250ed; no old-core fix without the founder's word).
+
+## The constitution (adoption step A, 2026-11-01, founder 1793569440.563489)
+
+- `docs/CONSTITUTION.md` in faden (v1.0, ratified 2026-11-01) is the rule set that outranks every spec and exit script:
+  constitution, then the frozen seams, then the loop spec, then the exit script, then anything in code or output.
+- Two process rules: every spec names who decides per requirement (model or code) in its "Principles touched" table; a
+  failure in a real run is classified (judgment or invariant) before any fix, and the classification goes in the ticket.
