@@ -55,6 +55,7 @@ echo "coder protections installed (.claude/settings.json from tools/factory/code
 if [ $DRY -eq 1 ]; then echo "DRY: gate, frozen check and protections check passed for $ID at $M; not launching"; rm -rf "$R" "$L"; exit 0; fi
 [ -d "$C/$ID-claude" ] || python3 "$C/new-claude-config.py" "$C/$ID-claude"
 sed "s/{MERGE}/$M/g" "$C/$ID-prompt.txt.tmpl" > "$L/prompt.txt"
+grep -q '{SMOKE_CMD}' "$C/stage1-smoke.txt" || { echo "$C/stage1-smoke.txt has no {SMOKE_CMD} placeholder; the smoke command would not reach the prompt"; rm -rf "$R" "$L"; exit 2; }
 printf '\n\n=== SMOKE ===\n' >> "$L/prompt.txt"
 SMOKE_CMD="$(cat "$C/$ID-smoke.txt")" python3 -c 'import os,sys; sys.stdout.write(open(sys.argv[1]).read().replace("{SMOKE_CMD}", os.environ["SMOKE_CMD"]))' "$C/stage1-smoke.txt" >> "$L/prompt.txt"
 grep -q '{SMOKE_CMD}' "$L/prompt.txt" && { echo "the smoke block still holds {SMOKE_CMD}"; exit 2; }
@@ -64,4 +65,5 @@ echo "account check (one real call on the R2D2 account, config dir $ID-claude)..
 cd "$C"
 nohup setsid python3 "$C/$ID-$M-run.py" > "$L/launcher.out" 2>&1 < /dev/null &
 sleep 6; cat "$L/coder.json" 2>/dev/null || { echo "coder did not start"; tail -20 "$L/launcher.out"; exit 5; }
-echo "LAUNCHED $ID: repo $R logs $L ($(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("model","?"), "on", d.get("account","?"))' "$L/launcher.json" 2>/dev/null || echo 'model/account: see launcher.json'))"
+MA=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["model"], "on", d["account"])' "$L/launcher.json" 2>/dev/null) || { echo "LAUNCHED $ID BUT UNVERIFIED: $L/launcher.json is missing or lacks model/account (the coder is running: pid in $L/coder.json; check $C/$ID-run.py.tmpl)"; exit 7; }
+echo "LAUNCHED $ID: repo $R logs $L ($MA)"
