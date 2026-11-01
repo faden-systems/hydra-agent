@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
 # The coder launcher (one script for every loop; replaces the per-loop coder/<id>-launch.sh copies):
-#   tools/factory/coder_launch.sh <id> <full sha of main at launch> <spec commit sha> [--repo-url <url>] [--dry]
+#   tools/factory/coder_launch.sh <id> <full sha of the base commit> <spec commit sha> [--repo-url <url>] [--dry]
+# The base commit is main at launch, or the loop's base branch (c0: the merged spec commit on loop/lw1-base); the three
+# spec files must be at the base, equal to the spec commit's.
 # The dry-run gate runs before anything else that costs (founder standing rule 2026-10-19, 1792422361): a spec without a
 # current dry-run (tools/factory/dry_run_gate.sh) is refused, the clone removed, exit 6. Then, as before: the three spec
 # files at <main> must equal the spec commit's; the frozen hashes, prompt and run script come from
 # $HYDRA_HOME/coder/<id>-prompt.txt.tmpl, <id>-run.py.tmpl ({MERGE} = main sha), the one-call account check is
-# $HYDRA_HOME/coder/r2d2-check.py; the coder starts detached. --dry stops after the gate and the frozen check.
+# $HYDRA_HOME/coder/r2d2-check.py (on the loop's own config dir $HYDRA_HOME/coder/<id>-claude); the coder starts detached.
+# Adoption step A (founder brief 2026-11-01): every coder carries the protections. tools/factory/coder-settings.json,
+# the two hooks and docs/CONSTITUTION.md must be at the base; the settings are installed as <clone>/.claude/settings.json,
+# excluded from git locally (so an exit's "everything committed" gate ignores them). Founder rule 1 (2026-10-22): every
+# prompt carries the Stage 1 smoke block: $HYDRA_HOME/coder/<id>-smoke.txt (the loop's smoke command, one line) is
+# substituted into $HYDRA_HOME/coder/stage1-smoke.txt and appended to the prompt; a loop without a smoke file is refused.
+# --dry stops after the gate, the frozen check and the protections check (nothing is launched, the clone is removed).
 set -euo pipefail
-ID="${1:?loop id}"; M="${2:?full sha of main}"; SPEC="${3:?spec commit sha}"; shift 3
+ID="${1:?loop id}"; M="${2:?full sha of the base commit}"; SPEC="${3:?spec commit sha}"; shift 3
 URL="https://github.com/faden-systems/faden.git"; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in --repo-url) URL="$2"; shift 2;; --dry) DRY=1; shift;; *) echo "unknown argument: $1" >&2; exit 2;; esac
 done
-[[ "$M" =~ ^[0-9a-f]{40}$ ]] || { echo "need a full sha for main"; exit 2; }
+[[ "$M" =~ ^[0-9a-f]{40}$ ]] || { echo "need a full sha for the base commit"; exit 2; }
 [[ "$SPEC" =~ ^[0-9a-f]{7,40}$ ]] || { echo "need a sha for the spec commit"; exit 2; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 C="${HYDRA_HOME:-$HOME}/coder"; cd "$C"; R="$C/$ID-$M"; L="$R-logs"
-for f in "$C/$ID-prompt.txt.tmpl" "$C/$ID-run.py.tmpl" "$C/r2d2-check.py"; do [ -s "$f" ] || { echo "missing: $f"; exit 2; }; done
+for f in "$C/$ID-prompt.txt.tmpl" "$C/$ID-run.py.tmpl" "$C/r2d2-check.py" "$C/$ID-smoke.txt" "$C/stage1-smoke.txt"; do [ -s "$f" ] || { echo "missing: $f"; exit 2; }; done
 [ -e "$R" ] && { echo "exists: $R"; exit 2; }; mkdir "$L"
 git clone -q "$URL" "$R"; cd "$R"
 git checkout -q -b "loop/$ID" "$M"; git config user.name hydra-coder; git config user.email coder@hydra.local
@@ -36,13 +44,24 @@ R=pathlib.Path(sys.argv[1]); L=pathlib.Path(sys.argv[2]); i=sys.argv[3]
 files=[f'loops/{i}.md',f'loops/{i}.exit.sh',f'loops/{i}.acceptance.py']
 (L/'frozen-hashes.json').write_text(json.dumps({f:hashlib.sha256((R/f).read_bytes()).hexdigest() for f in files},indent=2)+'\n')
 PY
-if [ $DRY -eq 1 ]; then echo "DRY: gate and frozen check passed for $ID at $M; not launching"; rm -rf "$R" "$L"; exit 0; fi
+# the protections (adoption step A): the settings, the hooks and the constitution must be at the base; installed, excluded
+for f in tools/factory/coder-settings.json tools/factory/coder_hooks/pre_tool_use.py tools/factory/coder_hooks/stop.sh docs/CONSTITUTION.md; do
+  git cat-file -e "$M:$f" 2>/dev/null || { echo "MISSING AT THE BASE: $f (adoption step A must be on the base line before a coder launches)"; rm -rf "$R" "$L"; exit 3; }
+done
+mkdir -p .claude && cp tools/factory/coder-settings.json .claude/settings.json
+grep -qx '.claude/' .git/info/exclude 2>/dev/null || echo '.claude/' >> .git/info/exclude
+python3 -c "import json,sys; json.load(open('.claude/settings.json'))" || { echo "coder-settings.json at the base is not valid JSON"; rm -rf "$R" "$L"; exit 3; }
+echo "coder protections installed (.claude/settings.json from tools/factory/coder-settings.json at $M, excluded locally)"
+if [ $DRY -eq 1 ]; then echo "DRY: gate, frozen check and protections check passed for $ID at $M; not launching"; rm -rf "$R" "$L"; exit 0; fi
 [ -d "$C/$ID-claude" ] || python3 "$C/new-claude-config.py" "$C/$ID-claude"
 sed "s/{MERGE}/$M/g" "$C/$ID-prompt.txt.tmpl" > "$L/prompt.txt"
+printf '\n\n=== SMOKE ===\n' >> "$L/prompt.txt"
+SMOKE_CMD="$(cat "$C/$ID-smoke.txt")" python3 -c 'import os,sys; sys.stdout.write(open(sys.argv[1]).read().replace("{SMOKE_CMD}", os.environ["SMOKE_CMD"]))' "$C/stage1-smoke.txt" >> "$L/prompt.txt"
+grep -q '{SMOKE_CMD}' "$L/prompt.txt" && { echo "the smoke block still holds {SMOKE_CMD}"; exit 2; }
 sed "s/{MERGE}/$M/g" "$C/$ID-run.py.tmpl" > "$C/$ID-$M-run.py"
 python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$C/$ID-$M-run.py"
-echo "account check (one real call on the R2D2 account)..."; python3 "$C/r2d2-check.py" "$L/account-check.json" || { echo "R2D2 ACCOUNT CHECK FAILED"; exit 4; }
+echo "account check (one real call on the R2D2 account, config dir $ID-claude)..."; R2D2_CONFIG_DIR="$C/$ID-claude" python3 "$C/r2d2-check.py" "$L/account-check.json" || { echo "R2D2 ACCOUNT CHECK FAILED"; exit 4; }
 cd "$C"
 nohup setsid python3 "$C/$ID-$M-run.py" > "$L/launcher.out" 2>&1 < /dev/null &
 sleep 6; cat "$L/coder.json" 2>/dev/null || { echo "coder did not start"; tail -20 "$L/launcher.out"; exit 5; }
-echo "LAUNCHED: repo $R logs $L"
+echo "LAUNCHED $ID: repo $R logs $L ($(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("model","?"), "on", d.get("account","?"))' "$L/launcher.json" 2>/dev/null || echo 'model/account: see launcher.json'))"
