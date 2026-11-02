@@ -7,7 +7,7 @@
 # current dry-run (tools/factory/dry_run_gate.sh) is refused, the clone removed, exit 6. Then, as before: the three spec
 # files at <main> must equal the spec commit's; the frozen hashes, prompt and run script come from
 # $HYDRA_HOME/coder/<id>-prompt.txt.tmpl, <id>-run.py.tmpl ({MERGE} = main sha), the one-call account check is
-# $HYDRA_HOME/coder/r2d2-check.py (on the loop's own config dir $HYDRA_HOME/coder/<id>-claude); the coder starts detached.
+# $HYDRA_HOME/coder/l-check.py (CODER_ACCOUNT=claude-l, the default since founder 2026-11-02 1793596969; claude-r2d2 -> r2d2-check.py) on the loop's own config dir $HYDRA_HOME/coder/<id>-claude; the coder starts detached.
 # Adoption step A (founder brief 2026-11-01): every coder carries the protections. tools/factory/coder-settings.json,
 # the two hooks and docs/CONSTITUTION.md must be at the base; the settings are installed as <clone>/.claude/settings.json,
 # excluded from git locally (so an exit's "everything committed" gate ignores them). The deny list is the protected paths
@@ -25,7 +25,9 @@ done
 [[ "$SPEC" =~ ^[0-9a-f]{7,40}$ ]] || { echo "need a sha for the spec commit"; exit 2; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 C="${HYDRA_HOME:-$HOME}/coder"; cd "$C"; R="$C/$ID-$M"; L="$R-logs"
-for f in "$C/$ID-prompt.txt.tmpl" "$C/$ID-run.py.tmpl" "$C/r2d2-check.py" "$C/$ID-smoke.txt" "$C/stage1-smoke.txt"; do [ -s "$f" ] || { echo "missing: $f"; exit 2; }; done
+ACCOUNT="${CODER_ACCOUNT:-claude-l}"  # founder 2026-11-02 1793596969: new launches on L; CODER_ACCOUNT=claude-r2d2 is the fallback
+case "$ACCOUNT" in claude-l) CHECK="l-check.py"; CHECK_DIR_VAR="L_CONFIG_DIR";; claude-r2d2) CHECK="r2d2-check.py"; CHECK_DIR_VAR="R2D2_CONFIG_DIR";; *) echo "unknown CODER_ACCOUNT $ACCOUNT"; exit 2;; esac
+for f in "$C/$ID-prompt.txt.tmpl" "$C/$ID-run.py.tmpl" "$C/$CHECK" "$C/$ID-smoke.txt" "$C/stage1-smoke.txt"; do [ -s "$f" ] || { echo "missing: $f"; exit 2; }; done
 [ -e "$R" ] && { echo "exists: $R"; exit 2; }; mkdir "$L"
 git clone -q "$URL" "$R"; cd "$R"
 git checkout -q -b "loop/$ID" "$M"; git config user.name hydra-coder; git config user.email coder@hydra.local
@@ -104,7 +106,8 @@ SMOKE_CMD="$(cat "$C/$ID-smoke.txt")" python3 -c 'import os,sys; sys.stdout.writ
 grep -q '{SMOKE_CMD}' "$L/prompt.txt" && { echo "the smoke block still holds {SMOKE_CMD}"; exit 2; }
 sed "s/{MERGE}/$M/g" "$C/$ID-run.py.tmpl" > "$C/$ID-$M-run.py"
 python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$C/$ID-$M-run.py"
-echo "account check (one real call on the R2D2 account, config dir $ID-claude)..."; R2D2_CONFIG_DIR="$C/$ID-claude" python3 "$C/r2d2-check.py" "$L/account-check.json" || { echo "R2D2 ACCOUNT CHECK FAILED"; exit 4; }
+echo "account check (one real call on the $ACCOUNT account, config dir $ID-claude)..."; env "$CHECK_DIR_VAR=$C/$ID-claude" python3 "$C/$CHECK" "$L/account-check.json" || { echo "$ACCOUNT ACCOUNT CHECK FAILED"; exit 4; }
+grep -q "credentials/$ACCOUNT.env" "$C/$ID-run.py.tmpl" || { echo "$C/$ID-run.py.tmpl does not use credentials/$ACCOUNT.env: the run template and the account check disagree"; exit 4; }
 cd "$C"
 nohup setsid python3 "$C/$ID-$M-run.py" > "$L/launcher.out" 2>&1 < /dev/null &
 sleep 6; cat "$L/coder.json" 2>/dev/null || { echo "coder did not start"; tail -20 "$L/launcher.out"; exit 5; }
