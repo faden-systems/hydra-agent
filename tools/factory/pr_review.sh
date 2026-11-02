@@ -87,10 +87,48 @@ PY
   # the exclusion is named only when sections were actually dropped: a claim without a drop would misreport the review
   if [ "${DROPPED:-0}" -gt 0 ]; then EXCL="DIFF EXCLUDES ${PR_REVIEW_EXCLUDE} (committed run evidence, not code): ${DROPPED} file section(s) are not in this review"; fi
 fi
-# the diff goes in whole up to DIFF_CAP bytes (the retired job capped at 60 KB; the subscription model takes more); a
-# larger diff is cut there and the cut is named in the prompt and the comment, so a partial review is never read as a full one
-DIFF_CAP="${PR_REVIEW_DIFF_CAP:-200000}"; FULL=$(wc -c < "$OUT/code.diff.full"); TRUNC=""
-if [ "$FULL" -gt "$DIFF_CAP" ]; then head -c "$DIFF_CAP" "$OUT/code.diff.full" > "$OUT/code.diff"; TRUNC="DIFF CUT at $DIFF_CAP of $FULL bytes: this review covers the first part only; split the PR or raise PR_REVIEW_DIFF_CAP"; else cp "$OUT/code.diff.full" "$OUT/code.diff"; fi
+# the diff goes in whole up to DIFF_CAP bytes (the retired job capped at 60 KB; the subscription model took faden #431's
+# 236 KB with room, n2026-11-02-6). A larger diff is cut by whole files, never mid-file: the per-file sections are ordered
+# product first, paths under a tests/ or docs/ directory last (so a cut costs tests, not product), kept up to the last
+# `diff --git` boundary below the cap, and every file left out is named in the prompt and the comment, so a partial
+# review is never read as a full one and its coverage is readable from the comment.
+DIFF_CAP="${PR_REVIEW_DIFF_CAP:-400000}"; FULL=$(wc -c < "$OUT/code.diff.full"); TRUNC=""
+if [ "$FULL" -gt "$DIFF_CAP" ]; then
+  TRUNC=$(python3 - "$OUT/code.diff.full" "$OUT/code.diff" "$DIFF_CAP" <<'PY'
+import re, sys
+src, dst, cap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(src, "rb").read()
+def unquote(s):  # git quotes a path with a quote, a control or a non-ASCII byte: C escapes, octal bytes
+    if not (s.startswith('"') and s.endswith('"')): return s
+    return s[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape").encode("latin-1").decode("utf-8", "surrogateescape")
+def name(part):  # the post-image path of one file section
+    lines = part.decode("utf-8", "surrogateescape").split("\n")
+    for line in lines[1:]:
+        if line.startswith("@@"): break
+        for key in ("rename to ", "copy to "):
+            if line.startswith(key): return unquote(line[len(key):])
+    head = lines[0][len("diff --git "):]
+    m = re.fullmatch(r'("(?:[^"\\]|\\.)*") ("(?:[^"\\]|\\.)*")', head)
+    if m: return unquote(m.group(2))[2:]
+    n = (len(head) - 1) // 2  # unquoted "a/P b/P" (a space in P is not quoted): the same P on both sides
+    if head[n] == " " and head[2:n] == head[n + 3:]: return head[n + 3:]
+    return head.rsplit(" b/", 1)[-1]
+def later(path):  # tests and docs go after the product
+    return any(d in ("tests", "docs") for d in path.split("/")[:-1])
+parts = re.split(rb"(?m)^(?=diff --git )", data)
+pre, files = parts[0], [(name(p), p) for p in parts[1:]]
+files.sort(key=lambda f: later(f[0]))  # stable: the order inside each group is the PR's
+kept, size, left = [pre], len(pre), []
+for i, (path, part) in enumerate(files):
+    if size + len(part) > cap: left = [p for p, _ in files[i:]]; break
+    kept.append(part); size += len(part)
+open(dst, "wb").write(b"".join(kept))
+print(f"DIFF CUT: {len(left)} file{'' if len(left) == 1 else 's'} left out: {', '.join(left)} (the diff is {len(data)} bytes, "
+      f"the cap {cap}; this review covers {size} bytes of whole files, product first, tests/ and docs/ last); "
+      "split the PR or raise PR_REVIEW_DIFF_CAP")
+PY
+)
+else cp "$OUT/code.diff.full" "$OUT/code.diff"; fi
 gh pr view "$PR" --repo "$REPO" --json title,body,headRefName,baseRefName,headRefOid \
   --jq '"Title: " + .title + "\nBranch: " + .headRefName + " -> " + .baseRefName + " (head " + .headRefOid + ")\n\n" + (.body // "")' > "$OUT/context.md"
 # the reviewer reads a throwaway worktree of the PR's head revision only (never the manager's own checkout with whatever
