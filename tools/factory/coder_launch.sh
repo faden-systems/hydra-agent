@@ -10,7 +10,8 @@
 # $HYDRA_HOME/coder/r2d2-check.py (on the loop's own config dir $HYDRA_HOME/coder/<id>-claude); the coder starts detached.
 # Adoption step A (founder brief 2026-11-01): every coder carries the protections. tools/factory/coder-settings.json,
 # the two hooks and docs/CONSTITUTION.md must be at the base; the settings are installed as <clone>/.claude/settings.json,
-# excluded from git locally (so an exit's "everything committed" gate ignores them). Founder rule 1 (2026-10-22): every
+# excluded from git locally (so an exit's "everything committed" gate ignores them). The deny list is the protected paths
+# minus the loop's fence (FENCE= in loops/<id>.exit.sh), written with the fence to .claude/fence.json for the hook. Founder rule 1 (2026-10-22): every
 # prompt carries the Stage 1 smoke block: $HYDRA_HOME/coder/<id>-smoke.txt (the loop's smoke command, one line) is
 # substituted into $HYDRA_HOME/coder/stage1-smoke.txt and appended to the prompt; a loop without a smoke file is refused.
 # --dry stops after the gate, the frozen check and the protections check (nothing is launched, the clone is removed).
@@ -51,7 +52,49 @@ done
 mkdir -p .claude && cp tools/factory/coder-settings.json .claude/settings.json
 grep -qx '.claude/' .git/info/exclude 2>/dev/null || echo '.claude/' >> .git/info/exclude
 python3 -c "import json,sys; json.load(open('.claude/settings.json'))" || { echo "coder-settings.json at the base is not valid JSON"; rm -rf "$R" "$L"; exit 3; }
-echo "coder protections installed (.claude/settings.json from tools/factory/coder-settings.json at $M, excluded locally)"
+# The deny list is computed per loop: the protected paths minus the loop's fence (founder review of c0, 2026-11-02: a deny
+# on a path the fence grants made the c0 coder write through one-off scripts). The fence is the exit's own FENCE= regex
+# (loops/<id>.exit.sh, one line); it is written to .claude/fence.json for the PreToolUse hook (which exempts exactly the
+# paths the regex matches), and every deny rule whose protected path is granted in part by the fence is dropped (the hook
+# and the exit's fence check stay exact). An exit without a FENCE= line keeps the full deny list.
+python3 - "$ID" "$M" <<'PY' || { echo "the per-loop deny list could not be computed"; rm -rf "$R" "$L"; exit 3; }
+import json, re, sys
+loop, base = sys.argv[1], sys.argv[2]
+matches = [m for m in (re.match(r"^FENCE='([^']*)'\s*$", l) for l in open(f"loops/{loop}.exit.sh", encoding="utf-8").read().splitlines()) if m]
+if len(matches) != 1:
+    print(f"deny list: loops/{loop}.exit.sh has {len(matches)} FENCE= line(s); the full protected list stays"); raise SystemExit(0)
+fence = matches[0].group(1)  # the quoted regex only (trailing whitespace after the quote is not part of it)
+re.compile(fence)
+def literal_prefix(alt):
+    out, i = [], 0
+    alt = alt[1:] if alt.startswith("^") else alt
+    while i < len(alt):
+        c = alt[i]
+        if c == "\\" and i + 1 < len(alt): out.append(alt[i + 1]); i += 2; continue
+        if c in "[](){}*+?$|.": break
+        out.append(c); i += 1
+    return "".join(out)
+# the exits' convention: anchored alternatives joined by | at the top level (no groups). A grouped regex such as
+# ^(a|b)$ cannot be split by this parser: then nothing is dropped (the hook still exempts by the full regex) and the launch says so.
+if "(" in fence:
+    print(f"deny list: the fence of {loop} uses groups; no deny rule dropped (the hook exempts by the full regex; write the fence as anchored alternatives to drop deny rules)")
+    prefixes = []
+else:
+    prefixes = [literal_prefix(a) for a in fence.split("|")]
+settings = json.load(open(".claude/settings.json"))
+kept, dropped = [], []
+for rule in settings["permissions"]["deny"]:
+    m = re.match(r"^(\w+)\((.*)\)$", rule)
+    if not m: kept.append(rule); continue
+    pat = m.group(2); base_path = pat[:-3] if pat.endswith("/**") else pat
+    granted = any(p == base_path or p.startswith(base_path + "/") or (not pat.endswith("/**") and p == base_path) for p in prefixes if p)
+    (dropped if granted else kept).append(rule)
+settings["permissions"]["deny"] = kept
+json.dump(settings, open(".claude/settings.json", "w"), indent=2)
+json.dump({"loop": loop, "base": base, "fence": fence, "deny_dropped": dropped}, open(".claude/fence.json", "w"), indent=2)
+print(f"deny list for {loop}: {len(kept)} rule(s) kept, {len(dropped)} dropped as granted by the fence: " + (" ".join(dropped) or "none"))
+PY
+echo "coder protections installed (.claude/settings.json from tools/factory/coder-settings.json at $M minus the fence; .claude/fence.json; excluded locally)"
 if [ $DRY -eq 1 ]; then echo "DRY: gate, frozen check and protections check passed for $ID at $M; not launching"; rm -rf "$R" "$L"; exit 0; fi
 [ -d "$C/$ID-claude" ] || python3 "$C/new-claude-config.py" "$C/$ID-claude"
 sed "s/{MERGE}/$M/g" "$C/$ID-prompt.txt.tmpl" > "$L/prompt.txt"
