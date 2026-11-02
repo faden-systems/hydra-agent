@@ -107,7 +107,17 @@ grep -q '{SMOKE_CMD}' "$L/prompt.txt" && { echo "the smoke block still holds {SM
 sed "s/{MERGE}/$M/g" "$C/$ID-run.py.tmpl" > "$C/$ID-$M-run.py"
 python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$C/$ID-$M-run.py"
 echo "account check (one real call on the $ACCOUNT account, config dir $ID-claude)..."; env "$CHECK_DIR_VAR=$C/$ID-claude" python3 "$C/$CHECK" "$L/account-check.json" || { echo "$ACCOUNT ACCOUNT CHECK FAILED"; exit 4; }
-grep -q "credentials/$ACCOUNT.env" "$C/$ID-run.py.tmpl" || { echo "$C/$ID-run.py.tmpl does not use credentials/$ACCOUNT.env: the run template and the account check disagree"; exit 4; }
+# r1 of #105: a grep would accept the chosen account's credential path in a comment or an unused string while the code
+# loads another account. The generated run script is parsed instead: every credential path its code names (string
+# constants matching credentials/<account>.env) must be the chosen account's, and no other account's path may appear.
+python3 - "$C/$ID-$M-run.py" "$ACCOUNT" <<'PYCHK' || { echo "$C/$ID-run.py.tmpl and the $ACCOUNT account check disagree"; exit 4; }
+import ast, re, sys
+tree = ast.parse(open(sys.argv[1]).read()); want = sys.argv[2]
+named = {m.group(1) for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+         for m in re.finditer(r"credentials/([\w.-]+)\.env", n.value)}
+if named != {want}:
+    print(f"run script names credential file(s) {sorted(named) or 'none'} in code; the account check is {want}"); sys.exit(1)
+PYCHK
 cd "$C"
 nohup setsid python3 "$C/$ID-$M-run.py" > "$L/launcher.out" 2>&1 < /dev/null &
 sleep 6; cat "$L/coder.json" 2>/dev/null || { echo "coder did not start"; tail -20 "$L/launcher.out"; exit 5; }
