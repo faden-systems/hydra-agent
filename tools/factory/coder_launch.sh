@@ -60,10 +60,10 @@ python3 -c "import json,sys; json.load(open('.claude/settings.json'))" || { echo
 python3 - "$ID" "$M" <<'PY' || { echo "the per-loop deny list could not be computed"; rm -rf "$R" "$L"; exit 3; }
 import json, re, sys
 loop, base = sys.argv[1], sys.argv[2]
-lines = [l for l in open(f"loops/{loop}.exit.sh", encoding="utf-8").read().splitlines() if re.match(r"^FENCE='[^']*'\s*$", l)]
-if len(lines) != 1:
-    print(f"deny list: loops/{loop}.exit.sh has {len(lines)} FENCE= line(s); the full protected list stays"); raise SystemExit(0)
-fence = lines[0][len("FENCE='"):-1]
+matches = [m for m in (re.match(r"^FENCE='([^']*)'\s*$", l) for l in open(f"loops/{loop}.exit.sh", encoding="utf-8").read().splitlines()) if m]
+if len(matches) != 1:
+    print(f"deny list: loops/{loop}.exit.sh has {len(matches)} FENCE= line(s); the full protected list stays"); raise SystemExit(0)
+fence = matches[0].group(1)  # the quoted regex only (trailing whitespace after the quote is not part of it)
 re.compile(fence)
 def literal_prefix(alt):
     out, i = [], 0
@@ -74,7 +74,13 @@ def literal_prefix(alt):
         if c in "[](){}*+?$|.": break
         out.append(c); i += 1
     return "".join(out)
-prefixes = [literal_prefix(a) for a in fence.split("|")]
+# the exits' convention: anchored alternatives joined by | at the top level (no groups). A grouped regex such as
+# ^(a|b)$ cannot be split by this parser: then nothing is dropped (the hook still exempts by the full regex) and the launch says so.
+if "(" in fence:
+    print(f"deny list: the fence of {loop} uses groups; no deny rule dropped (the hook exempts by the full regex; write the fence as anchored alternatives to drop deny rules)")
+    prefixes = []
+else:
+    prefixes = [literal_prefix(a) for a in fence.split("|")]
 settings = json.load(open(".claude/settings.json"))
 kept, dropped = [], []
 for rule in settings["permissions"]["deny"]:
