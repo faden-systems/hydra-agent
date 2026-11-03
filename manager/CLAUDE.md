@@ -312,7 +312,11 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
 
 ## The constitution (adoption step A, 2026-11-01, founder 1793569440.563489)
 
-- `docs/CONSTITUTION.md` in faden (v1.1, ratified 2026-11-02; v1.0 2026-11-01, 1.1 = P7 Means reworded by the founder, 1793636355) is the rule set that outranks every spec and exit script:
+- `docs/CONSTITUTION.md` in faden (v2.0, ratified 2026-11-02, main 57125145 / loop/lw1-base 2baab162; v1.0 2026-11-01; 1.1 = P7 Means reworded by
+  the founder, 1793636355; 2.0 = P5 redefined by the founder, 1793667884: "apply and tell", a kind of change the app developer
+  declares applies at once when the model makes it, the model tells the person in the same answer, the person can undo it
+  until its block ends, the caps hold for every change; Appendix E check `apply-and-tell (c2)`) is the rule set that outranks
+  every spec and exit script:
   constitution, then the frozen seams, then the loop spec, then the exit script, then anything in code or output.
 - Two process rules: every spec names who decides per requirement (model or code) in its "Principles touched" table; a
   failure in a real run is classified (judgment or invariant) before any fix, and the classification goes in the ticket.
