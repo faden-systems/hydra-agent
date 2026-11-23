@@ -534,11 +534,12 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
   lowered. Numbers at the writing: the live part is 3.3 MB (`MEMORY.md` 2.8 MB, of which 1.9 MB dated before 14 Nov;
   `state.json` 0.47 MB, of which 0.38 MB the bodies of 32 closed tracks); growth since 14 Nov about 90 KB a day and
   about 25 KB a merged loop (c01 and c02: `MEMORY.md` 20 KB, `state.json` 5 KB); the trigger is expected to fire about
-  once in a ten-loop build pass. The manager announces the tidy in the new-core thread (what and why, as for a rule
-  path) before it starts.
+  once in a ten-loop build pass. If the first tidy leaves much less than 256 KB, the floor alone decides, and at the
+  first build's rate (90 to 135 KB a day) the size trigger then fires after about 4 to 5 active days. The manager
+  announces the tidy in the new-core thread (what and why, as for a rule path) before it starts.
 - A session of its own, launched detached in the delegate launcher's form from `coder/memory-tidy.prompt.txt`, on the
-  most capable model the account offers that day (Fable 5.1 at the time of writing), never inside a manager turn. The
-  report names the model and the account.
+  most capable model the account offers that day: the manager's own model (Fable 5.1 at the time of writing), never the
+  coders' Opus 5.5, never inside a manager turn. The report names the model and the account.
 - Nothing is deleted. The session writes beside the live files, never over them: `MEMORY.tidy.md` (what stays current,
   in MEMORY.md's own form), `factory/manager-memory/archive/<YYYY-MM-DD>/` (every moved entry with its date and its
   section; every superseded decision with what replaced it) and the report `factory/log/evidence/memory-tidy-<date>.md`.
