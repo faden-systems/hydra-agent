@@ -312,11 +312,253 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
 
 ## The constitution (adoption step A, 2026-11-01, founder 1793569440.563489)
 
-- `docs/CONSTITUTION.md` in faden (v2.0, ratified 2026-11-02, main 57125145 / loop/lw1-base 2baab162; v1.0 2026-11-01; 1.1 = P7 Means reworded by
-  the founder, 1793636355; 2.0 = P5 redefined by the founder, 1793667884: "apply and tell", a kind of change the app developer
-  declares applies at once when the model makes it, the model tells the person in the same answer, the person can undo it
-  until its block ends, the caps hold for every change; Appendix E check `apply-and-tell (c2)`) is the rule set that outranks
-  every spec and exit script:
+- `docs/CONSTITUTION.md` in faden (v1.0, ratified 2026-11-01) is the rule set that outranks every spec and exit script:
   constitution, then the frozen seams, then the loop spec, then the exit script, then anything in code or output.
 - Two process rules: every spec names who decides per requirement (model or code) in its "Principles touched" table; a
   failure in a real run is classified (judgment or invariant) before any fix, and the classification goes in the ticket.
+
+## Founder account switch back to L (2026-11-02, 1793596969.948749)
+
+- The manager and every coder, delegate or review launch run on the L account (`claude-l`, Fable 5.1 for the manager,
+  Opus 5.5 high for coders) from 2026-11-02 on; `claude-r2d2` is the fallback. This replaces the 2026-11-01 rule. Same
+  rules as that switch: nothing switches mid-task; the manager moves at a point with nothing in flight (the #430 merge
+  decision completes first, then `hydra engine acc=claude-l model=fable5.1`); coder launches (c1 first) go on L.
+- The launchers: `coder/l-check.py` is the one-call L check (`L_OK`; mirrors `r2d2-check.py`); `coder_launch.sh` picks
+  the check from `CODER_ACCOUNT` (default `claude-l`; hydra-agent PR from branch account-l-20261102); `ticket-launch.sh`
+  accepts `TICKET_ENGINE=claude-l` without `TICKET_ALLOW_L` and keeps `claude-r2d2` as the fallback;
+  `delegate-launch.py` and `coder/c1-run.py.tmpl` use `credentials/claude-l.env`.
+- Confirmation stays the CLI's own status line (`claude auth status`: loggedIn, apiProvider) plus the credential's
+  name; never a token, a config dump or environment output. One top-level line when the manager has switched and one
+  when the first coder launches on L.
+
+## Founder decisions: grader exception, exit scope, factory tooling (2026-11-02, 1793637715)
+
+- P8 grader: gpt-6-astra grading a gpt-6-sol coach is a standing exception to P8's different-vendor rule (no other vendor
+  key on the VM); recorded in `docs/notes/constitution.md`, not in the constitution's text. `ModelVerifier`'s
+  different-model-id check stays.
+- The new core's exits do not run the old core's full suite (from c2 on; c1 by amendment 5, PR #438): the suites of the
+  modules the new core imports (`faden/attest`, `faden/graph`, `faden/stabilize`, `faden/runtime/interfaces` and the model
+  clients) plus the new core's own suites (`tests/invariants`, `tests/coach`), the CLI journeys, the acceptance replay and
+  the real smoke. The fence and frozen-tree checks prove the old core untouched. The full old suite stays in the nightly
+  (information) and in any old-core PR; the red-at-base allowlist and `loops/suite_tools.sh flake_rerun` stay for whoever
+  needs them. The spec template says so (PR #439).
+- Factory tooling is not under the freeze: the launcher, the coder hooks, the exit helpers, the review tooling and their
+  tests (`tools/factory`, hydra-agent) may be fixed in the small-fix lane, one review round each, Opus 5.5 or Codex.
+  n2026-11-02-4 (hook test isolation) launched 16:47Z on L. Still frozen: old-core product code and old-core tests,
+  including the two cw1a flakes (n2026-11-02-5) and the sn1 grading evidence gap (n2026-11-02-2).
+
+## Founder decisions: branch protection option 2; offline standing instructions (2026-11-02, 1793638284 + 1793638443)
+
+- Branch protection: option 2. No branch protection on main for now and no separate GitHub identity for the manager. The
+  standing rule is the lock: the manager edits a rule path (`docs/CONSTITUTION.md`, `seams/`, `loops/`, `.github/`,
+  `CLAUDE.md`, `AGENTS.md`, `tools/lint/`, `pyproject.toml`) only after a line in the new-core thread saying what and why;
+  the coder deny rules, hooks and fence checks stay as they are. Revisit when the founder says so.
+- Offline window (2026-11-02 ~17:00-20:00Z): (1) c1 #431 round 4 follows c0's final-round rule: findings fixed or declined
+  (the node-start decline stands), the exit reruns, #431 squash-merges into loop/lw1-base on its PASS; no round 5 unless
+  the founder says so; a clean round merges at once. (2) After the merge, the founder's Stage 2 check on c1 by transcript:
+  the CLI on gpt-6-sol from a clean checkout of the merged base, data under a test directory, never the founder's
+  history; the exact first line `Today's session on treadmill for 40 minutes. Slept well and not hurting.`; then the plan,
+  Start, the clock (test time if the real clock is impractical), one coach proposal answered by a declared phrase, Stop,
+  the summary; the full unedited transcript in the thread (coach lines, cards with fields, facts with quote and source,
+  tool calls with outcome or refusal, asks and proposals with options and phrases, the record summary with kinds, counts
+  and chain verification), in parts if long. (3) Questions for the founder wait in the thread; process questions are
+  answered by the founder's Claude session. The old core stays frozen; factory tooling fixes run; nightly 14 is information.
+- Addendum (founder 1793639487, 17:1xZ): the Q5 commit on #431 is new product code and gets one review round on its exit
+  evidence (gpt-6-astra, Appendix C) before the merge; findings fixed or declined, the exit rerun on the fixed head, the
+  merge on that PASS with the dispositions in the thread; no second round without the founder.
+
+## Founder: the old project is finished, the new one starts (2026-11-14, 1794645201.024939)
+
+- The old code base (`faden-systems/faden-archived`) is closed: its queue and every decision held for 'resume' are
+  closed, the planner experiment (1794087542) is withdrawn, no more work is done on it. The pause of 2026-11-03 ends
+  for the new code base only. The test app 611250ed keeps running untouched until the founder says otherwise.
+- The new project is still Faden ("Framework of Intent Programming"), repo `faden-systems/faden`, from zero.
+  `docs/CONSTITUTION.md` 1.0 (PR #1, merged 2026-11-14 08:32Z) is in force; the old constitution and its P-numbers
+  do not apply. The manager decides loop specs and exit scripts and runs the factory; the founder's Claude writes the
+  build brief and the specs and keeps `docs/ARCHITECTURE.md`; the founder decides formats, new checks, record kinds
+  and build scope. Reviewers: different model and vendor from the author, never the author's transcript.
+- Persistence: option (a). `/srv/hydra/repos/faden` pushes to `faden-archived` (remote repointed 08:35Z) and keeps
+  the factory's log and memory there for now. Nobody pushes anything from the old code base into the new repo.
+  The fresh clone for the new work is `/srv/hydra/repos/faden-new`.
+- Accounts: everyone (manager, coders, delegates, reviews) on R2D2 (`hydra engine acc=claude-r2d2 model=fable5.1`
+  set 08:35Z); it was reset 2026-11-14; use as much of it as possible before Sunday 15 Nov 18:00 Pacific.
+- Owed: when the architecture document, the build brief and the two specs are on `main`, read them; then the
+  factory setup PR (a `CLAUDE.md` that imports the constitution, `AGENTS.md`, the launcher, hooks and CI); the loop 1
+  spec and exit script posted in the thread before a coder launches; the factory-home proposal (written:
+  `factory/log/evidence/new-repo-2026-11-14/factory-home-proposal.md` in the archive clone; A = separate
+  `faden-factory` repo recommended).
+
+## Founder decisions: factory home, reads before launch, the test app, old ops (2026-11-14, 1794646325.164109)
+
+- Factory home: option A. `faden-systems/faden-factory` (private, created 2026-11-14 09:02Z, seeded with the archive's
+  `factory/` tree at 55fdbb60) holds the factory's state, the Slack mirror, the track logs, the digests, the memory and
+  the run evidence; the manager's persistence moves there for the new project. The archive keeps the old history as it is.
+- The founder's Claude session reads every loop spec and its exit script (as a PR, named in the thread) before the loop
+  launches, starting with loop 1, and answers in the thread; no coder launches before that read. It also reviews the
+  factory set-up PR (#3): when its review has nothing open, the manager merges. Decisions that are the founder's still go
+  to him. It reads the thread about every 30 minutes through the weekend; say when the next spec will be ready.
+- The test app (fitflow-dogfood, 611250ed) is stopped; its data and its unit are kept so it can be started again. The
+  manager lacks the privilege (`Interactive authentication required`); Hermes stops it.
+- The old ops items (reviewer sandbox, restart-proof unit, nightly timer) wait; each is raised again when the new
+  project needs it.
+
+## Founder's Claude, for the record: the constitution is ratified by the founder's own merge (2026-11-14, 1794697236.734539)
+
+- `docs/CONSTITUTION.md` says the founder ratifies a version by merging it. PR #31 (1.0.1) was merged by the manager on
+  the founder's words "Go ahead with your one-sentence change" (1794696110), not by his merge; his Claude had asked that
+  the merge be left to him and is telling the founder, whose call it is whether that stands or he redoes it.
+- From now on, a change to the constitution waits for the founder's own merge, or for his words "merge it". The founder's
+  go on a wording is not a go to merge.
+
+## Constitution 1.0.3: what a loop may build before the founder's word (2026-11-15, founder "A" via his Claude 1794769401.471429)
+
+- `docs/CONSTITUTION.md` 1.0.3 (PR #45, merged by his Claude on the founder's word "A", 3de5352): a loop builds and merges,
+  marked as a proposal, an addition to the data of a declared record kind, hygiene of the session server, or a detail the
+  Skeleton spec leaves open; the spec lists each under "Proposals for the founder" with the reason and the alternative; the
+  Skeleton spec records it as a proposal until he decides; the next loop removes what he declines. A new record kind, a
+  change to the seven tools or to the graph and delta format, or a new check on what the model may do still waits for his
+  word ("Questions for the founder"). Loop 7 (base 4687c9a) runs under 1.0.2; nothing changes for its exit.
+- 1.0.2 (cf662ad, the founder's "merge it"): a change to an earlier loop's test no longer goes to the founder first; the spec
+  names the test, the change and the reason ("Earlier tests this loop changes"; a patch `loops/<id>.earlier-tests.patch`
+  when more than a line, applied alone as the coder's first commit); his Claude reads the list before the launch; the coder
+  changes only what is named; a coder whose spec and an earlier test cannot both hold stops, never builds a switch.
+
+## Founder's Claude, for the record: lane tickets that touch an earlier loop's test are named for his read (2026-11-16, 1794870208.723309)
+
+- A small-fix lane ticket that changes an earlier loop's test, even a repair that leaves the check as it was (#63, the s06
+  poll), is named in the new-core thread for the founder's Claude session's read before it launches; one line, minutes of
+  his time, and a reviewer's authorization finding then has its answer on the PR. The constitution's read-before-launch
+  (1.0.2) covers specs that change what a test checks; this extends the same habit to repairs. His read of #63 after the
+  merge: the right repair, weakens nothing; he tells the founder it happened and sees nothing to object to.
+
+## Founder: pause after loop 9's merge (2026-11-17, 1794876281.954929, founder words 4:43 pm PT 16 Nov)
+
+- Verbatim: "When Loop 9 is merged, please pause the dev work since I want to do some testing before we move ahead with
+  Loop 10." His Claude's reading, told to him for correction: loop 9 goes on as planned (review rounds, launch, gate, merge
+  and its record); after loop 9's merge nothing launches until he says go (no loop 10 launch, no coder, no lane ticket);
+  the console stays up for his testing and its restart on loop 9's merged commit still waits for his word (asked at the
+  merge); whether loop 10's spec may be drafted on paper during the pause is his to say, so it is paused too until he says.
+
+## Founder: document PRs merge on his word, relayed by his Claude (2026-11-17, 1794942801.027399)
+
+- The founder's words, 17 Nov 11:08 PT: "You don’t need to wait for me to merge . You can go ahead and ask the team to merge the code."
+  On that word the manager squash-merged #71 (constitution 1.0.4: an interrupt rule may declare spoken forms, principle 4; its entry says
+  the manager merged it on his word and quotes him), #72, #73 and #77 in that order (main b828827, 19:1xZ); each squash message carries his
+  sentence; the quotations were fact-checked against the mirror as for #70 and #76. Constitution 1.0.4 is in force.
+- From now on a document or constitution PR that waited for the founder's own merge merges when his Claude relays his word for it, with the
+  quotation fact-checked and his sentence in the squash message; the 2026-11-14 "for the record" rule (his own merge or "merge it") is
+  satisfied by that relayed word. Loop 10's spec branch took main before its launch (00fffea). Loop 10's gate is unchanged: its launch
+  waits for the must of his read (6957755985) and for his word.
+
+## Constitution 1.0.5: code passes a done model node with one way on (2026-11-17, #81 merged d6f90d9 on the founder's 11:08 word via his Claude 1794944568)
+
+- Principle 3's one exception: a model node the model has already marked done and that has one way on is passed by code, which plays on;
+  a done model node with no way on or more than one stops the cursor and wakes the model as before. `docs/ARCHITECTURE.md` step 3 and
+  `AGENTS.md` changed with it. Loop 11 builds it (`cursor {op: "passed"}` before `retimed`). Still his: the original write-up's sentence
+  and the version number.
+
+## Founder: pause until 15:16 Pacific on 17 Nov (2026-11-17, founder 12:16 PT via the L session 1794946691)
+
+- Verbatim: "Given there is a usage reset coming soon, let’s pause the team’s work for three hours until the reset occurs." Until 15:16 PT
+  (23:16Z): nothing new (no delegate, no run, no review round, no merge); in-flight work stopped at a pick-up point and kept on disk (the
+  loop 10 real run on the round 4 stand-in stopped at 20:19Z in its fourth real session; harness round 5 had already finished, its edits
+  uncommitted in /tmp/wt-s10); no check and no post before 23:16Z; Hermes and Simba paused too. The L session posts the word to resume;
+  work then picks up where it stood (round 5's commit, the real run again, the #78 comment with the rerun modes, Codex round 2, his read
+  and the launch word); his loop 11 report comes after the resume. Loop 10's gate is unchanged.
+
+## Founder account switch to R2D2 for the coming loops (2026-11-22, 10:47 PT via his Claude session 1795373436.000569)
+
+- The founder's words: "Ok, now check if the team is ready for work. Given L account usage is almost 100%, ask the team to use R2d2 account for
+  these loops' work." Every Claude run the factory makes for the coming loops (the manager's turns, coder launches, delegates), from their
+  preparation on, runs on `claude-r2d2` (Fable 5.1 for the manager, Opus 5.5 high for coders and delegates); `claude-l` is the fallback. This
+  replaces the 2026-11-17 rule (everyone on the L account). Reviews stay on Codex. Switched 19:0xZ: `hydra engine acc=claude-r2d2 model=fable5.1`;
+  `coder/delegate-launch.py` is the R2D2 launcher (`coder/delegate-launch-l.py` is the L copy); `tools/factory/coder_launch.sh` already defaults to R2D2.
+- "These loops" are the next build, planned as loops in the new repository `faden-systems/faden-core` (created 2026-11-22, empty). The plan is with
+  the founder; the pause of 18 Nov holds until his word; launch nothing and merge nothing before it. Readiness check: `factory/log/evidence/readiness-2026-11-22.md`.
+
+## Founder: the pause ends for faden-core; loop 1 kicked off (2026-11-22, 11:13 PT via his Claude session 1795375228.290959)
+
+- Verbatim: "We don't need simba so go ahead and ask the team to start and kick off loop 1". The new build runs in `faden-systems/faden-core`
+  (clone `/srv/hydra/repos/faden-core`); nothing changes in `faden` on this word. Simba is not needed: no assignment, no waiting.
+- The brief: `docs/BUILD-BRIEF.md` in his Claude's PR with the constitution 1.0.5, the architecture and the core's Skeleton spec; ten loops. The
+  factory layer came in as faden-core#1 (tools/factory as on faden main, launcher URL changed, loops/TEMPLATE.md); `CLAUDE.md` and `AGENTS.md`
+  follow the brief's layout on the same branch; his Claude reads them before the merge; `docs/` is his.
+- Loop 1 (no session): the record, the schema validator, facts and the declared-answer module copied from faden 5b8fcb7; the declarations, the
+  app-declarations check, the no-crossing check and the test app's declarations written new. Procedure: spec and exit from the brief's row, one
+  Codex round, the dry run, his read of the "Principles touched" table and the exit script, then the launch on R2D2. His word covers the set-up
+  and loop 1's launch after the brief PR (merged on his word) and the set-up PR merge; later loops wait for his loop-by-loop decisions.
+
+## Founder: no PR of the faden-core build waits for his approval; his Claude reviews and merges (2026-11-22, 13:59 PT via his Claude 1795384872.525859)
+
+- Verbatim: "You don’t need to merge PR with my approval. You can go ahead and review the pr and merger them". His Claude's reading, his
+  to correct: it covers the pull requests of the build (specs, builds, the set-up, and a change to a document that only records what he
+  has decided); his Claude reviews them and merges them. Still his, as decisions first: a change to the constitution or the architecture,
+  a new record kind, a change to the seven tools or to the graph and delta format, a new check on what the model may do. The steps of
+  `CLAUDE.md` stay: the review round on another vendor's model, the dry run, the exit's PASS before a build merges.
+- The spec PR procedure from now on: the manager posts on the PR when the Codex dispositions are in and the dry run is current on the final
+  head; his Claude reads the diff and the driver, merges when clean, posts the merge commit in the thread; the manager launches from it.
+- The four graph decisions of 22 Nov 13:51 PT (decision 2: a; 3: now a decision; 4: a; 5: both) are loop 2's, recorded by faden-core#4
+  (0761608, his Claude's merge); quotations checked against the mirror by the manager, none off.
+
+## Founder: no lint; the six forms of the graph decisions; loop 2's spec may be drafted (2026-11-22 evening PT, relayed by his Claude 1795414382.363939)
+
+- Verbatim (22 Nov): 19:48 PT "Can we just remove lint? it basically has to make all kinds of rules and assumptions. The whole intent programming
+  is relying on the model's intelligence." 20:11 PT "We can always add the lint if needed when we run into situation where the lint is the only
+  solution. ie. after we add the guard rails to G space (the framework will put it into the prompt ) and the model still makes the mistakes."
+  22:07 PT "Yes to all six points as you recommended."
+- No lint (brief row 15): the harness applies an edit or returns the reason; code plays a node only when it is complete and hands any other to
+  the model; a check on what the model writes is the last remedy, after a guard rail in the contract. Constitution 2.0 is his Claude's draft in
+  faden-core #7 (branch docs/no-lint); it is not in force until the founder's word on its text and his Claude's merge; 1.0.5 judges until then.
+- The six forms (row 16): (1) `"fixed": true` on a pre-authored step, shown to the model, nothing refused; (2) a pre-authored step may be any
+  step, one that code plays included; (3) no flow at all = a frame whose only step is a hole; (4) several holes, each with its own signature;
+  (5) a loop on a frame's edge written as a plan's loop, the hole unfilled again at each pass; (6) `remove` reaches any step not ended,
+  `replace` names the first step that goes. Loop 2 = "the graph and its edits"; proposals 18-22 of the Skeleton spec are its details.
+- Loop 2's spec may be drafted now from docs/no-lint; nothing is reviewed or launched before #7 merges; the spec names the loop 1 tests that
+  change. After the merge: `loops/TEMPLATE.md`'s lint mention and the reviewers' rubric follow the new principles (rule paths: thread line first).
+
+## Memory tidy: a periodic process, and one home for the founder's decisions (2026-11-23, founder via his Claude 1795466903.893029)
+
+- The founder's words: "we should add a process for tidying up the memory periodically. It should be either by size or
+  project demarkation like rewrite etc. And it should use the best model to do that." and "it is a good idea to have
+  central place to keep log of decision and github is the right place."
+- Two triggers and two limits, settled with his Claude on his word of 23 Nov 12:50 PT ("You and the manager to figure
+  out. Make it balanced."). What is measured is the live part: `MEMORY.md` without the archive, and `state.json`'s lists
+  in force (the decisions and the tracks). The archive, `LEDGER.jsonl`, the track logs and the Slack mirror do not count.
+  (1) Demarcation, always: a rewrite, a new brief, the last loop of a brief merged (14 Nov 2026, 22 Nov 2026). (2) Size:
+  the live part has grown to twice what the last tidy left and is above 512 KB; the floor keeps a small residue from
+  tripping the trigger at every loop. Limits: a tidy runs at a quiet point (no coder, delegate, review round or fix in
+  flight; nothing else writing the same files) and at most once per merged loop. It reads the live part and what was
+  added since the last tidy, never the archive again, so its cost follows the growth and not the history. The digest
+  reports the live part's size and its growth since the last tidy every cycle, so the balance is checked with numbers:
+  a size trigger that would fire at every loop is raised; one that would not fire once in a ten-loop build pass is
+  lowered. Numbers at the writing: the live part is 3.3 MB (`MEMORY.md` 2.8 MB, of which 1.9 MB dated before 14 Nov;
+  `state.json` 0.47 MB, of which 0.38 MB the bodies of 32 closed tracks); growth since 14 Nov about 90 KB a day and
+  about 25 KB a merged loop (c01 and c02: `MEMORY.md` 20 KB, `state.json` 5 KB); the trigger is expected to fire about
+  once in a ten-loop build pass. If the first tidy leaves much less than 256 KB, the floor alone decides, and at the
+  first build's rate (90 to 135 KB a day) the size trigger then fires after about 4 to 5 active days. The manager
+  announces the tidy in the new-core thread (what and why, as for a rule path) before it starts.
+- A session of its own, launched detached in the delegate launcher's form from `coder/memory-tidy.prompt.txt`, on the
+  most capable model the CLI on the VM offers for the account that day, found at launch by the one-call account check
+  with that model (the newest Fable the CLI accepts; never the coders' Opus 5.5; not necessarily the manager's own
+  model: on 23 Nov 2026 the CLI 2.1.285 offered Fable 5.1 and refused Fable 5.2, which needs 2.1.290), never inside a
+  manager turn. The report names the model the CLI offered and the account.
+- Nothing is deleted, and nothing is retyped: text that leaves `MEMORY.md` is moved by commands that copy bytes, by
+  entry range, from an index the session writes; the session itself types only the index, the scripts, a header line
+  and the report; the check that every line that leaves is in the archive is a script whose output goes in the report.
+  The session writes beside the live files, never over them: `MEMORY.tidy.md` (what stays current,
+  in MEMORY.md's own form), `factory/manager-memory/archive/<YYYY-MM-DD>/` (every moved entry with its date and its
+  section; every superseded decision with what replaced it) and the report `factory/log/evidence/memory-tidy-<date>.md`.
+  The manager swaps the result in on its own next turn (so no one else writes `MEMORY.md` at the same time) after
+  checking that every line that leaves `MEMORY.md` is in the archive. `MANAGER-HANDOFF.md`, `LEDGER.jsonl`, `claude/`
+  and `codex/` are not touched.
+- The decisions in force are sorted three ways. A factory rule still in force stays in `state.json`
+  (`founder_decisions_in_force`). A product or design decision still in force must be in the brief's table "What is
+  decided" (`docs/BUILD-BRIEF.md` in faden-core, row 18): the report lists the ones missing there with their dates and
+  his words, and his Claude adds them. The rest goes to the archive with what replaced it. `state.json` names the brief
+  as the home of his product and design decisions (`founder_decisions_home`) and keeps only the factory's own rules.
+- The report and its cost (the CLI's estimate, labelled so) go into the new-core thread: what moved and where, the
+  bytes and entries before and after, the decisions in each of the three groups, the model and the account.
+- The first tidy answers the demarcation of 22 Nov 2026 (the rewrite in faden-core) and waits for no size; it runs at
+  the first quiet point, with nothing of loop 2 in flight on the account (while #12 waits for his Claude's read, or after
+  its merge) and before loop 3's launch. Its starting sizes: `MEMORY.md` 2.8 MB (at least 1.3 MB dated before 14 Nov
+  2026); 116 decisions in force, 84 dated before 14 Nov 2026, sorted three ways as above.
