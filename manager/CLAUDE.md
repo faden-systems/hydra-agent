@@ -521,11 +521,21 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
 - The founder's words: "we should add a process for tidying up the memory periodically. It should be either by size or
   project demarkation like rewrite etc. And it should use the best model to do that." and "it is a good idea to have
   central place to keep log of decision and github is the right place."
-- Two triggers. (1) Size: `MEMORY.md` over 1 MB, or more than 40 entries in `state.json`'s decisions in force; the
-  digest reports both numbers every cycle. (2) Demarcation: a decision of the founder that ends a project era or starts a
-  rewrite (14 Nov 2026, 22 Nov 2026). The manager announces the tidy in the new-core thread (what and why, as for a rule
-  path) and starts it when it takes no usage from a running loop: no coder, delegate or launch of a loop in flight on
-  the account. A loop's exit rerun or a Codex round is no obstacle.
+- Two triggers and two limits, settled with his Claude on his word of 23 Nov 12:50 PT ("You and the manager to figure
+  out. Make it balanced."). What is measured is the live part: `MEMORY.md` without the archive, and `state.json`'s lists
+  in force (the decisions and the tracks). The archive, `LEDGER.jsonl`, the track logs and the Slack mirror do not count.
+  (1) Demarcation, always: a rewrite, a new brief, the last loop of a brief merged (14 Nov 2026, 22 Nov 2026). (2) Size:
+  the live part has grown to twice what the last tidy left and is above 512 KB; the floor keeps a small residue from
+  tripping the trigger at every loop. Limits: a tidy runs at a quiet point (no coder, delegate, review round or fix in
+  flight; nothing else writing the same files) and at most once per merged loop. It reads the live part and what was
+  added since the last tidy, never the archive again, so its cost follows the growth and not the history. The digest
+  reports the live part's size and its growth since the last tidy every cycle, so the balance is checked with numbers:
+  a size trigger that would fire at every loop is raised; one that would not fire once in a ten-loop build pass is
+  lowered. Numbers at the writing: the live part is 3.3 MB (`MEMORY.md` 2.8 MB, of which 1.9 MB dated before 14 Nov;
+  `state.json` 0.47 MB, of which 0.38 MB the bodies of 32 closed tracks); growth since 14 Nov about 90 KB a day and
+  about 25 KB a merged loop (c01 and c02: `MEMORY.md` 20 KB, `state.json` 5 KB); the trigger is expected to fire about
+  once in a ten-loop build pass. The manager announces the tidy in the new-core thread (what and why, as for a rule
+  path) before it starts.
 - A session of its own, launched detached in the delegate launcher's form from `coder/memory-tidy.prompt.txt`, on the
   most capable model the account offers that day (Fable 5.1 at the time of writing), never inside a manager turn. The
   report names the model and the account.
@@ -542,5 +552,7 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
   as the home of his product and design decisions (`founder_decisions_home`) and keeps only the factory's own rules.
 - The report and its cost (the CLI's estimate, labelled so) go into the new-core thread: what moved and where, the
   bytes and entries before and after, the decisions in each of the three groups, the model and the account.
-- The first tidy runs after c02's merge and before loop 3's launch. Its starting sizes: `MEMORY.md` 2.8 MB (at least
-  1.3 MB dated before 14 Nov 2026); 114 decisions in force, 84 dated before 14 Nov 2026.
+- The first tidy answers the demarcation of 22 Nov 2026 (the rewrite in faden-core) and waits for no size; it runs at
+  the first quiet point, with nothing of loop 2 in flight on the account (while #12 waits for his Claude's read, or after
+  its merge) and before loop 3's launch. Its starting sizes: `MEMORY.md` 2.8 MB (at least 1.3 MB dated before 14 Nov
+  2026); 116 decisions in force, 84 dated before 14 Nov 2026, sorted three ways as above.
