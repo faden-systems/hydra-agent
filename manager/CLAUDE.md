@@ -538,9 +538,14 @@ smoke, and supersedes any older "the manager no longer runs coder exits" wording
   first build's rate (90 to 135 KB a day) the size trigger then fires after about 4 to 5 active days. The manager
   announces the tidy in the new-core thread (what and why, as for a rule path) before it starts.
 - A session of its own, launched detached in the delegate launcher's form from `coder/memory-tidy.prompt.txt`, on the
-  most capable model the account offers that day: the manager's own model (Fable 5.1 at the time of writing), never the
-  coders' Opus 5.5, never inside a manager turn. The report names the model and the account.
-- Nothing is deleted. The session writes beside the live files, never over them: `MEMORY.tidy.md` (what stays current,
+  most capable model the CLI on the VM offers for the account that day, found at launch by the one-call account check
+  with that model (the newest Fable the CLI accepts; never the coders' Opus 5.5; not necessarily the manager's own
+  model: on 23 Nov 2026 the CLI 2.1.285 offered Fable 5.1 and refused Fable 5.2, which needs 2.1.290), never inside a
+  manager turn. The report names the model the CLI offered and the account.
+- Nothing is deleted, and nothing is retyped: text that leaves `MEMORY.md` is moved by commands that copy bytes, by
+  entry range, from an index the session writes; the session itself types only the index, the scripts, a header line
+  and the report; the check that every line that leaves is in the archive is a script whose output goes in the report.
+  The session writes beside the live files, never over them: `MEMORY.tidy.md` (what stays current,
   in MEMORY.md's own form), `factory/manager-memory/archive/<YYYY-MM-DD>/` (every moved entry with its date and its
   section; every superseded decision with what replaced it) and the report `factory/log/evidence/memory-tidy-<date>.md`.
   The manager swaps the result in on its own next turn (so no one else writes `MEMORY.md` at the same time) after
